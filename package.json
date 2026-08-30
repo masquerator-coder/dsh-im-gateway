@@ -1,0 +1,63 @@
+{
+  "name": "dsh-im-gateway",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness (DSH) IM gateway plugin: inbound HTTP webhook -> per-chat persistent Agent -> outbound reply callback.",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./lib/index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepare": "node scripts/build.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "im",
+    "gateway",
+    "webhook"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4",
+    "@deepseek-ai/dsh-agent": "*",
+    "@deepseek-ai/dsh-agent-default-model": "*",
+    "@deepseek-ai/dsh-llm": "*",
+    "@deepseek-ai/dsh-session": "*",
+    "@deepseek-ai/schemastery": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": { "optional": true },
+    "@deepseek-ai/dsh-agent": { "optional": true },
+    "@deepseek-ai/dsh-agent-default-model": { "optional": true },
+    "@deepseek-ai/dsh-llm": { "optional": true },
+    "@deepseek-ai/dsh-session": { "optional": true },
+    "@deepseek-ai/schemastery": { "optional": true }
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.6.0"
+  }
+}

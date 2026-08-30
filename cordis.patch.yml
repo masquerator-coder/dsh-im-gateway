@@ -1,0 +1,27 @@
+# dsh-im-gateway bundle patch — the configuration layer this package
+# contributes when a profile lists it as a bundle.
+#
+# The plugin row references the package by name (not a source path), so Node
+# resolution loads the built entry `lib/index.js` (see package.json `main`).
+# Users override any row here from their profile's own cordis.patch.yml.
+
+- insert:
+    - id: im-gateway
+      name: 'dsh-im-gateway'
+      config:
+        host: '127.0.0.1'
+        port: 8799
+        inboundPath: '/im'
+        secret: ''
+        chatIdField: 'chat_id'
+        textField: 'text'
+        senderField: 'sender_id'
+        callbackUrl: 'http://127.0.0.1:9999/reply'
+        callbackChatHeader: 'x-im-chat-id'
+        callbackSecretHeader: 'x-im-secret'
+        provider: ''
+        model: ''
+        maxTokens: 0
+        agentPreset: ''
+        cwd: ''
+        disposeAfterReply: false

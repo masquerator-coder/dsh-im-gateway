@@ -1,0 +1,18 @@
+# Canonical text form is LF, enforced at checkout too, so the working tree and
+# the repo never differ on line endings regardless of host (Windows/macOS/Linux).
+# This mirrors the DeepSeek Harness repository convention.
+* text=auto eol=lf
+
+# Windows command scripts genuinely need CRLF in the working tree for cmd.exe;
+# keep the in-repo form LF and make CRLF a checkout-time presentation only.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Non-text artifacts (binary) must never be line-ending normalised.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary

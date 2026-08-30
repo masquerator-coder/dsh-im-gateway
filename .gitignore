@@ -1,0 +1,27 @@
+# Dependencies are peer/optional (provided by the host DSH at load time).
+# If you run `npm/pnpm install` locally for type-checking, keep node_modules out.
+node_modules/
+
+# pnpm's content-addressable store if it is ever materialised inside the repo.
+.pnpm-store/
+
+# Build output (esbuild bundle emitted by `prepare`/\`build`; git installs
+# rebuild it from source, so it is never committed)
+lib/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local overrides (never commit real secrets)
+.env
+.env.*

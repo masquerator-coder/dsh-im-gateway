@@ -1,0 +1,35 @@
+# DeepSeek Harness IM gateway — LOCAL SOURCE overlay (development / e2e form).
+#
+# This overlay loads the plugin straight from its TypeScript source via a
+# `--patch` flag, so you can iterate without installing the package:
+#
+#   pnpm dsh web --patch /absolute/path/to/dsh-im-gateway/cordis.yml
+#
+# The plugin `name` points at the source entry `./src/index.ts`. (Official
+# docs require an absolute path for `--patch`; a relative path resolves
+# against the profile directory and is kept here for this repo's layout.)
+#
+# For distribution, the sibling `cordis.patch.yml` is the *bundle* layer that
+# references the package by name (`dsh-im-gateway` → built `lib/index.js`).
+# Edit the config to match your deployment; never commit real secrets.
+
+- insert:
+    - id: im-gateway
+      name: './src/index.ts'
+      config:
+        host: '127.0.0.1'
+        port: 8799
+        inboundPath: '/im'
+        secret: ''
+        chatIdField: 'chat_id'
+        textField: 'text'
+        senderField: 'sender_id'
+        callbackUrl: 'http://127.0.0.1:9999/reply'
+        callbackChatHeader: 'x-im-chat-id'
+        callbackSecretHeader: 'x-im-secret'
+        provider: ''
+        model: ''
+        maxTokens: 0
+        agentPreset: ''
+        cwd: ''
+        disposeAfterReply: false
