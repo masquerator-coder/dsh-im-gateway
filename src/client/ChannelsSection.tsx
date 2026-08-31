@@ -168,8 +168,12 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     setDraft(loaded)
     setDraftName(active.name ?? '')
     void loadSecrets(active)
+    // Depends on the active channel OBJECT: re-selecting (id change) and
+    // saving an existing channel (object replaced in `channels`, id unchanged)
+    // both must re-backfill the form. De-ps on id alone would miss save, since
+    // save() clears the draft while the id stays the same.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active?.id])
+  }, [active])
 
   const beginCreate = useCallback((type: ChannelType) => {
     setCreating(type)
@@ -219,10 +223,10 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
         : channels.map(c => (c.id === id ? nextChannel : c))
       const section: ChannelsSettings = { channels: nextList }
       await scope.set('channels', section.channels)
-      // Select the just-saved channel.
+      // Select the just-saved channel. The backfill effect (keyed on `active`)
+      // re-runs because save() replaced the channel object in `channels`.
       setActiveId(id)
       setCreating(null)
-      setDraft({})
       setNotice(t('channels.saved'))
     } catch (error) {
       setNotice(`${t('channels.saveFailed')}: ${String(error)}`)
