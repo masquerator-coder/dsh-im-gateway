@@ -1,17 +1,32 @@
-import { createHash } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle, AgentOptions } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import { boundContextSummary, createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
-import type { Config } from './config.ts'
+import { sessionIdForChat } from './session.ts'
 
-/** A deterministic, stable SessionId derived from an external chat id. */
-function sessionIdForChat(chatId: string): SessionId {
-  const digest = createHash('sha1').update(chatId).digest('hex').slice(0, 16)
-  return SessionId(`im-${digest}`)
+/**
+ * Per-message runtime options, resolved from the channel that received it
+ * (agent routing can differ from one IM channel to the next).
+ */
+export interface MessageRuntime {
+  /** Optional provider route override for the created agent. */
+  provider?: string
+  /** Optional model id override. */
+  model?: string
+  /** Optional positive output-token cap. */
+  maxTokens?: number
+  /** Optional working directory for the agent session. */
+  cwd?: string
+  /** Optional agent preset. */
+  agentPreset?: string
+  /** Whether to dispose the agent right after its reply is delivered. */
+  disposeAfterReply?: boolean
 }
+
+/** A function the transport supplies to push one agent reply back out. */
+export type ReplySink = (text: string) => Promise<void>
 
 /** Render an assistant message's text blocks into one reply string. */
 function textOf(event: Extract<SessionEvent, { type: 'assistant/message' }>): string {
@@ -52,9 +67,19 @@ export interface InboundMessage {
   senderId?: string
 }
 
+export interface AgentRouting {
+  provider?: string
+  model?: string
+  maxTokens?: number
+  cwd?: string
+  agentPreset?: string
+}
+
 /**
  * One gateway instance: maps external chats to persistent agents, injects
- * inbound messages, collects replies and POSTs them to the callback URL.
+ * inbound messages and routes each collected reply back through the per-message
+ * `ReplySink` that the receiving transport supplied. This decouples the agent
+ * plumbing (common to every channel) from the transport (per channel).
  */
 export class ImGateway {
   private readonly agents = new Map<SessionId, AgentHandle>()
@@ -62,7 +87,7 @@ export class ImGateway {
 
   constructor(
     private readonly ctx: Context,
-    private readonly config: Config,
+    private readonly defaults: AgentRouting = {},
   ) {
     // Observe every reply across the runtime and forward matching runs.
     ctx.on('session/event', (session, event) => {
@@ -71,16 +96,16 @@ export class ImGateway {
   }
 
   /**
-   * Handle one inbound IM message. It is injected into the persistent agent
-   * for the external chat (creating the agent on first contact), and the
-   * agent's reply is collected and POSTed to the configured callback URL.
+   * Handle one inbound IM message: inject it into the persistent agent for the
+   * external chat (creating the agent on first contact), then deliver the reply
+   * back through `reply`.
    */
-  async handle(message: InboundMessage): Promise<void> {
+  async handle(message: InboundMessage, reply: ReplySink, runtime: MessageRuntime = {}): Promise<void> {
     const { chatId, text } = message
-    const sessionId = sessionIdForChat(chatId)
+    const sessionId = SessionId(sessionIdForChat(chatId))
     let handle = this.agents.get(sessionId)
     if (handle === undefined) {
-      handle = await this.ensureAgent(sessionId)
+      handle = await this.ensureAgent(sessionId, runtime)
       this.agents.set(sessionId, handle)
     }
     const agent = handle.agent
@@ -104,25 +129,25 @@ export class ImGateway {
         ...(bundled === undefined ? {} : { summary: bundled }),
       },
     }))
-    void this.awaitReply(sessionId, chatId, collector)
+    void this.awaitReply(sessionId, collector, reply, runtime)
   }
 
   /** Create (and remember) the persistent agent for one external chat. */
-  private async ensureAgent(sessionId: SessionId): Promise<AgentHandle> {
+  private async ensureAgent(sessionId: SessionId, runtime: MessageRuntime): Promise<AgentHandle> {
     const options: AgentOptions = {
-      ...(this.config.provider ? { provider: this.config.provider } : {}),
-      ...(this.config.model ? { model: this.config.model } : {}),
-      ...(this.config.maxTokens > 0 ? { maxTokens: this.config.maxTokens } : {}),
+      ...(runtime.provider ? { provider: runtime.provider } : {}),
+      ...(runtime.model ? { model: runtime.model } : {}),
+      ...(runtime.maxTokens ? { maxTokens: runtime.maxTokens } : {}),
     }
-    const cwdSet = this.config.cwd !== ''
+    const cwdSet = runtime.cwd !== undefined && runtime.cwd !== ''
     const handle = await this.ctx.agents.create({
       sessionId,
       meta: {
-        ...(cwdSet ? { cwd: this.config.cwd } : {}),
-        ...(this.config.agentPreset ? { agentPreset: this.config.agentPreset } : {}),
+        ...(cwdSet ? { cwd: runtime.cwd } : {}),
+        ...(runtime.agentPreset ? { agentPreset: runtime.agentPreset } : {}),
       },
       ...(Object.keys(options).length > 0 ? { agentOptions: options } : {}),
-      setup: async (agentCtx) => {
+      setup: async () => {
         // Optional preset mount (only when explicitly configured).
       },
     })
@@ -130,23 +155,28 @@ export class ImGateway {
     return handle
   }
 
-  /** Wait for the collector to settle, then forward the reply to the callback. */
-  private async awaitReply(sessionId: SessionId, chatId: string, collector: ReplyCollector): Promise<void> {
+  /** Wait for the collector to settle, then forward the reply through the sink. */
+  private async awaitReply(
+    sessionId: SessionId,
+    collector: ReplyCollector,
+    reply: ReplySink,
+    runtime: MessageRuntime,
+  ): Promise<void> {
     try {
       await collector.agent.whenIdle()
-      const reply = collector.settle()
+      const text = collector.settle()
       this.pending.delete(sessionId)
-      if (reply !== '') {
-        await this.postReply(chatId, reply)
+      if (text !== '') {
+        await reply(text)
       } else {
-        this.ctx.logger.warn(`[im-gateway] empty reply for chat ${chatId}`)
+        this.ctx.logger.warn(`[im-gateway] empty reply for ${sessionId}`)
       }
     } catch (error: unknown) {
       collector.settle()
       this.pending.delete(sessionId)
-      this.ctx.logger.warn(`[im-gateway] reply for chat ${chatId} failed: ${errorChain(error)}`)
+      this.ctx.logger.warn(`[im-gateway] reply for ${sessionId} failed: ${errorChain(error)}`)
     } finally {
-      if (this.config.disposeAfterReply) {
+      if (runtime.disposeAfterReply) {
         void this.disposeAgent(sessionId)
       }
     }
@@ -160,29 +190,6 @@ export class ImGateway {
       await handle.dispose()
     } catch (error: unknown) {
       this.ctx.logger.warn(`[im-gateway] dispose ${sessionId} failed: ${errorChain(error)}`)
-    }
-  }
-
-  /** POST the reply back to the configured callback URL. */
-  private async postReply(chatId: string, reply: string): Promise<void> {
-    const headers: Record<string, string> = {
-      'content-type': 'application/json',
-      [this.config.callbackChatHeader]: chatId,
-    }
-    if (this.config.secret !== '') {
-      headers[this.config.callbackSecretHeader] = this.config.secret
-    }
-    const response = await fetch(this.config.callbackUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: reply,
-        ts: Date.now(),
-      }),
-    })
-    if (!response.ok) {
-      throw new Error(`callback returned ${response.status} ${response.statusText}`)
     }
   }
 

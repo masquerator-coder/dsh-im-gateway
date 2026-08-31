@@ -1,26 +1,45 @@
 # dsh-im-gateway — DeepSeek Harness IM gateway plugin
 
-A [DeepSeek Harness](https://deepseek-harness.github.io/deepseek-harness/) (Cordis) plugin that bridges an external IM platform into Harness:
+A [DeepSeek Harness](https://deepseek-harness.github.io/deepseek-harness/) (Cordis) plugin that bridges external IM platforms into Harness:
 
-1. **Inbound** — an embedded HTTP webhook server receives messages POSTed by the external IM platform.
+1. **Inbound** — a multi-channel gateway receives messages from external IM platforms.
 2. **Bridge** — each message is injected into a **persistent Harness Agent** that is stably mapped to the external chat id (so a conversation keeps context across messages; separate chats stay isolated).
-3. **Outbound** — the Agent's reply is collected from the session event stream and **POSTed back to a configurable callback URL**.
+3. **Outbound** — the Agent's reply is collected from the session event stream and delivered back through the **same channel** that received it.
 
-It is IM-agnostic: both the inbound and outbound legs are plain HTTP, so it works with WeCom, Feishu, Telegram bots, Discord, custom systems, etc., without binding to any vendor SDK.
+It ships both a **legacy single HTTP webhook** and a **multi-channel settings UI** ("IM 通道" in the DSH settings panel) covering six channel kinds — 微信 (clawbot), QQ (icqq bot), 邮箱 Email (SMTP/IMAP), 中国移动 5G消息 (WebSocket), 飞书 (official bot), and 通用 HTTP 回调.
 
 ---
 
 ## How it works
 
 ```
-external IM  --POST-->  [HTTP webhook (this plugin)]  --followup-->  [persistent Agent/session per chat]
-      ^                                                                      |
-      |                                                                      | session/event
-      +-- <--callback POST--  [collected reply]
+external IM  --POST-->  [channel transport (webhook / WS / IMAP / icqq / claw)]  --followup-->  [persistent Agent/session per chat]
+      ^                                                                                            |
+      |                                                                                            | session/event
+      +-- <-- same channel delivers--  [collected reply]
 ```
 
 - **Per-chat session**: `SessionId = im-<sha1(chat_id)[0:16]>`. The same external chat always reuses the same Agent (durable context); different chats never share one.
-- **Reply delivery**: text blocks of each `assistant/message` session event (`@deepseek-ai/dsh-session`) are accumulated until the agent reaches quiescence (`agent.whenIdle()`), then POSTed to `callbackUrl`.
+- **Reply delivery**: text blocks of each `assistant/message` session event (`@deepseek-ai/dsh-session`) are accumulated until the agent reaches quiescence (`agent.whenIdle()`), then delivered back through the receiving transport.
+
+---
+
+## Multi-channel IM management (settings UI)
+
+In the DSH settings panel an **"IM 通道"** entry (pushed to the end of the left nav) opens a per-channel management UI. Each channel kind ships a **foolproof prefill template**, so fixed items are already correct and the user only fills in the cherry-picked key/token/account (or scans a QR):
+
+| Type | Fixed items auto-filled | User provides | Transport |
+| --- | --- | --- | --- |
+| **微信** (clawbot) | `clawUrl` (`http://127.0.0.1:9001`) | token; scan companion QR | polling HTTP client of a clawbot companion gateway |
+| **QQ** | — | (optional qq/password; scan QR to log in) | `icqq` bot (QR or password login) |
+| **Email** | server/ports/TLS from chosen provider (QQ/163/Gmail/Outlook/企业微信/自定义) | account + 授权码/密码 | `nodemailer` (SMTP out) + `imapflow` (IMAP in) |
+| **中国移动 5G消息** | `serverUrl` (`wss://…/ws/msg`), `version: 2.0` | apiKey | WebSocket `SmsClient` to the 5G 消息 gateway |
+| **飞书** | — | App ID + App Secret | official `@larksuiteoapi/node-sdk` WebSocket long connection |
+| **通用 HTTP** | `inboundPath` `/im`, field mapping (`chat_id`/`text`/`sender_id`) | callbackUrl + (optional) secret | shared inbound `node:http` webhook route |
+
+Each enabled channel holds a **live connection** (`connected` / `connecting` / `error` / `idle`) that the host reports back to the UI through the `imGateway` RPC (`remote.define('imGateway', { list })`, polled by the client); the UI also shows the login **QR** for QQ/微信 scan-to-login and the connection error detail when present. Channel records live under the `im-channels` settings namespace, with secret fields (`apiKey`, `password`, `appSecret`, `token`, …) declared `role('secret')` — redacted on every wire boundary, only the host transports read them back from the settings scope.
+
+> **Secrets**: keep real values out of Git. `.gitignore` already excludes `cordis.local.yml` / `.env*` and `lib/`; never commit an apiKey/appSecret/password to a channel record that ends up under version control.
 
 ---
 
@@ -28,14 +47,22 @@ external IM  --POST-->  [HTTP webhook (this plugin)]  --followup-->  [persistent
 
 | Path | Purpose |
 | --- | --- |
-| `src/config.ts` | Schemastery `Config` schema (all tunables) |
-| `src/inbound.ts` | Embedded `node:http` webhook server |
-| `src/gateway.ts` | chat→agent mapping, message injection, reply collection + callback |
-| `src/index.ts` | Plugin entry (`name`/`inject`/`Config`/`apply` + lifecycle) |
+| `src/config.ts` | Schemastery `Config` schema (legacy single-webhook tunables) |
+| `src/inbound.ts` | Embedded `node:http` webhook server (routes by URL path) |
+| `src/gateway.ts` | chat→agent mapping, message injection, reply collection + delivery |
+| `src/session.ts` | Deterministic `im-<sha1(chat_id)>` session-key derivation |
+| `src/index.ts` | Plugin entry (`name`/`inject`/`Config`/`apply` + lifecycle + `imGateway` RPC) |
+| `src/channels/types.ts` | Channel type model + status (pure types, shared client/host) |
+| `src/channels/schema.ts` | Host-side `im-channels` settings schema (SECRET fields via `role('secret')`) |
+| `src/channels/manager.ts` | Per-channel connection lifecycle, transport build, live status snapshots |
+| `src/transports/*.ts` | One real adapter per channel (http / email / cmcc / feishu / wechat / qq) |
+| `src/client/*` | Browser half: settings section UI, foolproof templates, live status + QR |
 | `cordis.yml` | Local source overlay (`--patch`) for development / e2e iteration |
 | `cordis.patch.yml` | Published **bundle** layer — references the package by name (`dsh-im-gateway` → `lib/index.js`) |
-| `scripts/build.mjs` | esbuild build: bundles `src/` → `lib/index.js` (the `build`/`prepare` script) |
+| `scripts/build.mjs` | esbuild build: emits `lib/index.js` (node) + `lib/client.js` (browser) |
+| `scripts/smoke.mts` | Local smoke test (session hashing, HTTP route, reply callback, CMCC failure) |
 | `lib/` | Generated build output (git-ignored; produced by `prepare` on install) |
+| `docs/channel-ui-design.md` | Design doc for the multi-channel settings UI |
 | `LICENSE` | MIT license |
 | `README.md` | This file |
 
@@ -132,7 +159,10 @@ pnpm dsh web --patch /path/to/dsh-im-gateway/cordis.yml
         model: 'deepseek-chat'
 ```
 
-### External IM → gateway (inbound)
+### External IM → gateway (legacy HTTP webhook)
+
+> The settings UI is the primary way to attach channels (see above). The legacy
+> single HTTP webhook path below is retained for back-compat / headless setups.
 
 POST messages to `http://<host>:<port>/im`:
 

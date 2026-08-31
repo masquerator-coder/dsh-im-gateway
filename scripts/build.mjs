@@ -27,6 +27,21 @@ const outdir = join(root, '..', 'lib')
 mkdirSync(outdir, { recursive: true })
 
 // --- node half ---
+// Runtime deps are provided by the host (external @deepseek-ai/*) plus this
+// plugin's own `dependencies` (ws, nodemailer, imapflow, mailparser, icqq,
+// @larksuiteoapi/*), which resolve from node_modules at load time — never
+// inline the heavy transports into the bundle.
+const nodeExternal = [
+  '@deepseek-ai/*',
+  'ws',
+  'nodemailer',
+  'imapflow',
+  'mailparser',
+  'icqq',
+  '@larksuiteoapi/*',
+  'bufferutil',
+  'utf-8-validate',
+]
 await build({
   entryPoints: [join(root, '..', 'src', 'index.ts')],
   outfile: join(outdir, 'index.js'),
@@ -36,7 +51,7 @@ await build({
   target: 'node20',
   sourcemap: true,
   // Host-provided runtime deps: resolve from the DSH the plugin is loaded into.
-  external: ['@deepseek-ai/*'],
+  external: nodeExternal,
   logLevel: 'info',
 })
 

@@ -1,0 +1,9 @@
+# Single-package workspace: this project is NOT a monorepo. Peer deps
+# (@deepseek-ai/*) are provided by the host DSH runtime at load time and must
+# not be auto-installed from the npm registry (they are not all published
+# there). Only the local devDependencies (esbuild + types) are installed.
+packages: []
+allowBuilds:
+  esbuild: set this to true or false
+  protobufjs: set this to true or false
+autoInstallPeers: false

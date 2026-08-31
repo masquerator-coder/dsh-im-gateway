@@ -9,19 +9,20 @@
 
 /** The channel kinds the gateway can manage. */
 export type ChannelType =
-  | 'wechat'   // 微信（占位：个人号无官方接口，仅接入引导）
-  | 'qq'       // QQ（占位）
-  | 'email'    // email（SMTP 收/发）
+  | 'wechat'   // 微信（clawbot companion）
+  | 'qq'       // QQ（icqq bot，扫码登录）
+  | 'email'    // email（SMTP/IMAP 收发）
   | 'cmcc'     // 中国移动 新消息 / 5G消息 (WebSocket)
-  | 'feishu'   // 飞书（占位/扫码）
+  | 'feishu'   // 飞书（官方 bot，长连接）
   | 'http'     // 通用 HTTP 回调（既有的 im-gateway webhook）
 
 /**
- * Non-secret, per-channel wiring. Every field is optional except `id`/`type`;
- * a channel's secrets are referenced by ref and fetched via credentials.
+ * Per-channel wiring. Non-secret fields are returned to the client over the
+ * wire; SECRET fields (`role('secret')` in the schema) are redacted on every
+ * wire boundary and only ever readable by the host via the settings scope.
  */
 export interface ChannelConfig {
-  /** Stable channel id (e.g. "wechat-work", "imap-liam"). */
+  /** Stable channel id. */
   id: string
   /** Channel kind. */
   type: ChannelType
@@ -32,30 +33,48 @@ export interface ChannelConfig {
   /** Human note (optional). */
   note?: string
 
-  // email
+  // ---- agent routing (all channels) ----
+  provider?: string
+  model?: string
+  cwd?: string
+  agentPreset?: string
+  disposeAfterReply?: boolean
+
+  // ---- email ----
   host?: string
   imapPort?: number
   smtpPort?: number
   useTls?: boolean
   account?: string
+  inbox?: string
+  password?: string // SECRET (role('secret'))
 
-  // cmcc (5G消息)
+  // ---- cmcc (5G消息) ----
   serverUrl?: string
   uploadUrl?: string
   version?: string
+  apiKey?: string // SECRET
 
-  // http (generic webhook)
+  // ---- http (generic webhook) ----
   inboundPath?: string
   chatIdField?: string
   textField?: string
+  senderField?: string
   callbackUrl?: string
   callbackChatHeader?: string
+  secret?: string // SECRET
 
-  // base agent routing
-  provider?: string
-  model?: string
-  cwd?: string
-  agentPreset?: string
+  // ---- feishu ----
+  appId?: string
+  appSecret?: string // SECRET
+
+  // ---- wechat (clawbot companion) ----
+  clawUrl?: string
+  token?: string // SECRET
+
+  // ---- qq ----
+  qq?: string
+  qqPassword?: string // SECRET (password login; QR preferred)
 }
 
 /** Resolved shape of the whole `im-channels` settings section. */
@@ -64,5 +83,5 @@ export interface ChannelsSettings {
   channels: ChannelConfig[]
 }
 
-/** Connection lifecycle state surfaced to the UI (mirrored on demand). */
+/** Connection lifecycle state surfaced to the UI (live via RPC). */
 export type ChannelStatus = 'idle' | 'connecting' | 'connected' | 'error' | 'placeholder'

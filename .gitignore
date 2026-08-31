@@ -27,6 +27,11 @@ Thumbs.db
 .env.*
 # dsh-cmcc-newmsg: local-only cordis overlay carrying the real 5G 消息 API Key
 cordis.local.yml
-dsh-cmcc-newmsg/cordis.local.yml
+dsh-cmcc-newmsg/
 # dsh-cmcc-newmsg: received-media working directory (local only)
 .dsh/cmcc-newmsg/
+
+# Cross-session working artifacts kept out of the public repo: the vendored
+# dsh-cmcc-newmsg plugin working copy and other-tool AI session artifacts
+# (AGENTS.md / hyperframes / demo recordings) are local-only.
+video/

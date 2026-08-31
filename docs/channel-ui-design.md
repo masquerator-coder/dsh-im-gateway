@@ -1,8 +1,8 @@
 # dsh-im-gateway 多通道管理 UI —— 设计文档
 
-> 状态：设计阶段（待 client 插件打包/通信机制调研结果最终确认）
+> 状态：**已实现**（本文档与 `src/channels/*`、`src/transports/*`、`src/client/*` 同步更新）。
 > 目标：在 DSH 设置页左侧列表最末新增"IM 通道"入口，点开后右侧选择/管理通道。
-> 用户已决策：并入 dsh-im-gateway；左侧列表最末；首批可用通道 = 5G消息 + email + 通用HTTP，微信/QQ/飞书做占位+引导。
+> 用户已决策：并入 dsh-im-gateway；左侧列表最末；首批可用通道 = 5G消息 + email + 通用HTTP；微信/QQ/飞书随后实现为真实收发（非占位）。—— 现在六类通道全部真实收发。
 
 ## 1. 核心机制（已确认，基于 DSH checkout 源码）
 
@@ -41,26 +41,33 @@ ctx.slots.inject('settings.section', () => ctx.slots.register({
 - **持久化/通信**：client 通过 `ctx.remote.<ns>` 调 node half 暴露的远程命名空间；密钥走 `remote.credentials`；配置可走 `remote.settings` 或自定义 `remote.imGateway`。
 - **构建**：内置包用 `tsdown` + `clientBundle`（`tsdown.config.ts`）；我们插件现有 esbuild（`scripts/build.mjs`）需扩展以同时产出 node 与 client 两个 bundle，且 client bundle 用浏览器平台（react/jsx），node bundle 用 node 平台。
 
-## 2.5 待确认（依赖调研子代理结果）
-- [ ] 第三方插件通过 `dsh plugin add` 安装时，client half 是否自动随包分发并被 web 端发现（还是需要额外步骤，如替换 web bundle / client plugin host）。
-- [ ] `ctx.remote` 的精确调用形态与"node half 如何注册远程命名空间"（`ctx.router`? 还是插件暴露 service）。
-- [ ] `remote.credentials` 读写 API 精确签名。
+## 2.5 已确认（实现结论）
+- [x] **client half 随包分发**：esbuild `scripts/build.mjs` 同时产出 `lib/index.js`（node）与 `lib/client.js`（browser CJS factory），浏览器平台 seed 经 `window.__ModuleLoader__.load({id, factory})` 加载 client half。
+- [x] **`ctx.remote` RPC 形态**：node half 用 `ctx.remote.define('imGateway', () => ({ list }))` 注册远程命名空间；client half 经 `remote.imGateway.list()` 轮询拉取通道状态快照（`statusList()` 含 status/detail/qr）。
+- [x] **密钥与回显分离**：通道记录存放于 `im-channels` settings 作用域，密钥字段用 `role('secret')`，宿主 transports 经 settings scope 读回；client 端 describe 永不回传密钥（空值 = 保留已存值）。
 
-## 3. UI 结构（目标形态）
+## 3. UI 结构（已实现）
 设置页左侧最末新增「IM 通道」栏目 → 右侧面板：
-- 上区：通道选择（微信 / QQ / email / 5G消息(中国移动新消息) / 飞书 / 通用HTTP 回调）卡片网格，加图标 + 标题 + 状态(未连接/已连接/占位)。
-- 下区（选中某通道后）：
-  - **5G消息**：填写 `apiKey` + `serverUrl`（默认预填），可选上传/扫码引导。
-  - **email**：填写 SMTP/IMAP 服务器、账号、授权码、收发规则。
-  - **通用HTTP**：既有 `callbackUrl`、`secret`、字段映射（chatIdField/textField…）。
-  - 微信/QQ/飞书：占位卡 + "接入指引"文案（官方资质/扫码说明）。
+- 左列："新建通道"六类按钮（微信 / QQ / email / 5G消息 / 飞书 / 通用HTTP），下方"已配置"通道列表（名称 + 类型 + 实时状态）。
+- 右列（选中某通道/新建时）：**状态行**（类型 · 实时连接状态 + 错误详情）、名称、该类型的**傻瓜式配置表单**、保存/删除。
+  - **5G消息**：只填 `apiKey`；`serverUrl`、`version` 预填模板自动带入。
+  - **email**：先选邮箱服务商（QQ/163/Gmail/Outlook/企业微信/自定义），已知服务商自动填 host/IMAP/SMTP/TLS，用户只填账号 + 授权码；选"自定义"时显示 host/端口字段。
+  - **通用HTTP**：填 `callbackUrl` + 可选 `secret`；`inboundPath`/字段映射预填。
+  - **飞书**：只填 App ID + App Secret（长连接）。
+  - **微信**：填 clawbot 网关地址（预填） + token；显示伴生网关登录 QR。
+  - **QQ**：留空即扫码登录——登录 QR 由宿主经 RPC 回传并在面板内显示。
 
 ## 4. 配置持久化
-- 沿用 DSH settings 持久化：`ctx.remote.$host` / settings describe + ScopeBinder（client 端），经 `remote` 服务提交给宿主。
-- 密钥字段用 `Schema.string().role('secret')`（与 dsh-cmcc-newmsg 的 apiKey 一致），避免明文进日志/回调。
+- 通道记录存于 `im-channels` settings 命名空间（`ChannelsSettingsSchema`），client 经 settings scope 提交，宿主经 settings scope 读取。
+- 密钥字段用 `Schema.string().role('secret')`（与 dsh-cmcc-newmsg 的 apiKey 一致），描述/回显时被框架抹除，宿主 transports 从 settings scope 直接读回。
 - 本地覆盖层 cordis.local.yml 承载真实密钥，不入 Git。
 
-## 5. 后端连接管理
-- 复用现有：HTTP webhook（通用）已在 `src/`；5G消息 WebSocket（`dsh-cmcc-newmsg`）收编或作为通道实现。
-- email：新增 SMTP/IMAP 收发实现（方案阶段）。
-- 连接状态回传给 UI（每通道 connected/error/idle），UI 显示。
+## 5. 后端连接管理（已实现）
+- 六类通道各有一个真实 transport（`src/transports/*.ts`）：
+  - `http.ts`：共享 `InboundHttpServer` 的按路径注册 webhook 路由，回复 POST 回 callbackUrl。
+  - `cmcc.ts` + `cmcc/smsClient.ts`：WebSocket 接中国移动 新消息/5G消息 网关（X-API-Key 头 + auth 握手 + 心跳 + 断线重连）。
+  - `email.ts`：`nodemailer` 发（SMTP）+ `imapflow` 收（IMAP 轮询 INBOX，uid 去重）。
+  - `feishu.ts`：官方 `@larksuiteoapi/node-sdk` WebSocket 长连接事件服务。
+  - `wechat.ts`：clawbot 伴生网关的轻量 HTTP 客户端（/health·/receive·/send·/qr）。
+  - `qq.ts`：`icqq` bot（扫码或密码登录，群/私聊均可收发）。
+- **连接状态回传**：`ChannelManager` 维护每通道 status（idle/connecting/connected/error）+ detail，`remote.define('imGateway', { list })` 暴露 `statusList()`（含新增的 `qr`），client 每 3s 轮询拉取并渲染；QQ/微信的登录 QR 经同一 RPC 的 `qr` 字段回传到 UI 显示。
