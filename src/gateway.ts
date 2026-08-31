@@ -132,11 +132,34 @@ export class ImGateway {
     void this.awaitReply(sessionId, collector, reply, runtime)
   }
 
+  /**
+   * Resolve the provider + model for a created agent: explicit per-channel
+   * runtime values win; otherwise fall back to the deployment default model
+   * selection (`agentDefaultModel.currentSelection()`), matching how DSH's own
+   * headless/session-controller create agents. Without a model the persona
+   * template variable `{{model}}` renders with no value and the first turn
+   * errors out with no reply — this fallback is what prevents that.
+   */
+  private resolveModel(runtime: MessageRuntime): { provider?: string; model?: string } {
+    if (runtime.provider || runtime.model) {
+      return {
+        ...(runtime.provider ? { provider: runtime.provider } : {}),
+        ...(runtime.model ? { model: runtime.model } : {}),
+      }
+    }
+    const selection = this.ctx.get('agentDefaultModel')?.currentSelection()
+    return {
+      ...(selection?.provider ? { provider: selection.provider } : {}),
+      ...(selection?.model ? { model: selection.model } : {}),
+    }
+  }
+
   /** Create (and remember) the persistent agent for one external chat. */
   private async ensureAgent(sessionId: SessionId, runtime: MessageRuntime): Promise<AgentHandle> {
+    const model = this.resolveModel(runtime)
     const options: AgentOptions = {
-      ...(runtime.provider ? { provider: runtime.provider } : {}),
-      ...(runtime.model ? { model: runtime.model } : {}),
+      ...(model.provider ? { provider: model.provider } : {}),
+      ...(model.model ? { model: model.model } : {}),
       ...(runtime.maxTokens ? { maxTokens: runtime.maxTokens } : {}),
     }
     const cwdSet = runtime.cwd !== undefined && runtime.cwd !== ''
