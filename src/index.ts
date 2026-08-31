@@ -73,8 +73,11 @@ export function apply(ctx: Context, config: ConfigType): void {
   // Expose live channel status to the client over RPC so the UI reflects real
   // connection state. This namespace is injected into the client half via the
   // `remote.imGateway` service (see package.json dsh.client + client/index.ts).
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const remote = (ctx as any).remote
+  // `ctx.get` reads a service WITHOUT requiring it in `inject`, returning
+  // undefined when the host's runtime has no `remote` service — so hosts that
+  // lack ctx.remote (e.g. the server side generally) hit the fallback below
+  // instead of throwing "cannot get property remote without inject".
+  const remote = ctx.get('remote')
   if (remote && typeof remote.define === 'function') {
     remote.define('imGateway', () => ({
       list: () => channelManager.statusList(),
