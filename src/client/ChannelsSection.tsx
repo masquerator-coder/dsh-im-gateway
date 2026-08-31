@@ -115,7 +115,14 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState('')
 
-  const active = channels.find(ch => ch.id === activeId)
+  // The panel must not depend on first-mount timing: the settings snapshot can
+  // resolve AFTER this component mounts (mirror cold-loads on first open). Derive
+  // a safe active id so the existing-channel list renders as soon as any channel
+  // is present, even if `activeId` was initialised while `channels` was empty.
+  const resolvedActiveId: string | undefined = channels.some(ch => ch.id === activeId)
+    ? activeId
+    : channels[0]?.id
+  const active = channels.find(ch => ch.id === resolvedActiveId)
 
   const secretRef = (channelId: string, fieldKey: string): string =>
     `im-channels/${channelId}/${fieldKey}`
@@ -262,7 +269,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
           ),
         ),
       ),
-      active ? h('div', { style: { marginTop: '14px' } },
+      channels.length > 0 ? h('div', { style: { marginTop: '14px' } },
         h('div', { style: { fontSize: '12px', opacity: 0.7, marginBottom: '6px' } }, t('channels.add') + ' · ' + t('channels.status.connected')),
         h('div', { style: { display: 'grid', gap: '6px' } },
           channels.map(ch =>
@@ -271,8 +278,8 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
               onClick: () => select(ch.id),
               style: {
                 padding: '7px 10px', borderRadius: '8px', cursor: 'pointer', fontSize: '13px',
-                border: activeId === ch.id ? '1px solid #4f8cff' : '1px solid rgba(128,128,128,0.25)',
-                background: activeId === ch.id ? 'rgba(79,140,255,0.08)' : 'transparent',
+                border: resolvedActiveId === ch.id ? '1px solid #4f8cff' : '1px solid rgba(128,128,128,0.25)',
+                background: resolvedActiveId === ch.id ? 'rgba(79,140,255,0.08)' : 'transparent',
               },
             },
               h('div', { style: { fontWeight: 600 } }, ch.name),
