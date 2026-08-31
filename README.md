@@ -61,7 +61,7 @@ Each enabled channel holds a **live connection** (`connected` / `connecting` / `
 | `cordis.patch.yml` | Published **bundle** layer — references the package by name (`dsh-im-gateway` → `lib/index.js`) |
 | `scripts/build.mjs` | esbuild build: emits `lib/index.js` (node) + `lib/client.js` (browser) |
 | `scripts/smoke.mts` | Local smoke test (session hashing, HTTP route, reply callback, CMCC failure) |
-| `lib/` | Generated build output (git-ignored; produced by `prepare` on install) |
+| `lib/` | **Committed** build output — no `prepare`; git installs mount it as-is. Rebuild (`pnpm build`) & commit together with every `src/` change |
 | `docs/channel-ui-design.md` | Design doc for the multi-channel settings UI |
 | `LICENSE` | MIT license |
 | `README.md` | This file |
@@ -118,17 +118,20 @@ The plugin ships in **two interchangeable forms**:
 
 ### Install as a bundle
 
-Add the bundle to a profile (Git install builds `lib/` automatically via `prepare`):
+Add the bundle to a profile. The built `lib/` is **committed**, and the package has
+no `prepare`/`postinstall` script, so nothing runs on install:
 
 ```sh
 dsh plugin --profile demo add github:you/dsh-im-gateway
 ```
 
-> A Git install fetches sources and runs `prepare` (esbuild) to emit `lib/index.js`.
-> If your pnpm refuses the build permission, copy the package key pnpm prints into
-> the profile's `pnpm-workspace.yaml` `allowBuilds:` block (see the DSH
-> [publish docs](https://deepseek-harness.github.io/deepseek-harness/en/develop/basic/publish)).
-> For built artifacts instead, run `pnpm pack` and `dsh plugin --profile demo add ./dsh-im-gateway-<version>.tgz`.
+> No build scripts run on a Git install, so **no `allowBuilds` entry is needed** —
+> on this machine or on any sharee's. Just install and load.
+> **Contributor rule:** because `lib/` is committed, every `src/` change must ship
+> with its rebuilt `lib/` (`pnpm build` then commit) — otherwise the distributed
+> version runs a stale bundle.
+> For a single-file artifact instead of a Git install, run `pnpm pack` and
+> `dsh plugin --profile demo add ./dsh-im-gateway-<version>.tgz`.
 
 The bundle's layer is `cordis.patch.yml`, which inserts the `im-gateway` row with
 sensible defaults. Override any key from your profile's own `cordis.patch.yml`
@@ -204,8 +207,10 @@ left external (they resolve from the host runtime):
 pnpm build      # or: node scripts/build.mjs
 ```
 
-`prepare` runs the same build automatically when the package is installed from
-Git, so consumers always get a freshly built `lib/`. `lib/` is git-ignored.
+The committed `lib/` is what consumers load from a Git install. There is **no**
+`prepare` script — a Git install does not build anything (which is exactly why
+it needs no `allowBuilds` entry on any machine). **Rebuild and commit `lib/`
+together with every `src/` change** so the distributed bundle stays current.
 
 ### Type-checking
 

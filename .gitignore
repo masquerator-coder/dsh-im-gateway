@@ -5,9 +5,14 @@ node_modules/
 # pnpm's content-addressable store if it is ever materialised inside the repo.
 .pnpm-store/
 
-# Build output (esbuild bundle emitted by `prepare`/\`build`; git installs
-# rebuild it from source, so it is never committed)
-lib/
+# Build output (esbuild bundle emitted by `build`).
+#
+# COMMITTED on purpose: there is no `prepare` script, so pnpm does not build
+# this package on install — git installs mount the prebuilt `lib/` as-is. This
+# is what frees every downstream install (including all sharees) from pnpm's
+# allowBuilds step for THIS package. Rule: whenever `src/` changes, run
+# `pnpm build` and commit the rebuilt `lib/` in the same change — otherwise
+# the distributed git version would run a stale bundle.
 
 # Logs
 *.log

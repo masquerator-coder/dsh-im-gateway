@@ -27,7 +27,6 @@
   ],
   "scripts": {
     "build": "node scripts/build.mjs",
-    "prepare": "node scripts/build.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "smoke": "node --experimental-transform-types scripts/smoke.mts"
   },
