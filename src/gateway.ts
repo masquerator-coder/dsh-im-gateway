@@ -1,5 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle, AgentOptions } from '@deepseek-ai/dsh-agent'
+import { installModelSelection, type ModelSelection, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import { boundContextSummary, createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
@@ -157,6 +158,18 @@ export class ImGateway {
   /** Create (and remember) the persistent agent for one external chat. */
   private async ensureAgent(sessionId: SessionId, runtime: MessageRuntime): Promise<AgentHandle> {
     const model = this.resolveModel(runtime)
+    const selection: ModelSelection | undefined = (model.provider && model.model)
+      ? { provider: model.provider, model: model.model }
+      : undefined
+    // The agent-scoped model selection must be *installed* (not just passed as
+    // an option): installModelSelection wires the selected provider/model into
+    // both `system-prompt/assemble` (so a persona's `{{model}}` renders) and
+    // `agent/request` (so the LLM call actually routes to that provider). Without
+    // it the im agent runs with no model — the persona renders `{{model}}` empty
+    // and the first turn ends with zero tokens and no reply. This mirrors how
+    // DSH's own headless and session-controller create agents with the default
+    // model selection.
+    const modelRef: ModelSelectionRef = { current: selection, assembled: undefined }
     const options: AgentOptions = {
       ...(model.provider ? { provider: model.provider } : {}),
       ...(model.model ? { model: model.model } : {}),
@@ -170,11 +183,15 @@ export class ImGateway {
         ...(runtime.agentPreset ? { agentPreset: runtime.agentPreset } : {}),
       },
       ...(Object.keys(options).length > 0 ? { agentOptions: options } : {}),
-      setup: async () => {
+      setup: (agentCtx) => {
+        installModelSelection(agentCtx, modelRef)
         // Optional preset mount (only when explicitly configured).
       },
     })
-    this.ctx.logger.info(`[im-gateway] created agent ${sessionId}`)
+    this.ctx.logger.info(
+      `[im-gateway] created agent ${sessionId}`
+        + (selection ? ` (model=${selection.provider}/${selection.model})` : ' (no default model!)'),
+    )
     return handle
   }
 
