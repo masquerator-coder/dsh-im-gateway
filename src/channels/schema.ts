@@ -8,6 +8,10 @@
  *
  * This file is host-only because it value-imports schemastery; the browser
  * half consumes the pure types from `./types.ts` instead.
+ *
+ * DSH's vendored schemastery has NO `.optional()` — optional fields are
+ * declared with `.required(false)` (see vendor/schemastery/src/index.ts:
+ * `Schema.required(value?)`); `.required()` marks a field mandatory.
  */
 
 import z from '@deepseek-ai/schemastery'
@@ -24,36 +28,36 @@ export const CHANNEL_TYPES: readonly ChannelType[] = [
 /** schemastery schema for the `im-channels` namespace. */
 export const ChannelsSettingsSchema: z<ChannelsSettings> = z.object({
   channels: z.array(z.object({
-    id: z.string(),
-    type: z.union([...CHANNEL_TYPES]),
-    name: z.string(),
-    enabled: z.boolean().default(false),
-    note: z.string().optional(),
+    id: z.string().required(),
+    type: z.union([...CHANNEL_TYPES]).required(),
+    name: z.string().required(),
+    enabled: z.boolean().required(false).default(false),
+    note: z.string().required(false),
 
     // email
-    host: z.string().optional(),
-    imapPort: z.number().optional(),
-    smtpPort: z.number().optional(),
-    useTls: z.boolean().optional(),
-    account: z.string().optional(),
+    host: z.string().required(false),
+    imapPort: z.number().required(false),
+    smtpPort: z.number().required(false),
+    useTls: z.boolean().required(false),
+    account: z.string().required(false),
 
     // cmcc
-    serverUrl: z.string().optional(),
-    uploadUrl: z.string().optional(),
-    version: z.string().optional(),
+    serverUrl: z.string().required(false),
+    uploadUrl: z.string().required(false),
+    version: z.string().required(false),
 
     // http
-    inboundPath: z.string().optional(),
-    chatIdField: z.string().optional(),
-    textField: z.string().optional(),
-    callbackUrl: z.string().optional(),
-    callbackChatHeader: z.string().optional(),
+    inboundPath: z.string().required(false),
+    chatIdField: z.string().required(false),
+    textField: z.string().required(false),
+    callbackUrl: z.string().required(false),
+    callbackChatHeader: z.string().required(false),
 
     // base
-    provider: z.string().optional(),
-    model: z.string().optional(),
-    cwd: z.string().optional(),
-    agentPreset: z.string().optional(),
+    provider: z.string().required(false),
+    model: z.string().required(false),
+    cwd: z.string().required(false),
+    agentPreset: z.string().required(false),
   })).default([]),
 })
 
