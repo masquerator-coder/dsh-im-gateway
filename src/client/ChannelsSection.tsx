@@ -13,7 +13,7 @@
  */
 
 import * as React from 'react'
-import { createElement as h, Fragment, useCallback, useMemo, useState, useSyncExternalStore } from 'react'
+import { createElement as h, Fragment, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 
 import {
   type ChannelConfig, type ChannelsSettings, type ChannelType,
@@ -145,17 +145,31 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     }
   }, [credentials])
 
-  // Select a channel: reset draft and load its key state.
+  // Select an existing channel: just point at it. Loading its saved values is
+  // handled by the effect below (single source of truth, also covers the
+  // initial auto-selection of `channels[0]` on first mount).
   const select = useCallback((id: string) => {
     setActiveId(id)
     setCreating(null)
-    const ch = channels.find(c => c.id === id)
-    if (ch) {
-      setDraftName(ch.name ?? '')
-      setDraft({})
-      void loadSecrets(ch)
+  }, [])
+
+  // When the selection changes to a real existing channel, backfill the form
+  // with its saved non-secret values. Secrets are never returned to the client
+  // (credentials describe only reports "set"/"configured"), so those fields
+  // correctly stay empty and just show the "credential.set" placeholder.
+  useEffect(() => {
+    if (creating !== null || !active) return
+    const loaded: Record<string, string> = {}
+    for (const f of fieldsFor(active.type)) {
+      if (f.secret) continue
+      const v = (active as Record<string, unknown>)[f.key]
+      if (v !== undefined && v !== null) loaded[f.key] = String(v)
     }
-  }, [channels, loadSecrets])
+    setDraft(loaded)
+    setDraftName(active.name ?? '')
+    void loadSecrets(active)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active?.id])
 
   const beginCreate = useCallback((type: ChannelType) => {
     setCreating(type)
