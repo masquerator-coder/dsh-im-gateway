@@ -240,21 +240,40 @@ export class ImGateway {
     const workspacePath = runtime.cwd && runtime.cwd !== '' ? runtime.cwd : (this.defaults.cwd || defaultWorkspaceDir())
     const workspace = await this.ensureWorkspace(workspacePath)
 
-    const handle = await this.ctx.agents.create({
-      sessionId,
-      meta: {
-        cwd: workspacePath,
-        ...(runtime.agentPreset ? { agentPreset: runtime.agentPreset } : {}),
-      },
-      ...(Object.keys(options).length > 0 ? { agentOptions: options } : {}),
-      setup: async (agentCtx) => {
-        installModelSelection(agentCtx, modelRef)
-        const presets = this.ctx.get('agentPresets')
-        if (presets !== undefined) {
-          await presets.mount(agentCtx, runtime.agentPreset || undefined)
-        }
-      },
-    })
+    // Shared "webhook-aligned" composition for both create and resume. Resume
+    // loads an existing persisted session; create mints a fresh one. Either way
+    // the agent gets the same model selection + agent preset the web path uses.
+    const setup = async (agentCtx: Context): Promise<void> => {
+      installModelSelection(agentCtx, modelRef)
+      const presets = this.ctx.get('agentPresets')
+      if (presets !== undefined) {
+        await presets.mount(agentCtx, runtime.agentPreset || undefined)
+      }
+    }
+
+    let handle: AgentHandle
+    if (await this.sessionPersisted(sessionId)) {
+      // Cross-restart continuation: the same stable id already has a persisted
+      // log (under the workspace cwd now, not `_no-cwd`). `agents.create` would
+      // collide with it, so resume through the factory instead — this is the
+      // step that makes "重启可续" work without an id collision.
+      this.ctx.logger.info(`[im-gateway] resuming agent ${sessionId} (workspace=${workspacePath})`)
+      handle = await this.ctx.agents.resume({
+        resumeSessionId: sessionId,
+        agentOptions: options,
+        setup,
+      })
+    } else {
+      handle = await this.ctx.agents.create({
+        sessionId,
+        meta: {
+          cwd: workspacePath,
+          ...(runtime.agentPreset ? { agentPreset: runtime.agentPreset } : {}),
+        },
+        ...(Object.keys(options).length > 0 ? { agentOptions: options } : {}),
+        setup,
+      })
+    }
 
     // Register the session under its workspace so resumed/created sessions keep
     // the same durable identity the workspace expects (mirrors webhook).
@@ -316,6 +335,30 @@ export class ImGateway {
     const entity = existing ?? await registry.create(path)
     this.workspaces.set(path, entity)
     return entity
+  }
+
+  /**
+   * Probe whether a stable id already has a persisted session so `ensureAgent`
+   * can `resume` instead of `create` (which would collide). Mirrors the API
+   * session-controller: `sessionQuery.observeSession` resolves for a live or
+   * prepared session and throws `SESSION_QUERY_SESSION_NOT_FOUND` otherwise.
+   * Returns false when the probe service is absent (host without session query)
+   * so creation still proceeds as a fresh-session fallback.
+   */
+  private async sessionPersisted(sessionId: SessionId): Promise<boolean> {
+    const query = this.ctx.get('sessionQuery') as { observeSession?(id: SessionId): Promise<unknown> } | undefined
+    if (query === undefined || typeof query.observeSession !== 'function') return false
+    try {
+      const lease = await query.observeSession(sessionId)
+      // Caller-owned lease: release it now — it was only an existence probe.
+      const disposable = lease as { [Symbol.dispose]?: () => void } | undefined
+      try { disposable?.[Symbol.dispose]?.() } catch { /* best-effort release */ }
+      return true
+    } catch (error: unknown) {
+      if ((error as { code?: string })?.code === 'SESSION_QUERY_SESSION_NOT_FOUND') return false
+      this.ctx.logger.warn(`[im-gateway] session probe ${sessionId}: ${errorChain(error)}`)
+      return false
+    }
   }
 
   /** Wait for the collected reply, then forward it through the sink. */
