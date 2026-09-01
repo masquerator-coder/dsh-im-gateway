@@ -19,6 +19,16 @@ import { sessionIdForChat } from './session.ts'
  */
 const REPLY_TIMEOUT_MS = 300_000
 
+/**
+ * Inbound de-duplication window: suppresses a platform replay/echo of the same
+ * chat + text arriving again within this window so a duplicate never
+ * double-triggers a model turn.
+ */
+const DEDUP_WINDOW_MS = 5_000
+
+/** Bounded retries (total delivery attempts) for one reply over a flaky channel. */
+const REPLY_DELIVERY_MAX_ATTEMPTS = 2
+
 /** Per-message routing options resolved from the channel that received it. */
 export interface MessageRuntime {
   /** Optional provider route override for the created agent. */
@@ -35,6 +45,12 @@ export interface MessageRuntime {
   title?: string
   /** Whether to dispose the agent right after its reply is delivered. */
   disposeAfterReply?: boolean
+  /**
+   * Receiving channel/bot identity, folded into the session key so two channels
+   * (or bots) with the same external chat id never share a session. Filled by
+   * each transport (cmcc/email/...), defaults to the gateway-level channel.
+   */
+  channel?: string
 }
 
 /** A function transport supplies to push one agent reply back out. */
@@ -53,6 +69,13 @@ export interface AgentRouting {
   cwd?: string
   agentPreset?: string
   title?: string
+  /** Default channel/bot identity used when a runtime doesn't supply one. */
+  channel?: string
+  /**
+   * Sender allowlist (access control). Non-empty ⇒ only these senderIds may
+   * drive the agent; others (or sender-less messages) are denied up front.
+   */
+  allowlist?: string[]
 }
 
 /** Render an assistant message's text blocks into one reply string. */
@@ -66,6 +89,11 @@ function textOf(event: Extract<SessionEvent, { type: 'assistant/message' }>): st
 /** Resolve after `ms`, tagging the outcome so a caller can distinguish timeout from a settled turn. */
 function timeout(ms: number): Promise<'timeout'> {
   return new Promise((resolve) => { setTimeout(() => resolve('timeout'), ms) })
+}
+
+/** Resolve after `ms`, used for bounded delivery-retry backoff. */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => { setTimeout(resolve, ms) })
 }
 
 /**
@@ -168,6 +196,10 @@ export class ImGateway {
   private readonly workspaces = new Map<string, WorkspaceEntity>()
   /** Disposer for the global `session/event` mux; cleared on close(). */
   private readonly offSessionEvent: () => void
+  /** Per-session tail promises, serializing concurrent messages for one chat. */
+  private readonly tails = new Map<SessionId, Promise<void>>()
+  /** Recent-message dedup key → first-seen timestamp. */
+  private readonly recent = new Map<string, number>()
 
   constructor(
     private readonly ctx: Context,
@@ -181,10 +213,48 @@ export class ImGateway {
     }, { global: true })
   }
 
-  /** Handle one inbound IM message and deliver the collected reply via `reply`. */
+  /**
+   * Handle one inbound IM message and deliver the collected reply via `reply`.
+   *
+   * Order of gates, before any agent/workspace/model side effect:
+   * 1. sender allowlist (access control, deny-by-default when configured);
+   * 2. inbound de-duplication (platform replay/echo suppression);
+   * 3. per-session serialization (at most one in-flight turn per chat so
+   *    concurrent messages can't overwrite each other's reply claim).
+   */
   async handle(message: InboundMessage, reply: ReplySink, runtime: MessageRuntime = {}): Promise<void> {
-    const { chatId, text } = message
-    const sessionId = SessionId(sessionIdForChat(chatId))
+    const channel = runtime.channel ?? this.defaults.channel
+    if (!this.allowSender(message)) {
+      this.ctx.logger.warn(`[im-gateway] denied message chat=${message.chatId} sender=${message.senderId ?? '(none)'}`)
+      return
+    }
+    if (this.isRecentDuplicate(message, channel)) {
+      this.ctx.logger.info(`[im-gateway] suppressed duplicate chat=${message.chatId} sender=${message.senderId ?? '(none)'}`)
+      return
+    }
+    // Fold the receiving channel into the session key so the same external
+    // chat id on different channels never shares a session (isolation).
+    const sessionId = SessionId(sessionIdForChat(message.chatId, channel ?? ''))
+    const prev = this.tails.get(sessionId) ?? Promise.resolve()
+    const run = prev
+      .then(() => this.process(sessionId, message, reply, runtime, channel))
+      .catch((error: unknown) => {
+        this.ctx.logger.warn(`[im-gateway] handle ${sessionId} failed: ${errorChain(error)}`)
+      })
+    this.tails.set(sessionId, run.finally(() => {
+      if (this.tails.get(sessionId) === run) this.tails.delete(sessionId)
+    }))
+    await run
+  }
+
+  /** The body of one turn: ensure agent, claim the turn, follow up, collect reply. */
+  private async process(
+    sessionId: SessionId,
+    message: InboundMessage,
+    reply: ReplySink,
+    runtime: MessageRuntime,
+    channel?: string,
+  ): Promise<void> {
     let handle = this.agents.get(sessionId)
     if (handle === undefined) {
       handle = await this.ensureAgent(sessionId, runtime)
@@ -195,7 +265,7 @@ export class ImGateway {
     this.waiters.set(sessionId, wait)
 
     handle.agent.followup(createUserMessage({
-      content: [{ type: 'text', text }],
+      content: [{ type: 'text', text: this.composePrompt(message, channel) }],
       // A `user` MessageSource carries `{ kind: 'user' }` plus optional opaque
       // provenance fields in the merge-extensible runtime type. The `rpcId`
       // lets the global session/event collector claim exactly this prompt's
@@ -204,6 +274,38 @@ export class ImGateway {
     }))
 
     await this.awaitReply(sessionId, wait, reply, runtime)
+  }
+
+  /** Sender access control: allow all when no allowlist, else deny-by-default. */
+  private allowSender(message: InboundMessage): boolean {
+    const allow = this.defaults.allowlist
+    if (allow === undefined || allow.length === 0) return true
+    if (message.senderId === undefined || message.senderId === '') return false
+    return allow.includes(message.senderId)
+  }
+
+  /** Suppress identical chat+text replays/echoes within the dedup window. */
+  private isRecentDuplicate(message: InboundMessage, channel?: string): boolean {
+    const key = `${channel ?? ''}|${message.chatId}|${message.text}`
+    const now = Date.now()
+    const first = this.recent.get(key)
+    if (first !== undefined && now - first < DEDUP_WINDOW_MS) return true
+    if (this.recent.size > 500) {
+      for (const [k, t] of this.recent) {
+        if (now - t >= DEDUP_WINDOW_MS) this.recent.delete(k)
+      }
+    }
+    this.recent.set(key, now)
+    return false
+  }
+
+  /** Prepend source metadata (⑤) so the model knows who/which channel asked. */
+  private composePrompt(message: InboundMessage, channel?: string): string {
+    const meta: Record<string, string> = {}
+    if (channel !== undefined && channel !== '') meta.channel = channel
+    if (message.senderId !== undefined && message.senderId !== '') meta.senderId = message.senderId
+    if (Object.keys(meta).length === 0) return message.text
+    return `<dsh_im_source>${JSON.stringify(meta)}</dsh_im_source>\n\n${message.text}`
   }
 
   /** Resolve the provider + model: explicit per-channel values win, else the default model selection. */
@@ -379,7 +481,7 @@ export class ImGateway {
       const text = wait.settle()
       this.waiters.delete(sessionId)
       if (text !== '') {
-        await reply(text)
+        await this.deliverWithRetry(reply, text, sessionId)
       } else {
         this.ctx.logger.warn(`[im-gateway] empty reply for ${sessionId}`)
       }
@@ -390,6 +492,27 @@ export class ImGateway {
     } finally {
       if (runtime.disposeAfterReply) {
         void this.disposeAgent(sessionId)
+      }
+    }
+  }
+
+  /**
+   * Push one reply through the sink with a bounded retry. Delivery failures are
+   * never silent (④): every failed attempt is logged, and the final give-up is
+   * explicitly marked "NOT delivered" so loss is observable by the operator.
+   */
+  private async deliverWithRetry(reply: ReplySink, text: string, sessionId: SessionId): Promise<void> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await reply(text)
+        return
+      } catch (error: unknown) {
+        if (attempt >= REPLY_DELIVERY_MAX_ATTEMPTS) {
+          this.ctx.logger.warn(`[im-gateway] reply NOT delivered for ${sessionId} after ${attempt} attempts: ${errorChain(error)}`)
+          return
+        }
+        this.ctx.logger.warn(`[im-gateway] reply attempt ${attempt} failed for ${sessionId}: ${errorChain(error)}`)
+        await delay(300 * attempt)
       }
     }
   }
@@ -433,6 +556,8 @@ export class ImGateway {
     }
     this.agents.clear()
     this.waiters.clear()
+    this.tails.clear()
+    this.recent.clear()
   }
 }
 

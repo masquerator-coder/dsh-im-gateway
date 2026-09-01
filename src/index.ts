@@ -20,6 +20,7 @@ export function apply(ctx: Context, config: ConfigType): void {
     model: config.model,
     cwd: config.cwd,
     agentPreset: config.agentPreset,
+    allowlist: config.allowlist,
   })
 
   // One shared inbound HTTP server serves BOTH the legacy global webhook (at
@@ -65,6 +66,7 @@ export function apply(ctx: Context, config: ConfigType): void {
         cwd: config.cwd || undefined,
         agentPreset: config.agentPreset || undefined,
         disposeAfterReply: config.disposeAfterReply,
+        channel: 'http',
       })
       return undefined
     },

@@ -126,6 +126,7 @@ export class WechatClawTransport implements ChannelTransport {
           model: this.options.model,
           maxTokens: this.options.maxTokens,
           disposeAfterReply: this.options.disposeAfterReply,
+          channel: 'wechat',
         },
       })
     }

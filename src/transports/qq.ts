@@ -94,6 +94,7 @@ export class QQTransport implements ChannelTransport {
           model: this.options.model,
           maxTokens: this.options.maxTokens,
           disposeAfterReply: this.options.disposeAfterReply,
+          channel: 'qq',
         },
       })
     } else if (uid) {
@@ -108,6 +109,7 @@ export class QQTransport implements ChannelTransport {
           model: this.options.model,
           maxTokens: this.options.maxTokens,
           disposeAfterReply: this.options.disposeAfterReply,
+          channel: 'qq',
         },
       })
     }

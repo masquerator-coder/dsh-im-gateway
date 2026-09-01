@@ -19,6 +19,12 @@ export interface Config {
   textField: string
   /** Optional field carrying the sender id; appended to context for attribution. */
   senderField: string
+  /**
+   * Sender allowlist (access control). When non-empty, only these senderIds may
+   * drive the agent; every other (or sender-less) message is denied BEFORE any
+   * agent/workspace/model side effect. Empty disables per-sender authz.
+   */
+  allowlist: string[]
   /** Callback URL the agent's reply is POSTed to. */
   callbackUrl: string
   /** Callback request header name for the chat id (default x-im-chat-id). */
@@ -47,6 +53,7 @@ export const Config: Schema<Config> = Schema.object({
   chatIdField: Schema.string().default('chat_id'),
   textField: Schema.string().default('text'),
   senderField: Schema.string().default('sender_id'),
+  allowlist: Schema.array(Schema.string()).default([]),
   callbackUrl: Schema.string().required(),
   callbackChatHeader: Schema.string().default('x-im-chat-id'),
   callbackSecretHeader: Schema.string().default('x-im-secret'),

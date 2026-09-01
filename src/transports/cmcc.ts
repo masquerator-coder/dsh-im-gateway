@@ -22,6 +22,7 @@ export interface CmccTransportOptions {
       model?: string
       maxTokens?: number
       disposeAfterReply?: boolean
+      channel?: string
     }
   }) => void
   /** Called whenever the underlying connection state changes. */
@@ -93,6 +94,7 @@ export class CmccTransport implements ChannelTransport {
         model: this.options.model,
         maxTokens: this.options.maxTokens,
         disposeAfterReply: this.options.disposeAfterReply,
+        channel: 'cmcc',
       },
     })
   }
