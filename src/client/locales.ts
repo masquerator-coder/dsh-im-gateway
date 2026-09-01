@@ -25,7 +25,6 @@ export const zh = {
   'channels.status.connecting': '连接中…',
   'channels.status.connected': '已连接',
   'channels.status.error': '连接错误',
-  'channels.status.placeholder': '接入引导',
   'type.wechat': '微信',
   'type.qq': 'QQ',
   'type.email': '邮箱 Email',
@@ -62,10 +61,6 @@ export const zh = {
   'field.qq': 'QQ 号',
   'field.qqPassword': '密码（可选）',
   'credential.set': '已保存(更改请重新填写)',
-  'credential.placeholder.isSet': '(已配置，留空保持不变)',
-  'placeholder.guide': '接入指引',
-  'placeholder.open': '打开指引',
-  'placeholder.note': '该通道在本版本为接入引导占位。请前往官方渠道获取接入信息。',
 } as const
 
 export const en = {
@@ -87,7 +82,6 @@ export const en = {
   'channels.status.connecting': 'Connecting…',
   'channels.status.connected': 'Connected',
   'channels.status.error': 'Error',
-  'channels.status.placeholder': 'Guide only',
   'type.wechat': 'WeChat',
   'type.qq': 'QQ',
   'type.email': 'Email',
@@ -124,10 +118,6 @@ export const en = {
   'field.qq': 'QQ number',
   'field.qqPassword': 'Password (optional)',
   'credential.set': 'Saved (re-enter to change)',
-  'credential.placeholder.isSet': '(configured; leave blank to keep)',
-  'placeholder.guide': 'Access guide',
-  'placeholder.open': 'Open guide',
-  'placeholder.note': 'This channel is a guide placeholder in this build. Visit the official channel for access details.',
 } as const
 
 export type ImChannelsKey = keyof typeof zh

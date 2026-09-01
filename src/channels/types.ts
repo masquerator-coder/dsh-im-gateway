@@ -84,4 +84,4 @@ export interface ChannelsSettings {
 }
 
 /** Connection lifecycle state surfaced to the UI (live via RPC). */
-export type ChannelStatus = 'idle' | 'connecting' | 'connected' | 'error' | 'placeholder'
+export type ChannelStatus = 'idle' | 'connecting' | 'connected' | 'error'

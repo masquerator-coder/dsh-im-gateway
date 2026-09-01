@@ -23,9 +23,6 @@ import {
   type ChannelConfig, type ChannelsSettings, type ChannelType,
 } from '../channels/types.ts'
 
-/** Placeholder kinds only show an access guide (no live form). */
-const GUIDE_ONLY: readonly ChannelType[] = []
-
 /** One editable field of a channel, keyed by the schema field name. */
 interface Field {
   key: string
@@ -324,7 +321,6 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
       case 'connected': return t('channels.status.connected')
       case 'connecting': return t('channels.status.connecting')
       case 'error': return t('channels.status.error')
-      case 'placeholder': return t('channels.status.placeholder')
       default: return t('channels.status.idle')
     }
   }
