@@ -1,16 +1,25 @@
+import { randomUUID } from 'node:crypto'
+import { mkdir } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
-import type { Agent, AgentHandle, AgentOptions } from '@deepseek-ai/dsh-agent'
+import type { AgentHandle, AgentOptions } from '@deepseek-ai/dsh-agent'
 import { installModelSelection, type ModelSelection, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
-import { boundContextSummary, createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, errorChain, type MessageSource } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
-import type { SessionEvent } from '@deepseek-ai/dsh-session'
+import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { sessionIdForChat } from './session.ts'
 
 /**
- * Per-message runtime options, resolved from the channel that received it
- * (agent routing can differ from one IM channel to the next).
+ * Safety bound on one reply turn. The inbound HTTP server acks (202) only after
+ * `gateway.handle()` resolves, so a reply wait MUST always terminate — the
+ * global `session/event` mux settles on `turn/end`, and this timeout is the
+ * fallback that guarantees the ack goes out even if the agent drops the turn.
  */
+const REPLY_TIMEOUT_MS = 300_000
+
+/** Per-message routing options resolved from the channel that received it. */
 export interface MessageRuntime {
   /** Optional provider route override for the created agent. */
   provider?: string
@@ -18,49 +27,18 @@ export interface MessageRuntime {
   model?: string
   /** Optional positive output-token cap. */
   maxTokens?: number
-  /** Optional working directory for the agent session. */
+  /** Optional working directory for the agent session (a real Harness workspace). */
   cwd?: string
-  /** Optional agent preset. */
+  /** Optional agent preset label. */
   agentPreset?: string
+  /** Optional human-readable session title shown in the web UI. */
+  title?: string
   /** Whether to dispose the agent right after its reply is delivered. */
   disposeAfterReply?: boolean
 }
 
-/** A function the transport supplies to push one agent reply back out. */
+/** A function transport supplies to push one agent reply back out. */
 export type ReplySink = (text: string) => Promise<void>
-
-/** Render an assistant message's text blocks into one reply string. */
-function textOf(event: Extract<SessionEvent, { type: 'assistant/message' }>): string {
-  return event.data.message.content
-    .filter(block => block.type === 'text')
-    .map(block => block.text)
-    .join('')
-}
-
-/** Accumulate one reply run: collects streaming text until the agent settles. */
-class ReplyCollector {
-  private readonly parts: string[] = []
-  private settled = false
-
-  constructor(
-    readonly agent: Agent,
-    private readonly session: unknown,
-  ) {}
-
-  append(text: string): void {
-    if (!this.settled) this.parts.push(text)
-  }
-
-  settle(): string {
-    if (this.settled) return this.parts.join('')
-    this.settled = true
-    return this.parts.join('')
-  }
-
-  owns(session: unknown): boolean {
-    return session === this.session
-  }
-}
 
 export interface InboundMessage {
   chatId: string
@@ -74,33 +52,136 @@ export interface AgentRouting {
   maxTokens?: number
   cwd?: string
   agentPreset?: string
+  title?: string
+}
+
+/** Render an assistant message's text blocks into one reply string. */
+function textOf(event: Extract<SessionEvent, { type: 'assistant/message' }>): string {
+  return event.data.message.content
+    .filter(block => block.type === 'text')
+    .map(block => block.text)
+    .join('')
+}
+
+/** Resolve after `ms`, tagging the outcome so a caller can distinguish timeout from a settled turn. */
+function timeout(ms: number): Promise<'timeout'> {
+  return new Promise((resolve) => { setTimeout(() => resolve('timeout'), ms) })
 }
 
 /**
- * One gateway instance: maps external chats to persistent agents, injects
- * inbound messages and routes each collected reply back through the per-message
- * `ReplySink` that the receiving transport supplied. This decouples the agent
- * plumbing (common to every channel) from the transport (per channel).
+ * One in-flight reply: claims the turn opened by the user message identified by
+ * `promptRpcId`, accumulates that turn's assistant text, and settles on its
+ * `turn/end`. Turn tracking mirrors how DSH's own harness client distills one
+ * prompt's reply from the global session event stream. `done` resolves exactly
+ * when the owned turn ends — the event-mux drives settlement (rpcId claiming is
+ * race-immune), not an `agent.whenIdle()` poll.
+ */
+class ReplyWaiter {
+  private readonly parts: string[] = []
+  private owned = false
+  private openTurn = -1
+  private closed = false
+
+  /** Resolves when this waiter settles on its owned `turn/end`. */
+  readonly done: Promise<void>
+  private resolveDone!: () => void
+
+  constructor(
+    readonly sessionId: SessionId,
+    readonly promptRpcId: string,
+  ) {
+    this.done = new Promise((resolve) => { this.resolveDone = resolve })
+  }
+
+  /** Observe one session event; returns true once this waiter is settled. */
+  observe(event: SessionEvent): boolean {
+    if (this.closed) return true
+    switch (event.type) {
+      case 'turn/start':
+        this.openTurn = event.data?.turn ?? -1
+        return false
+      case 'user/message':
+        // The pinned dsh-agent `user` source is closed to `{ kind: 'user' }`,
+        // but dsh's MessageSource is merge-extensible at runtime: the rpcId we
+        // attach to the user message is persisted/emitted verbatim, and the
+        // harness's own client claims turns by it (dsh-im-main 同款逻辑).
+        if ((event.data?.source as { rpcId?: string } | undefined)?.rpcId === this.promptRpcId) this.owned = true
+        return false
+      case 'assistant/message':
+        if (this.owned) this.parts.push(textOf(event))
+        return false
+      case 'turn/end':
+        if (this.owned && event.data?.turn === this.openTurn) {
+          this.finish()
+          return true
+        }
+        return false
+      default:
+        return false
+    }
+  }
+
+  /** Force-close this waiter (timeout / caller teardown) and return what is accumulated so far. */
+  settle(): string {
+    this.finish()
+    return this.parts.join('')
+  }
+
+  private finish(): void {
+    if (this.closed) return
+    this.closed = true
+    this.resolveDone()
+  }
+}
+
+/** Minimal structural type for a Harness workspace entity (dynamic service, no static dep). */
+interface WorkspaceEntity {
+  path: string
+  attachSession(sessionId: SessionId): Promise<void>
+}
+
+/** Minimal structural type for the workspace registry service. */
+interface WorkspaceRegistry {
+  list(): readonly WorkspaceEntity[]
+  create(path: string, title?: string): Promise<WorkspaceEntity>
+}
+
+/** Base directory for IM sessions when no explicit workspace `cwd` is configured. */
+function defaultWorkspaceDir(): string {
+  return join(homedir(), '.dsh', 'im-workspace')
+}
+
+/**
+ * One gateway instance: maps external chats to persistent Harness sessions and
+ * routes each collected reply back through the per-message `ReplySink` the
+ * receiving transport supplied.
+ *
+ * Sessions are created exactly like DSH's own webhook/session-controller path:
+ * attached to a real Harness workspace, given the default (or per-channel)
+ * agent preset, and pinned to the deployment default permission preset. This is
+ * what makes the agent turn assemble a real model request and lets a stable
+ * session id resume cleanly across restarts (no `_no-cwd` id collision).
  */
 export class ImGateway {
   private readonly agents = new Map<SessionId, AgentHandle>()
-  private readonly pending = new Map<SessionId, ReplyCollector>()
+  private readonly waiters = new Map<SessionId, ReplyWaiter>()
+  private readonly workspaces = new Map<string, WorkspaceEntity>()
+  /** Disposer for the global `session/event` mux; cleared on close(). */
+  private readonly offSessionEvent: () => void
 
   constructor(
     private readonly ctx: Context,
     private readonly defaults: AgentRouting = {},
   ) {
-    // Observe every reply across the runtime and forward matching runs.
-    ctx.on('session/event', (session, event) => {
-      this.onSessionEvent(session, event)
-    })
+    // `global: true` mirrors the webhook/session-controller: receive session
+    // events regardless of Cordis binding so an agent created here can always
+    // claim its turns. The returned disposer is kept for close() cleanup.
+    this.offSessionEvent = ctx.on('session/event', (_session, event: SessionEvent) => {
+      this.onSessionEvent(_session, event)
+    }, { global: true })
   }
 
-  /**
-   * Handle one inbound IM message: inject it into the persistent agent for the
-   * external chat (creating the agent on first contact), then deliver the reply
-   * back through `reply`.
-   */
+  /** Handle one inbound IM message and deliver the collected reply via `reply`. */
   async handle(message: InboundMessage, reply: ReplySink, runtime: MessageRuntime = {}): Promise<void> {
     const { chatId, text } = message
     const sessionId = SessionId(sessionIdForChat(chatId))
@@ -109,38 +190,23 @@ export class ImGateway {
       handle = await this.ensureAgent(sessionId, runtime)
       this.agents.set(sessionId, handle)
     }
-    const agent = handle.agent
 
-    // End any collector still waiting on the previous turn so it does not
-    // swallow text belonging to the new turn.
-    const previous = this.pending.get(sessionId)
-    if (previous !== undefined) {
-      previous.settle()
-      this.pending.delete(sessionId)
-    }
+    const wait = new ReplyWaiter(sessionId, randomUUID())
+    this.waiters.set(sessionId, wait)
 
-    const collector = new ReplyCollector(agent, agent.session)
-    this.pending.set(sessionId, collector)
-
-    const bundled = this.describeInbound(message)
-    agent.followup(createUserMessage({
+    handle.agent.followup(createUserMessage({
       content: [{ type: 'text', text }],
-      source: {
-        kind: 'user',
-        ...(bundled === undefined ? {} : { summary: bundled }),
-      },
+      // A `user` MessageSource carries `{ kind: 'user' }` plus optional opaque
+      // provenance fields in the merge-extensible runtime type. The `rpcId`
+      // lets the global session/event collector claim exactly this prompt's
+      // turn and assemble its assistant reply (mirrors dsh-im-main).
+      source: { kind: 'user', rpcId: wait.promptRpcId } as unknown as MessageSource,
     }))
-    void this.awaitReply(sessionId, collector, reply, runtime)
+
+    await this.awaitReply(sessionId, wait, reply, runtime)
   }
 
-  /**
-   * Resolve the provider + model for a created agent: explicit per-channel
-   * runtime values win; otherwise fall back to the deployment default model
-   * selection (`agentDefaultModel.currentSelection()`), matching how DSH's own
-   * headless/session-controller create agents. Without a model the persona
-   * template variable `{{model}}` renders with no value and the first turn
-   * errors out with no reply — this fallback is what prevents that.
-   */
+  /** Resolve the provider + model: explicit per-channel values win, else the default model selection. */
   private resolveModel(runtime: MessageRuntime): { provider?: string; model?: string } {
     if (runtime.provider || runtime.model) {
       return {
@@ -155,65 +221,128 @@ export class ImGateway {
     }
   }
 
-  /** Create (and remember) the persistent agent for one external chat. */
+  /** Create a persistent session for one external chat, workspace-attached and fully composed. */
   private async ensureAgent(sessionId: SessionId, runtime: MessageRuntime): Promise<AgentHandle> {
     const model = this.resolveModel(runtime)
     const selection: ModelSelection | undefined = (model.provider && model.model)
       ? { provider: model.provider, model: model.model }
       : undefined
-    // The agent-scoped model selection must be *installed* (not just passed as
-    // an option): installModelSelection wires the selected provider/model into
-    // both `system-prompt/assemble` (so a persona's `{{model}}` renders) and
-    // `agent/request` (so the LLM call actually routes to that provider). Without
-    // it the im agent runs with no model — the persona renders `{{model}}` empty
-    // and the first turn ends with zero tokens and no reply. This mirrors how
-    // DSH's own headless and session-controller create agents with the default
-    // model selection.
     const modelRef: ModelSelectionRef = { current: selection, assembled: undefined }
     const options: AgentOptions = {
       ...(model.provider ? { provider: model.provider } : {}),
       ...(model.model ? { model: model.model } : {}),
       ...(runtime.maxTokens ? { maxTokens: runtime.maxTokens } : {}),
     }
-    const cwdSet = runtime.cwd !== undefined && runtime.cwd !== ''
+
+    // A real Harness workspace (explicit cwd, else the IM default). Attaching
+    // every session to one is what lets a stable id resume instead of colliding
+    // with a persisted `_no-cwd` log.
+    const workspacePath = runtime.cwd && runtime.cwd !== '' ? runtime.cwd : (this.defaults.cwd || defaultWorkspaceDir())
+    const workspace = await this.ensureWorkspace(workspacePath)
+
     const handle = await this.ctx.agents.create({
       sessionId,
       meta: {
-        ...(cwdSet ? { cwd: runtime.cwd } : {}),
+        cwd: workspacePath,
         ...(runtime.agentPreset ? { agentPreset: runtime.agentPreset } : {}),
       },
       ...(Object.keys(options).length > 0 ? { agentOptions: options } : {}),
-      setup: (agentCtx) => {
+      setup: async (agentCtx) => {
         installModelSelection(agentCtx, modelRef)
-        // Optional preset mount (only when explicitly configured).
+        const presets = this.ctx.get('agentPresets')
+        if (presets !== undefined) {
+          await presets.mount(agentCtx, runtime.agentPreset || undefined)
+        }
       },
     })
+
+    // Register the session under its workspace so resumed/created sessions keep
+    // the same durable identity the workspace expects (mirrors webhook).
+    if (workspace !== undefined) {
+      try {
+        await workspace.attachSession(sessionId)
+      } catch (error: unknown) {
+        this.ctx.logger.warn(`[im-gateway] attach session ${sessionId} to workspace: ${errorChain(error)}`)
+      }
+    }
+
+    // Pinning the effective permission preset and a stable title mirrors the
+    // webhook/session-controller session bootstrap and gives the reply/UI a
+    // recognizable surface.
+    const permission = this.ctx.get('permissionPresets')
+    if (permission !== undefined) {
+      try {
+        permission.set(handle.agent.session, permission.defaultPreset)
+      } catch (error: unknown) {
+        this.ctx.logger.warn(`[im-gateway] permission preset for ${sessionId}: ${errorChain(error)}`)
+      }
+    }
+    const title = runtime.title || this.defaults.title || `IM ${sessionId}`
+    const titles = this.ctx.get('sessionTitle')
+    if (titles !== undefined && typeof titles.rename === 'function') {
+      try {
+        titles.rename(handle.agent.session, title)
+      } catch (error: unknown) {
+        this.ctx.logger.warn(`[im-gateway] title rename for ${sessionId}: ${errorChain(error)}`)
+      }
+    }
+
     this.ctx.logger.info(
-      `[im-gateway] created agent ${sessionId}`
-        + (selection ? ` (model=${selection.provider}/${selection.model})` : ' (no default model!)'),
+      `[im-gateway] created agent ${sessionId} (workspace=${workspacePath})`
+        + (selection ? ` model=${selection.provider}/${selection.model}` : ''),
     )
     return handle
   }
 
-  /** Wait for the collector to settle, then forward the reply through the sink. */
+  /** Find or create the Harness workspace backing IM sessions. */
+  private async ensureWorkspace(path: string): Promise<WorkspaceEntity | undefined> {
+    const cached = this.workspaces.get(path)
+    if (cached !== undefined) return cached
+    const registry = this.ctx.get('workspaceRegistry') as WorkspaceRegistry | undefined
+    if (registry === undefined) {
+      // No workspace registry in this host: sessions carry their cwd metadata
+      // directly and Harness still routes models through `agent/request`.
+      return undefined
+    }
+    // The workspace registry canonicalizes a path with `fs.realpath`, so the
+    // directory must already exist (mirrors session-controller's createOrAdopt,
+    // which mkdirs the cwd before composing the agent). Create it first.
+    try {
+      await mkdir(path, { recursive: true })
+    } catch (error: unknown) {
+      this.ctx.logger.warn(`[im-gateway] mkdir workspace ${path}: ${errorChain(error)}`)
+    }
+    const existing = registry.list().find((item) => item.path === path)
+    const entity = existing ?? await registry.create(path)
+    this.workspaces.set(path, entity)
+    return entity
+  }
+
+  /** Wait for the collected reply, then forward it through the sink. */
   private async awaitReply(
     sessionId: SessionId,
-    collector: ReplyCollector,
+    wait: ReplyWaiter,
     reply: ReplySink,
     runtime: MessageRuntime,
   ): Promise<void> {
     try {
-      await collector.agent.whenIdle()
-      const text = collector.settle()
-      this.pending.delete(sessionId)
+      // Settle on the owned turn/end driven by the global event mux. A timeout
+      // guarantees the inbound HTTP 202 always returns even when an agent error
+      // drops the turn without a matching `turn/end`.
+      const outcome = await Promise.race([wait.done.then(() => 'done' as const), timeout(REPLY_TIMEOUT_MS)])
+      if (outcome === 'timeout') {
+        this.ctx.logger.warn(`[im-gateway] reply for ${sessionId} timed out after ${REPLY_TIMEOUT_MS}ms`)
+      }
+      const text = wait.settle()
+      this.waiters.delete(sessionId)
       if (text !== '') {
         await reply(text)
       } else {
         this.ctx.logger.warn(`[im-gateway] empty reply for ${sessionId}`)
       }
     } catch (error: unknown) {
-      collector.settle()
-      this.pending.delete(sessionId)
+      wait.settle()
+      this.waiters.delete(sessionId)
       this.ctx.logger.warn(`[im-gateway] reply for ${sessionId} failed: ${errorChain(error)}`)
     } finally {
       if (runtime.disposeAfterReply) {
@@ -233,30 +362,41 @@ export class ImGateway {
     }
   }
 
-  /** Build an optional human-readable source summary for attribution. */
-  private describeInbound(message: InboundMessage): string | undefined {
-    const parts: string[] = [`IM message in ${message.chatId}`]
-    if (message.senderId !== undefined && message.senderId !== '') {
-      parts.push(`from ${message.senderId}`)
-    }
-    const summary = parts.join(', ')
-    return boundContextSummary(summary)
-  }
-
-  /** Route session events into the matching pending collector. */
+  /** Route every session event into the matching per-run reply waiter. */
   private onSessionEvent(session: unknown, event: SessionEvent): void {
-    if (event.type !== 'assistant/message') return
-    for (const collector of this.pending.values()) {
-      if (collector.owns(session)) collector.append(textOf(event))
+    const sessionId = sessionIdOf(session)
+    if (sessionId === undefined) return
+    const wait = this.waiters.get(sessionId)
+    if (wait === undefined) return
+    if (wait.observe(event)) {
+      // Settled on its owned turn/end; stop routing events to it.
+      this.waiters.delete(sessionId)
     }
   }
 
-  /** Dispose all live agents (called on plugin unload). */
+  /** Dispose all live agents and drop the global event mux (called on plugin unload). */
   async close(): Promise<void> {
+    try {
+      this.offSessionEvent()
+    } catch (error: unknown) {
+      this.ctx.logger.warn(`[im-gateway] close session/event mux: ${errorChain(error)}`)
+    }
     for (const handle of this.agents.values()) {
-      await handle.dispose()
+      try {
+        await handle.dispose()
+      } catch (error: unknown) {
+        this.ctx.logger.warn(`[im-gateway] close dispose: ${errorChain(error)}`)
+      }
     }
     this.agents.clear()
-    this.pending.clear()
+    this.waiters.clear()
   }
+}
+
+/** Read the session id from either the runtime's Session, its handle, or the raw session value. */
+function sessionIdOf(session: unknown): SessionId | undefined {
+  const s = session as { id?: string; sessionId?: string }
+  if (s?.id) return SessionId(s.id)
+  if (s?.sessionId) return SessionId(s.sessionId)
+  return undefined
 }
