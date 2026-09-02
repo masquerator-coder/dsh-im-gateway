@@ -4,6 +4,10 @@ import type { ChannelTransport, InboundRoute } from './types.ts'
 // deps of this plugin (both MIT).
 
 import type * as Nodemailer from 'nodemailer'
+import { createHash } from 'node:crypto'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { readFile, writeFile, mkdir } from 'node:fs/promises'
 
 export interface EmailChannelOptions {
   host: string
@@ -28,13 +32,23 @@ export interface EmailChannelOptions {
   onState?: (status: 'connecting' | 'connected' | 'error' | 'idle', detail?: string) => void
 }
 
+/** Persisted-dedup cursor file: one JSON `{ lastUid }` per account+inbox. */
+function stateFileFor(host: string, account: string, inbox: string): string {
+  const key = createHash('sha1')
+    .update(`${host}|${account}|${inbox}`)
+    .digest('hex')
+    .slice(0, 16)
+  return join(homedir(), '.dsh', 'im-workspace', 'email-state', `${key}.json`)
+}
+
 /** Minimal adapter over nodemailer + imapflow, loaded lazily at runtime. */
 export class EmailTransport implements ChannelTransport {
   private transport: any = null
   private client: any = null
   private timer: NodeJS.Timeout | null = null
   private connected = false
-  private seenUids = new Set<number>()
+  /** Highest UID already processed, persisted across restarts. */
+  private lastUid = 0
 
   constructor(private readonly options: EmailChannelOptions) {}
 
@@ -79,6 +93,13 @@ export class EmailTransport implements ChannelTransport {
     this.connected = true
     this.options.onState?.('connected')
 
+    // Load the persisted last-processed UID cursor so a restart never replays
+    // the whole inbox (dedup survives process boundaries).
+    await this.loadCursor()
+    if (this.lastUid > 0) {
+      this.options.log?.(`email resume: continuing from lastUid=${this.lastUid}`)
+    }
+
     const poll = async (): Promise<void> => {
       try {
         await this.pollInbox()
@@ -98,17 +119,18 @@ export class EmailTransport implements ChannelTransport {
     if (!this.client || !this.client.connection) return
     const { host, account, inbox } = this.options
     await this.client.mailboxOpen(inbox || 'INBOX')
-    for await (const message of this.client.fetch('1:*', { uid: true, envelope: true, source: true })) {
+    // Incremental fetch: only messages newer than the last processed UID. UIDs
+    // are monotonic per mailbox, so this never rescans already-handled mail and
+    // only transfers the few new messages since the previous poll.
+    const range = this.lastUid > 0 ? `${this.lastUid + 1}:*` : '1:*'
+    let newest = this.lastUid
+    for await (const message of this.client.fetch(range, { uid: true, envelope: true, source: true })) {
       const uid = Number(message.uid)
-      if (!Number.isFinite(uid) || this.seenUids.has(uid)) continue
-      this.seenUids.add(uid)
-      // Only react to plain-text mail whose subject signals a chat message to
-      // this gateway (avoids treating every inbound newsletter as a prompt).
-      const subject = message.envelope?.subject || ''
+      if (!Number.isFinite(uid) || uid <= this.lastUid) continue
+      if (uid > newest) newest = uid
       const text = await this.extractText(message)
       if (!text) continue
       const sender = message.envelope?.from?.[0]?.address || ''
-      // Deduplicate by uid and only route if there is a responder hint.
       this.options.onInbound({
         chatId: `${account}/${sender || uid}`,
         text,
@@ -121,6 +143,36 @@ export class EmailTransport implements ChannelTransport {
           channel: 'email',
         },
       })
+    }
+    // Persist the cursor so the next poll (and a restart) continues from here.
+    if (newest > this.lastUid) {
+      this.lastUid = newest
+      await this.saveCursor()
+    }
+  }
+
+  /** Read the persisted last-processed UID for this account+inbox, if any. */
+  private async loadCursor(): Promise<void> {
+    try {
+      const { host, account, inbox } = this.options
+      const file = stateFileFor(host, account, inbox || 'INBOX')
+      const raw = await readFile(file, 'utf8')
+      const parsed = JSON.parse(raw) as { lastUid?: number }
+      const n = Number(parsed?.lastUid)
+      if (Number.isFinite(n) && n > 0) this.lastUid = n
+    } catch {
+      /* no state yet — first run, start from the inbox head */
+    }
+  }
+
+  private async saveCursor(): Promise<void> {
+    try {
+      const { host, account, inbox } = this.options
+      const file = stateFileFor(host, account, inbox || 'INBOX')
+      await mkdir(join(file, '..'), { recursive: true })
+      await writeFile(file, JSON.stringify({ lastUid: this.lastUid }), 'utf8')
+    } catch (error) {
+      this.options.log?.(`email cursor persist failed: ${String(error)}`)
     }
   }
 

@@ -197,8 +197,8 @@ POST messages to `http://<host>:<port>/im`:
 { "chat_id": "group-42|user-7", "sender_id": "user-7", "text": "你好" }
 ```
 
-> Send header `x-im-secret: <secret>` when `secret` is set. The gateway responds `202 { ok: true }` once the message is accepted; the reply arrives later over the callback.
-> When `allowlist` is set and `sender_id` is not in it (or missing), the message is denied — no agent turn, no reply.
+> Send header `x-im-secret: <secret>` when `secret` is set. The gateway responds `202 { ok: true }` **immediately** once the message is accepted — it does not wait for the model turn. The agent reply always arrives later over the callback (see below).
+> When `allowlist` is set and `sender_id` is not in it (or missing), the message is denied up front (a `202` is still returned) — no agent turn, no reply.
 
 ### Gateway → external IM (outbound callback)
 

@@ -40,3 +40,6 @@ dsh-cmcc-newmsg/
 # dsh-cmcc-newmsg plugin working copy and other-tool AI session artifacts
 # (AGENTS.md / hyperframes / demo recordings) are local-only.
 video/
+# AI design-session artifacts (brief.json / design-tokens.css / index.html /
+# manifest.json under design/session-*) are local-only tooling output.
+design/

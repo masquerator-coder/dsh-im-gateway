@@ -50,7 +50,7 @@ const EMAIL_PROVIDERS: EmailProvider[] = [
   { id: 'wework', label: '企业微信邮箱', host: 'imap.exmail.qq.com', imapPort: 993, smtpPort: 465, useTls: true },
 ]
 
-const DEFAULT_QQ_URL = 'http://127.0.0.1:9001'
+const DEFAULT_CLAWBOT_URL = 'http://127.0.0.1:9001'
 const DEFAULT_CMCC_WSS = 'wss://5gvas01.cmicmaap.com/gtw-ai/openclaw/ws/msg'
 
 /** Per-type prefill template + field list (the "傻瓜式" defaults). */
@@ -107,7 +107,7 @@ function templatesFor(): Record<ChannelType, Template> {
     ],
   }
   const wechat: Template = {
-    defaults: { clawUrl: DEFAULT_QQ_URL },
+    defaults: { clawUrl: DEFAULT_CLAWBOT_URL },
     fields: [
       { key: 'clawUrl', labelKey: 'field.clawUrl' },
       { key: 'token', labelKey: 'field.token', secret: true },

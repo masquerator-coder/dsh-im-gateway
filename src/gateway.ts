@@ -12,10 +12,13 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { sessionIdForChat } from './session.ts'
 
 /**
- * Safety bound on one reply turn. The inbound HTTP server acks (202) only after
- * `gateway.handle()` resolves, so a reply wait MUST always terminate — the
- * global `session/event` mux settles on `turn/end`, and this timeout is the
- * fallback that guarantees the ack goes out even if the agent drops the turn.
+ * Safety bound on one reply turn. The inbound HTTP server acks (202) as soon as
+ * the message is accepted (see `inbound.ts`), so the caller does not block on
+ * the model turn — but the reply-wait that runs in the background MUST always
+ * terminate: the global `session/event` mux settles on `turn/end`, and this
+ * timeout is the fallback that guarantees the collected reply is delivered (or
+ * explicitly dropped with "NOT delivered") even if the agent never emits a
+ * matching `turn/end`.
  */
 const REPLY_TIMEOUT_MS = 300_000
 

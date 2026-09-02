@@ -54,12 +54,21 @@ export class InboundHttpServer {
   constructor(
     private readonly host: string,
     private readonly port: number,
+    private readonly log?: (level: 'info' | 'warn' | 'error', message: string) => void,
   ) {
     this.server = createServer((req, res) => { void this.handle(req, res) })
   }
 
   /** Register (or replace) a route for a given path. */
   register(route: HttpRoute): void {
+    const existing = this.routes.get(route.path)
+    if (existing !== undefined) {
+      this.log?.(
+        'warn',
+        `[im-gateway] route path "${route.path}" already registered — this new route REPLACES it` +
+          '; an http channel and the global webhook (or two http channels) are sharing a path.',
+      )
+    }
     this.routes.set(route.path, route)
   }
 

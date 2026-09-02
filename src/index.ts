@@ -25,7 +25,9 @@ export function apply(ctx: Context, config: ConfigType): void {
 
   // One shared inbound HTTP server serves BOTH the legacy global webhook (at
   // config.inboundPath) and every configured `http` channel route (by path).
-  const inbound = new InboundHttpServer(config.host, config.port)
+  const inbound = new InboundHttpServer(config.host, config.port, (level, message) => {
+    ctx.logger[level](message)
+  })
 
   // Multi-channel IM management: register the durable settings namespace and
   // run every enabled channel.
@@ -59,7 +61,11 @@ export function apply(ctx: Context, config: ConfigType): void {
         })
         if (!res.ok) throw new Error(`callback returned ${res.status}`)
       }
-      await gateway.handle({ chatId, text, senderId }, sink, {
+      // Do NOT await: the 202 acknowledgement must return immediately (the
+      // reply arrives later over the callback). `gateway.handle` owns the full
+      // turn (per-session serialization + bounded reply wait) and already
+      // swallows its own errors, so fire-and-forget is safe here.
+      void gateway.handle({ chatId, text, senderId }, sink, {
         provider: config.provider || undefined,
         model: config.model || undefined,
         maxTokens: config.maxTokens,
@@ -67,6 +73,8 @@ export function apply(ctx: Context, config: ConfigType): void {
         agentPreset: config.agentPreset || undefined,
         disposeAfterReply: config.disposeAfterReply,
         channel: 'http',
+      }).catch((error: unknown) => {
+        ctx.logger.warn(`[im-gateway] legacy webhook handle failed: ${String(error)}`)
       })
       return undefined
     },

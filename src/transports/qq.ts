@@ -70,6 +70,9 @@ export class QQTransport implements ChannelTransport {
     } catch (error) {
       this.options.onState?.('error', error instanceof Error ? error.message : String(error))
       this.options.log?.(`qq login error: ${String(error)}`)
+      // Rethrow so `start()` surfaces a real error state to the manager
+      // (otherwise it would be reported as "connecting" forever).
+      throw error
     }
   }
 
