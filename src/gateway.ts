@@ -10,6 +10,7 @@ import { createUserMessage, errorChain, type MessageSource } from '@deepseek-ai/
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { sessionIdForChat } from './session.ts'
+import { InteractionBridge } from './interaction.ts'
 
 /**
  * Safety bound on one reply turn. The inbound HTTP server acks (202) as soon as
@@ -205,6 +206,12 @@ export class ImGateway {
   private readonly tails = new Map<SessionId, Promise<void>>()
   /** Recent-message dedup key → first-seen timestamp. */
   private readonly recent = new Map<string, number>()
+  /** Per-session outbound senders, populated per inbound route so IM-side
+   *  approval/question prompts can be pushed down the same channel that drives
+   *  that session. Keyed by session id; set by `registerSender`. */
+  private readonly senders = new Map<string, (text: string) => Promise<void>>()
+  /** IM-only bridge for DSH approval / user-question seams. */
+  readonly interactions: InteractionBridge
 
   constructor(
     private readonly ctx: Context,
@@ -216,6 +223,16 @@ export class ImGateway {
     this.offSessionEvent = ctx.on('session/event', (_session, event: SessionEvent) => {
       this.onSessionEvent(_session, event)
     }, { global: true })
+    this.interactions = new InteractionBridge(ctx)
+  }
+
+  /**
+   * Register the outbound sender for one session (called by the channel manager
+   * on every inbound route). Used to push approval/question prompts down the
+   * chat's IM channel. The latest sender wins; lookup happens at call time.
+   */
+  registerSender(sessionId: string, sender: (text: string) => Promise<void>): void {
+    this.senders.set(sessionId, sender)
   }
 
   /**
@@ -240,6 +257,15 @@ export class ImGateway {
     // Fold the receiving channel into the session key so the same external
     // chat id on different channels never shares a session (isolation).
     const sessionId = SessionId(sessionIdForChat(message.chatId, channel ?? ''))
+    // Keep the outbound sender hot for this session so an in-flight approval /
+    // question prompt can be pushed down the same channel that drives it.
+    this.registerSender(String(sessionId), reply)
+    // If this inbound text answers an outstanding IM-side approval/question,
+    // settle it and do NOT feed the text to the agent as a normal message.
+    if (this.interactions.consume(String(sessionId), message.text).consumed) {
+      this.ctx.logger.info(`[im-gateway] consumed interaction reply for ${sessionId}`)
+      return
+    }
     const prev = this.tails.get(sessionId) ?? Promise.resolve()
     const run = prev
       .then(() => this.process(sessionId, message, reply, runtime, channel))
@@ -356,6 +382,10 @@ export class ImGateway {
       if (presets !== undefined) {
         await presets.mount(agentCtx, runtime.agentPreset || undefined)
       }
+      // Register IM-side answerers for approval / user-questions on this agent's
+      // scope so a question surfaces on the driving IM channel instead of only
+      // the web UI. `next()`-falls back when no sender is present.
+      this.interactions.install(agentCtx, String(sessionId), (text) => this.sendInteractive(sessionId, text))
     }
 
     let handle: AgentHandle
@@ -552,6 +582,19 @@ export class ImGateway {
     }
   }
 
+  /**
+   * Push an interactive prompt (approval / question) down the session's IM
+   * channel through the sender registered by the latest inbound route. Throws
+   * when no sender is available so the bridge delegates to the next answerer.
+   */
+  private sendInteractive(sessionId: SessionId, text: string): Promise<void> {
+    const sender = this.senders.get(String(sessionId))
+    if (sender === undefined) {
+      return Promise.reject(new Error(`no outbound sender for ${sessionId}`))
+    }
+    return sender(text)
+  }
+
   /** Route every session event into the matching per-run reply waiter. */
   private onSessionEvent(session: unknown, event: SessionEvent): void {
     const sessionId = sessionIdOf(session)
@@ -582,6 +625,8 @@ export class ImGateway {
     this.waiters.clear()
     this.tails.clear()
     this.recent.clear()
+    this.senders.clear()
+    this.interactions.clear()
     this.workspaceInFlight.clear()
   }
 }
