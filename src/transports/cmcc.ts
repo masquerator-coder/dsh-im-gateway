@@ -1,6 +1,6 @@
-import type { ChannelTransport } from './types.ts' // not used directly here
+import type { ChannelTransport } from './types.ts'
 
-import { SmsClient, type InboundMessage } from './cmcc/smsClient.ts'
+import { SmsClient, type InboundMessage, type SmsLog } from './cmcc/smsClient.ts'
 
 export const DEFAULT_SERVER_URL = 'wss://5gvas01.cmicmaap.com/gtw-ai/openclaw/ws/msg'
 
@@ -13,6 +13,8 @@ export interface CmccTransportOptions {
   model?: string
   maxTokens?: number
   disposeAfterReply?: boolean
+  /** Leveled logger (routed into DSH's logger by the manager). */
+  log?: SmsLog
   onInbound: (route: {
     chatId: string
     text: string
@@ -45,7 +47,7 @@ export class CmccTransport implements ChannelTransport {
     this.desiredConnected = true
     const serverUrl = this.options.serverUrl || DEFAULT_SERVER_URL
     const version = this.options.version || '2.0'
-    const client = new SmsClient(this.options.apiKey, serverUrl, version)
+    const client = new SmsClient(this.options.apiKey, serverUrl, version, this.options.log)
     this.client = client
     this.options.onState?.('connecting')
 

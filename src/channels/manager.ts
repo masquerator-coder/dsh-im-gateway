@@ -4,6 +4,12 @@ import type { ChannelConfig, ChannelStatus, ChannelsSettings } from './types.ts'
 import type { ImGateway } from '../gateway.ts'
 import type { ChatIo, InboundRoute, TransportStatus } from '../transports/types.ts'
 import type { InboundHttpServer } from '../inbound.ts'
+import type { CmccTransportOptions } from '../transports/cmcc.ts'
+import type { HttpChannelOptions } from '../transports/http.ts'
+import type { EmailChannelOptions } from '../transports/email.ts'
+import type { FeishuChannelOptions } from '../transports/feishu.ts'
+import type { WechatClawOptions } from '../transports/wechat.ts'
+import type { QQChannelOptions } from '../transports/qq.ts'
 
 /** Mutable runtime handle for one channel. */
 export interface ChannelRuntime {
@@ -187,7 +193,7 @@ export class ChannelManager {
     switch (channel.type) {
       case 'cmcc': {
         const { CmccTransport } = await import('../transports/cmcc.ts')
-        return new CmccTransport({
+        const options: CmccTransportOptions = {
           apiKey: channel.apiKey || '',
           serverUrl: channel.serverUrl,
           version: channel.version,
@@ -196,11 +202,13 @@ export class ChannelManager {
           disposeAfterReply: base.disposeAfterReply,
           onInbound: routeInbound,
           onState: setState,
-        } as any) as unknown as ChatIo
+          log: (level, message) => this.ctx.logger[level](`[im-gateway] ${channel.id}: ${message}`),
+        }
+        return new CmccTransport(options) as ChatIo
       }
       case 'http': {
         const { HttpTransport } = await import('../transports/http.ts')
-        return new HttpTransport(this.inbound, {
+        const options: HttpChannelOptions = {
           path: channel.inboundPath || '/im',
           secret: channel.secret || '',
           chatIdField: channel.chatIdField || 'chat_id',
@@ -213,11 +221,12 @@ export class ChannelManager {
           model: base.model,
           disposeAfterReply: base.disposeAfterReply,
           onInbound: routeInbound,
-        } as any) as unknown as ChatIo
+        }
+        return new HttpTransport(this.inbound, options) as ChatIo
       }
       case 'email': {
         const { EmailTransport } = await import('../transports/email.ts')
-        return new EmailTransport({
+        const options: EmailChannelOptions = {
           host: channel.host || '',
           imapPort: channel.imapPort,
           smtpPort: channel.smtpPort,
@@ -231,11 +240,12 @@ export class ChannelManager {
           onInbound: routeInbound,
           onState: setState,
           log: (m: string) => this.ctx.logger.info(`[im-gateway] ${channel.id}: ${m}`),
-        } as any) as unknown as ChatIo
+        }
+        return new EmailTransport(options) as ChatIo
       }
       case 'feishu': {
         const { FeishuTransport } = await import('../transports/feishu.ts')
-        return new FeishuTransport({
+        const options: FeishuChannelOptions = {
           appId: channel.appId || '',
           appSecret: channel.appSecret || '',
           provider: base.provider,
@@ -243,11 +253,12 @@ export class ChannelManager {
           disposeAfterReply: base.disposeAfterReply,
           onInbound: routeInbound,
           log: (m: string) => this.ctx.logger.info(`[im-gateway] ${channel.id}: ${m}`),
-        } as any) as unknown as ChatIo
+        }
+        return new FeishuTransport(options) as ChatIo
       }
       case 'wechat': {
         const { WechatClawTransport } = await import('../transports/wechat.ts')
-        return new WechatClawTransport({
+        const options: WechatClawOptions = {
           clawUrl: channel.clawUrl || '',
           token: channel.token,
           provider: base.provider,
@@ -257,11 +268,12 @@ export class ChannelManager {
           onState: setState,
           onQr: (url: string) => { runtime.qr = url; this.emitStatus() },
           log: (m: string) => this.ctx.logger.info(`[im-gateway] ${channel.id}: ${m}`),
-        } as any) as unknown as ChatIo
+        }
+        return new WechatClawTransport(options) as ChatIo
       }
       case 'qq': {
         const { QQTransport } = await import('../transports/qq.ts')
-        return new QQTransport({
+        const options: QQChannelOptions = {
           qq: channel.qq,
           password: channel.qqPassword,
           provider: base.provider,
@@ -271,7 +283,8 @@ export class ChannelManager {
           onState: setState,
           onQr: (dataUrl: string) => { runtime.qr = dataUrl; this.emitStatus() },
           log: (m: string) => this.ctx.logger.info(`[im-gateway] ${channel.id}: ${m}`),
-        } as any) as unknown as ChatIo
+        }
+        return new QQTransport(options) as ChatIo
       }
     }
   }

@@ -17,10 +17,10 @@
  */
 
 import * as React from 'react'
-import { createElement as h, Fragment, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react'
+import { createElement as h, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 
 import {
-  type ChannelConfig, type ChannelsSettings, type ChannelType,
+  type ChannelConfig, type ChannelType,
 } from '../channels/types.ts'
 
 /** One editable field of a channel, keyed by the schema field name. */
@@ -124,7 +124,6 @@ function templatesFor(): Record<ChannelType, Template> {
 }
 
 export interface ChannelsSectionProps {
-  close: () => void
   /* eslint-disable @typescript-eslint/no-explicit-any */
   scope: any
   /** Host status RPC namespace (may be null when host lacks ctx.remote). */

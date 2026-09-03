@@ -7,8 +7,8 @@
 export const NS = 'im-channels'
 
 export const zh = {
-  'nav': 'IM 通道',
-  'nav.subtitle': '连接与自定义 IM 网关通道',
+  'card.title': 'IM 通道设置',
+  'card.description': '连接并管理 IM 网关通道（5G消息 / 邮箱 / HTTP / 飞书 / 微信 / QQ）。',
   'channels.empty': '尚未配置任何通道。选择一个类型开始接入。',
   'channels.add': '新建通道',
   'channels.existing': '已配置',
@@ -64,8 +64,8 @@ export const zh = {
 } as const
 
 export const en = {
-  'nav': 'IM Channels',
-  'nav.subtitle': 'Connect and customize IM gateway channels',
+  'card.title': 'IM channel settings',
+  'card.description': 'Connect and manage IM gateway channels (5G Message / email / HTTP / Feishu / WeChat / QQ).',
   'channels.empty': 'No channels configured. Pick a type to begin.',
   'channels.add': 'New channel',
   'channels.existing': 'Configured',

@@ -44,7 +44,7 @@ Agents are composed **exactly like the DSH webhook / session-controller path**:
 
 ## Multi-channel IM management (settings UI)
 
-In the DSH settings panel an **"IM 通道"** entry (pushed to the end of the left nav) opens a per-channel management UI. Each channel kind ships a **foolproof prefill template**, so fixed items are already correct and the user only fills in the cherry-picked key/token/account (or scans a QR):
+In the DSH **「插件 → 插件设置」** page an **"IM 通道设置"** card (styled like the other system plugin cards) expands on click to reveal the per-channel management UI. Each channel kind ships a **foolproof prefill template**, so fixed items are already correct and the user only fills in the cherry-picked key/token/account (or scans a QR):
 
 | Type | Fixed items auto-filled | User provides | Transport |
 | --- | --- | --- | --- |
@@ -74,7 +74,7 @@ Each enabled channel holds a **live connection** (`connected` / `connecting` / `
 | `src/channels/schema.ts` | Host-side `im-channels` settings schema (SECRET fields via `role('secret')`) |
 | `src/channels/manager.ts` | Per-channel connection lifecycle, transport build, live status snapshots |
 | `src/transports/*.ts` | One real adapter per channel (http / email / cmcc / feishu / wechat / qq), each tags its runtime with `channel` |
-| `src/client/*` | Browser half: settings section UI, foolproof templates, live status + QR |
+| `src/client/*` | Browser half: expandable plugin card (`ChannelsCard`) wrapping the channel management UI (`ChannelsSection`), foolproof templates, live status + QR |
 | `cordis.yml` | Local source overlay (`--patch`) for development / e2e iteration |
 | `cordis.patch.yml` | Published **bundle** layer — references the package by name (`dsh-im-gateway` → `lib/index.js`) |
 | `scripts/build.mjs` | esbuild build: emits `lib/index.js` (node) + `lib/client.js` (browser) |

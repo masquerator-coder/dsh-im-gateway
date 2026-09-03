@@ -27,6 +27,9 @@ pnpm-debug.log*
 .DS_Store
 Thumbs.db
 
+# WorkBuddy tool — local session memory / working logs, never commit to the public repo.
+.workbuddy/
+
 # Local overrides (never commit real secrets)
 .env
 .env.*

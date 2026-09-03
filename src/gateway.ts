@@ -197,6 +197,8 @@ export class ImGateway {
   private readonly agents = new Map<SessionId, AgentHandle>()
   private readonly waiters = new Map<SessionId, ReplyWaiter>()
   private readonly workspaces = new Map<string, WorkspaceEntity>()
+  /** In-flight workspace provision promises (dedups concurrent ensureWorkspace calls). */
+  private readonly workspaceInFlight = new Map<string, Promise<WorkspaceEntity | undefined>>()
   /** Disposer for the global `session/event` mux; cleared on close(). */
   private readonly offSessionEvent: () => void
   /** Per-session tail promises, serializing concurrent messages for one chat. */
@@ -420,6 +422,21 @@ export class ImGateway {
 
   /** Find or create the Harness workspace backing IM sessions. */
   private async ensureWorkspace(path: string): Promise<WorkspaceEntity | undefined> {
+    const existingProvision = this.workspaceInFlight.get(path)
+    if (existingProvision !== undefined) return existingProvision
+
+    const provision = this.provisionWorkspace(path)
+    this.workspaceInFlight.set(path, provision)
+    try {
+      return await provision
+    } finally {
+      // Drop the in-flight marker once settled so a later call can re-probe
+      // (and so close() sees an empty map).
+      this.workspaceInFlight.delete(path)
+    }
+  }
+
+  private async provisionWorkspace(path: string): Promise<WorkspaceEntity | undefined> {
     const cached = this.workspaces.get(path)
     if (cached !== undefined) return cached
     const registry = this.ctx.get('workspaceRegistry') as WorkspaceRegistry | undefined
@@ -494,7 +511,11 @@ export class ImGateway {
       this.ctx.logger.warn(`[im-gateway] reply for ${sessionId} failed: ${errorChain(error)}`)
     } finally {
       if (runtime.disposeAfterReply) {
-        void this.disposeAgent(sessionId)
+        // Await the dispose (not fire-and-forget) so it fully completes before
+        // this turn resolves and the next queued message for the same chat
+        // starts — otherwise a resume/ensureAgent could race a half-finished
+        // dispose of the same handle.
+        await this.disposeAgent(sessionId)
       }
     }
   }
@@ -561,6 +582,7 @@ export class ImGateway {
     this.waiters.clear()
     this.tails.clear()
     this.recent.clear()
+    this.workspaceInFlight.clear()
   }
 }
 

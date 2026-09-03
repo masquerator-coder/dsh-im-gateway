@@ -50,11 +50,11 @@ interface RawFrame extends InboundMedia {
 
 const DEBUG = false
 
+/** Leveled logger injected by the owning transport (routes into DSH's logger). */
+export type SmsLog = (level: 'info' | 'warn' | 'error', message: string) => void
+
 function log(...args: unknown[]): void {
   if (DEBUG) console.log(`[cmcc-im:${Date.now()}]`, ...args)
-}
-function logError(...args: unknown[]): void {
-  console.error(`[cmcc-im:${Date.now()}]`, ...args)
 }
 
 function maskApiKey(key: string): string {
@@ -76,9 +76,17 @@ export class SmsClient extends EventEmitter {
     readonly apiKey: string,
     private readonly serverUrl: string,
     private readonly version: string,
+    /** Optional leveled logger; when absent, diagnostics are dropped (no console). */
+    private readonly emitLog?: SmsLog,
   ) {
     super()
     log('SmsClient created', { apiKey: maskApiKey(apiKey), serverUrl, version })
+  }
+
+  /** Route an error-level message through the injected logger (or drop it). */
+  private errLog(message: string): void {
+    if (this.emitLog) this.emitLog('error', message)
+    if (DEBUG) console.error(`[cmcc-im:${Date.now()}]`, message)
   }
 
   connect(): Promise<void> {
@@ -121,7 +129,7 @@ export class SmsClient extends EventEmitter {
                 authResolved = true
                 clearTimeout(authTimeout)
                 const err = new Error(message.message || 'authentication failed')
-                logError('auth failed', message.message)
+                this.errLog(`auth failed: ${String(message.message ?? '')}`)
                 reject(err)
               }
             } catch {
@@ -141,12 +149,12 @@ export class SmsClient extends EventEmitter {
           this.attemptReconnect()
         })
         this.ws.on('error', (error) => {
-          logError('websocket error', error.message)
+          this.errLog(`websocket error: ${error.message}`)
           this.emit('error', error)
           this.ws?.close()
         })
       } catch (error) {
-        logError('connect failed', error)
+        this.errLog(`connect failed: ${String(error)}`)
         this.emit('error', error)
         reject(error)
       }
@@ -275,19 +283,19 @@ export class SmsClient extends EventEmitter {
         case 'auth_ok':
           break
         case 'auth_failed':
-          logError('auth failed', message.message)
+          this.errLog(`auth failed: ${String(message.message ?? '')}`)
           this.emit('error', new Error(message.message || 'authentication failed'))
           if (this.ws?.readyState === WebSocket.OPEN) this.ws.close()
           break
         case 'error':
-          logError('server error', message.message)
+          this.errLog(`server error: ${String(message.message ?? '')}`)
           this.emit('error', new Error(message.message || 'unknown server error'))
           break
         default:
           log('unknown message type', message.type)
       }
     } catch (error) {
-      logError('handleMessage error', error)
+      this.errLog(`handleMessage error: ${String(error)}`)
     }
   }
 
@@ -367,7 +375,7 @@ export class SmsClient extends EventEmitter {
       if (this.connected && this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.ws.send(JSON.stringify({ type: 'ping' }))
         this.heartbeatTimeout = setTimeout(() => {
-          logError('heartbeat timeout')
+          this.errLog('heartbeat timeout')
           this.emit('error', new Error('heartbeat timeout'))
           if (this.ws?.readyState === WebSocket.OPEN) this.ws.close()
         }, HEARTBEAT_TIMEOUT)
@@ -402,7 +410,7 @@ export class SmsClient extends EventEmitter {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
       if (!this.connected) {
-        this.connect().catch((error) => logError('reconnect failed', error))
+        this.connect().catch((error) => this.errLog(`reconnect failed: ${String(error)}`))
       }
     }, finalDelay)
   }
