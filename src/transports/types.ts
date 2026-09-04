@@ -52,21 +52,4 @@ export interface ChatIo extends ChannelTransport {
   sendText(chatId: string, text: string): Promise<void>
 }
 
-/**
- * Factory signature. `secrets` is the resolved `{ [fieldKey]: value }` for this
- * channel (apiKey, password, app secret…). `onInbound` is how the adapter
- * pushes a received message into the gateway. Returns a started/startable
- * transport.
- */
-export type TransportFactory = (
-  ctx: any,
-  options: {
-    channelId: string
-    config: Record<string, unknown>
-    secrets: Record<string, string>
-    /** Push one inbound message to the shared gateway. */
-    onInbound: (route: InboundRoute) => void
-  },
-) => ChannelTransport
-
 export type { InboundMessage }

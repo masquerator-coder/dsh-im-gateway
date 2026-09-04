@@ -39,6 +39,14 @@ export interface ChannelConfig {
   cwd?: string
   agentPreset?: string
   disposeAfterReply?: boolean
+  /** Positive output-token cap for turns on this channel (0/absent = runtime default). */
+  maxTokens?: number
+  /**
+   * Sender allowlist for this channel. Non-empty ⇒ only these senderIds may
+   * drive the agent; everyone else (or sender-less messages) is denied up front.
+   * Empty/absent = allow all (rely on transport auth / private network).
+   */
+  allowlist?: string[]
 
   // ---- email ----
   host?: string

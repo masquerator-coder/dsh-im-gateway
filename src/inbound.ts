@@ -1,7 +1,14 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { timingSafeEqual } from 'node:crypto'
 import type { InboundMessage, ReplySink } from './gateway.ts'
 
-/** One HTTP webhook route = one `http` channel. */
+/** Hard cap on one webhook request body (DoS guard). */
+const MAX_BODY_BYTES = 1024 * 1024 // 1 MiB
+
+/** Cap on concurrent inbound connections (DoS guard). */
+const MAX_CONNECTIONS = 64
+
+/** One webhook HTTP route = one `http` channel. */
 export interface HttpRoute {
   /** URL path this route serves, e.g. /im. */
   path: string
@@ -17,21 +24,40 @@ export interface HttpRoute {
   onMessage: (message: InboundMessage) => Promise<ReplySink | undefined>
 }
 
-/** Parse the request body as JSON, tolerating empty / malformed input. */
-function readJson(req: IncomingMessage): Promise<unknown> {
-  return new Promise((resolve, reject) => {
+/** Outcome of parsing one request body (errors carry their HTTP status). */
+type ReadJsonResult =
+  | { ok: true; body?: unknown }
+  | { ok: false; status: number; error: string }
+
+/**
+ * Parse the request body as JSON, tolerating empty input. The body is read
+ * with a hard byte cap: oversized payloads are rejected (413) and the request
+ * socket destroyed instead of buffering unbounded memory.
+ */
+function readJson(req: IncomingMessage): Promise<ReadJsonResult> {
+  return new Promise((resolve) => {
     const chunks: Buffer[] = []
-    req.on('data', (chunk: Buffer) => chunks.push(chunk))
+    let size = 0
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length
+      if (size > MAX_BODY_BYTES) {
+        chunks.length = 0
+        req.destroy()
+        resolve({ ok: false, status: 413, error: 'payload too large' })
+        return
+      }
+      chunks.push(chunk)
+    })
     req.on('end', () => {
       const raw = Buffer.concat(chunks).toString('utf8')
-      if (raw.trim() === '') return resolve(undefined)
+      if (raw.trim() === '') return resolve({ ok: true, body: undefined })
       try {
-        resolve(JSON.parse(raw))
-      } catch (error: unknown) {
-        reject(error)
+        resolve({ ok: true, body: JSON.parse(raw) as unknown })
+      } catch {
+        resolve({ ok: false, status: 400, error: 'malformed JSON body' })
       }
     })
-    req.on('error', reject)
+    req.on('error', () => resolve({ ok: false, status: 400, error: 'request aborted' }))
   })
 }
 
@@ -57,6 +83,8 @@ export class InboundHttpServer {
     private readonly log?: (level: 'info' | 'warn' | 'error', message: string) => void,
   ) {
     this.server = createServer((req, res) => { void this.handle(req, res) })
+    // DoS guard: refuse new connections beyond a sane concurrent cap.
+    this.server.maxConnections = MAX_CONNECTIONS
   }
 
   /** Register (or replace) a route for a given path. */
@@ -112,12 +140,27 @@ export class InboundHttpServer {
         return send(res, 404, { error: 'not found' })
       }
       if (route.secret !== '') {
-        const provided = req.headers['x-im-secret']
-        if (provided !== route.secret) {
+        const provided = String(req.headers['x-im-secret'] ?? '')
+        const a = Buffer.from(provided)
+        const b = Buffer.from(route.secret)
+        // Constant-time comparison; unequal lengths short-circuit (no leak of
+        // secret content, only of its length which is public config anyway).
+        const authorized = a.length === b.length && timingSafeEqual(a, b)
+        if (!authorized) {
           return send(res, 401, { error: 'unauthorized' })
         }
       }
-      const body = await readJson(req)
+      // Reject by Content-Length up front when the client declares an oversized
+      // body (chunked bodies are still capped while streaming in readJson).
+      const declared = Number(req.headers['content-length'] ?? 0)
+      if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+        return send(res, 413, { error: 'payload too large' })
+      }
+      const parsed = await readJson(req)
+      if (!parsed.ok) {
+        return send(res, parsed.status, { error: parsed.error })
+      }
+      const body = parsed.body
       if (body === undefined || typeof body !== 'object' || body === null || Array.isArray(body)) {
         return send(res, 400, { error: 'expected a JSON object body' })
       }
@@ -138,8 +181,10 @@ export class InboundHttpServer {
       })
       // Ack immediately; the reply goes out via the channel's callback.
       send(res, 202, { ok: true })
-    } catch (error: unknown) {
-      send(res, 500, { error: error instanceof Error ? error.message : String(error) })
+    } catch (error) {
+      // Never leak internal error details to the external caller; log them.
+      this.log?.('error', `[im-gateway] inbound ${req.url ?? ''} failed: ${error instanceof Error ? error.message : String(error)}`)
+      send(res, 500, { error: 'internal error' })
     }
   }
 }

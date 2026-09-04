@@ -104,6 +104,8 @@ interface PendingRecord {
   tryAnswer: (text: string) => boolean
   /** Abort the wait (request.signal fired / teardown). */
   abort: () => void
+  /** Remove the request-signal abort listener once the record is settled. */
+  detach?: () => void
 }
 
 /** Pending interactions keyed by session id (at most one outstanding per session). */
@@ -117,6 +119,13 @@ export class InteractionBridge {
     return this.pending.has(sessionId)
   }
 
+  /** Remove a settled record from pending and release its signal listener. */
+  private drop(sessionId: string, record: PendingRecord): void {
+    if (this.pending.get(sessionId) === record) this.pending.delete(sessionId)
+    record.detach?.()
+    record.detach = undefined
+  }
+
   /**
    * Consume an inbound message if it answers the outstanding interaction.
    * Returns `{ consumed: true }` when matched-and-settled; otherwise `{ consumed: false }`
@@ -127,20 +136,23 @@ export class InteractionBridge {
     if (record === undefined) return { consumed: false }
     if (!record.tryAnswer(text.trim())) return { consumed: false }
     // `tryAnswer` settled the outcome; drop the record so later messages are normal.
-    this.pending.delete(sessionId)
+    this.drop(sessionId, record)
     return { consumed: true }
   }
 
   /** Abort + clear outstanding interaction(s). */
   clear(sessionId?: string): void {
     if (sessionId !== undefined) {
-      this.pending.get(sessionId)?.abort()
-      this.pending.delete(sessionId)
+      const record = this.pending.get(sessionId)
+      if (record !== undefined) {
+        this.drop(sessionId, record)
+        record.abort()
+      }
       return
     }
-    for (const id of [...this.pending.keys()]) {
-      this.pending.get(id)?.abort()
-      this.pending.delete(id)
+    for (const [id, record] of [...this.pending]) {
+      this.drop(id, record)
+      record.abort()
     }
   }
 
@@ -185,7 +197,7 @@ export class InteractionBridge {
         abort: () => resolve('cancelled'),
       }
       this.pending.set(sessionId, record)
-      this.attachAbort(req.signal, () => this.abortIfCurrent(sessionId, record))
+      record.detach = this.attachAbort(req.signal, () => this.abortIfCurrent(sessionId, record))
       void this.sendPrompt(send, prompt, sessionId, () => this.delegateOnFailure(sessionId, record, () => resolve('unavailable')))
     })
   }
@@ -209,7 +221,7 @@ export class InteractionBridge {
         abort: () => resolve({ answers: [] }),
       }
       this.pending.set(sessionId, record)
-      this.attachAbort(req.signal, () => this.abortIfCurrent(sessionId, record))
+      record.detach = this.attachAbort(req.signal, () => this.abortIfCurrent(sessionId, record))
       void this.sendPrompt(send, prompt, sessionId, () => this.delegateOnFailure(sessionId, record, () => resolve({ answers: [] })))
     })
   }
@@ -290,27 +302,29 @@ export class InteractionBridge {
     return false
   }
 
-  private attachAbort(signal: AbortSignal | undefined, onAbort: () => void): void {
-    if (signal === undefined) return
+  private attachAbort(signal: AbortSignal | undefined, onAbort: () => void): (() => void) | undefined {
+    if (signal === undefined) return undefined
     if (signal.aborted) {
       onAbort()
-      return
+      return undefined
     }
     signal.addEventListener('abort', onAbort, { once: true })
+    // Detach removes the listener when the record settles by answer — otherwise
+    // one listener per interaction would leak on the (long-lived) request
+    // signal for every prompt that is answered instead of aborted.
+    return () => signal.removeEventListener('abort', onAbort)
   }
 
   private abortIfCurrent(sessionId: string, record: PendingRecord): void {
-    if (this.pending.get(sessionId) === record) {
-      this.pending.delete(sessionId)
-      record.abort()
-    }
+    if (this.pending.get(sessionId) !== record) return
+    this.drop(sessionId, record)
+    record.abort()
   }
 
   private delegateOnFailure(sessionId: string, record: PendingRecord, fallback: () => void): void {
-    if (this.pending.get(sessionId) === record) {
-      this.pending.delete(sessionId)
-      fallback()
-    }
+    if (this.pending.get(sessionId) !== record) return
+    this.drop(sessionId, record)
+    fallback()
   }
 
   private async sendPrompt(

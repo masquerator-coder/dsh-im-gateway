@@ -17,6 +17,9 @@ export interface QQChannelOptions {
   onState?: (status: 'connected' | 'connecting' | 'error' | 'idle', detail?: string) => void
 }
 
+/** Upper bound on remembered reply-route entries (one per distinct chat). */
+const MAX_QQ_TARGETS = 5000
+
 /**
  * QQ bot transport driven by `icqq` (the maintained oicq fork). Login prefers a
  * QR scan — the "傻瓜式" path: with no stored qq/password, `client.login()` puts
@@ -28,6 +31,15 @@ export class QQTransport implements ChannelTransport {
   private connected = false
   /** chatId -> { kind: 'group'|'friend', id: number } for reply routing. */
   private targets = new Map<string, { kind: 'group' | 'friend'; id: number }>()
+
+  /** Keep the reply-route table bounded: drop the oldest entry past the cap. */
+  private recordTarget(chatId: string, target: { kind: 'group' | 'friend'; id: number }): void {
+    this.targets.set(chatId, target)
+    if (this.targets.size > MAX_QQ_TARGETS) {
+      const oldest = this.targets.keys().next().value
+      if (oldest !== undefined) this.targets.delete(oldest)
+    }
+  }
 
   constructor(private readonly options: QQChannelOptions) {}
 
@@ -87,7 +99,7 @@ export class QQTransport implements ChannelTransport {
     const uid = msg?.user_id
     if (gid) {
       const chatId = String(gid)
-      this.targets.set(chatId, { kind: 'group', id: Number(gid) })
+      this.recordTarget(chatId, { kind: 'group', id: Number(gid) })
       this.options.onInbound({
         chatId,
         text,
@@ -102,7 +114,7 @@ export class QQTransport implements ChannelTransport {
       })
     } else if (uid) {
       const chatId = String(uid)
-      this.targets.set(chatId, { kind: 'friend', id: Number(uid) })
+      this.recordTarget(chatId, { kind: 'friend', id: Number(uid) })
       this.options.onInbound({
         chatId,
         text,

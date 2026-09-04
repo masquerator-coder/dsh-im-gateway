@@ -39,6 +39,8 @@ export const ChannelsSettingsSchema: z<ChannelsSettings> = z.object({
     cwd: z.string().required(false),
     agentPreset: z.string().required(false),
     disposeAfterReply: z.boolean().required(false),
+    maxTokens: z.number().required(false),
+    allowlist: z.array(z.string()).required(false),
 
     // email
     host: z.string().required(false),
@@ -51,7 +53,6 @@ export const ChannelsSettingsSchema: z<ChannelsSettings> = z.object({
 
     // cmcc
     serverUrl: z.string().required(false),
-    uploadUrl: z.string().required(false),
     version: z.string().required(false),
     apiKey: SECRET(),
 

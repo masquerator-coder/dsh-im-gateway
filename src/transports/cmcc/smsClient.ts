@@ -70,6 +70,8 @@ export class SmsClient extends EventEmitter {
   private heartbeatInterval: NodeJS.Timeout | null = null
   private heartbeatTimeout: NodeJS.Timeout | null = null
   private reconnectTimer: NodeJS.Timeout | null = null
+  /** How long to wait for the `auth_ok` frame after the socket opens. */
+  private readonly authTimeoutMs = 20000
   connected = false
 
   constructor(
@@ -92,6 +94,21 @@ export class SmsClient extends EventEmitter {
   connect(): Promise<void> {
     log('connecting WebSocket', { serverUrl: this.serverUrl })
     return new Promise((resolve, reject) => {
+      // `settled` guards against double-settling (a dead socket fires BOTH
+      // 'error' and 'close'). A pre-auth failure REJECTS instead of leaving
+      // the caller waiting on the auth timeout, so the owning transport
+      // surfaces a real error state promptly.
+      let settled = false
+      const fail = (error: Error): void => {
+        if (settled) return
+        settled = true
+        reject(error)
+      }
+      const succeed = (): void => {
+        if (settled) return
+        settled = true
+        resolve()
+      }
       try {
         this.ws = new WebSocket(this.serverUrl, {
           rejectUnauthorized: true,
@@ -101,15 +118,13 @@ export class SmsClient extends EventEmitter {
           log('websocket open')
           this.connected = true
           this.ws?.send(JSON.stringify({ type: 'auth', apiKey: this.apiKey, version: this.version }))
-          const AUTH_TIMEOUT_MS = 10000
           let authResolved = false
           const authTimeout = setTimeout(() => {
-            if (!authResolved) {
-              authResolved = true
-              if (this.ws?.readyState === WebSocket.OPEN) this.ws.close()
-              reject(new Error('authentication response timeout'))
-            }
-          }, AUTH_TIMEOUT_MS * 2)
+            if (authResolved) return
+            authResolved = true
+            if (this.ws?.readyState === WebSocket.OPEN) this.ws.close()
+            fail(new Error('authentication response timeout'))
+          }, this.authTimeoutMs)
 
           const onFrame = (data: WebSocket.RawData): void => {
             try {
@@ -123,14 +138,17 @@ export class SmsClient extends EventEmitter {
                 this.reconnectAttempts = 0
                 this.startHeartbeat()
                 this.emit('connected')
-                resolve()
+                succeed()
               } else if (message.type === 'auth_failed') {
                 if (authResolved) return
                 authResolved = true
                 clearTimeout(authTimeout)
                 const err = new Error(message.message || 'authentication failed')
                 this.errLog(`auth failed: ${String(message.message ?? '')}`)
-                reject(err)
+                // Bad credentials are a configuration problem: retrying in a
+                // loop cannot fix them, so stop the reconnect cycle.
+                this.disconnect()
+                fail(err)
               }
             } catch {
               // not yet the auth frame; ignore
@@ -143,6 +161,9 @@ export class SmsClient extends EventEmitter {
         })
         this.ws.on('close', (code, reason) => {
           log('websocket closed', { code, reason: reason.toString() })
+          // A close before auth completes means the connection attempt failed
+          // (e.g. ECONNREFUSED); report it instead of hanging until timeout.
+          if (!settled) fail(new Error(`websocket closed before authentication (code=${code})`))
           this.connected = false
           this.stopHeartbeat()
           this.emit('disconnected')
@@ -151,12 +172,13 @@ export class SmsClient extends EventEmitter {
         this.ws.on('error', (error) => {
           this.errLog(`websocket error: ${error.message}`)
           this.emit('error', error)
+          if (!settled) fail(error)
           this.ws?.close()
         })
       } catch (error) {
         this.errLog(`connect failed: ${String(error)}`)
         this.emit('error', error)
-        reject(error)
+        fail(error instanceof Error ? error : new Error(String(error)))
       }
     })
   }
@@ -251,27 +273,37 @@ export class SmsClient extends EventEmitter {
       switch (message.type) {
         case 'message':
         case 'text_message':
-          this.emit('message', {
+        case 'media_message': {
+          // Cannot attribute the sender? Drop the message rather than folding
+          // every anonymous inbound into one shared session keyed by apiKey
+          // (which would cross-contaminate unrelated senders' conversations
+          // and reply to an invalid number).
+          const from = String(message.from || message.phone || '').trim()
+          if (!from) {
+            this.errLog(`inbound ${message.type} dropped: missing from/phone`)
+            break
+          }
+          const base = {
             id: String(message.messageId || message.id || Date.now()),
-            from: String(message.from || message.phone || this.apiKey),
+            from,
             content: String(message.content ?? ''),
             timestamp: Number(message.timestamp) || Date.now(),
-          } satisfies InboundMessage)
+          }
+          if (message.type === 'media_message') {
+            this.emit('message', {
+              ...base,
+              mediaType: message.mediaType,
+              mediaUrl: message.mediaUrl,
+              mediaFileName: message.mediaFileName,
+              thumbnailUrl: message.thumbnailUrl,
+              mediaSize: message.mediaSize,
+              mediaMimeType: message.mediaMimeType,
+            } satisfies InboundMessage)
+          } else {
+            this.emit('message', base satisfies InboundMessage)
+          }
           break
-        case 'media_message':
-          this.emit('message', {
-            id: String(message.messageId || message.id || Date.now()),
-            from: String(message.from || message.phone || this.apiKey),
-            content: String(message.content ?? ''),
-            timestamp: Number(message.timestamp) || Date.now(),
-            mediaType: message.mediaType,
-            mediaUrl: message.mediaUrl,
-            mediaFileName: message.mediaFileName,
-            thumbnailUrl: message.thumbnailUrl,
-            mediaSize: message.mediaSize,
-            mediaMimeType: message.mediaMimeType,
-          } satisfies InboundMessage)
-          break
+        }
         case 'pong': {
           if (this.heartbeatTimeout) {
             clearTimeout(this.heartbeatTimeout)
@@ -281,11 +313,13 @@ export class SmsClient extends EventEmitter {
           break
         }
         case 'auth_ok':
+          // Auth outcome is owned by the connect-time listener (onFrame).
           break
         case 'auth_failed':
-          this.errLog(`auth failed: ${String(message.message ?? '')}`)
-          this.emit('error', new Error(message.message || 'authentication failed'))
-          if (this.ws?.readyState === WebSocket.OPEN) this.ws.close()
+          // Auth outcome is owned by the connect-time listener (onFrame),
+          // which rejects and disconnects. This no-op keeps late auth frames
+          // from double-closing or double-reporting the error.
+          this.errLog(`late auth_failed frame: ${String(message.message ?? '')}`)
           break
         case 'error':
           this.errLog(`server error: ${String(message.message ?? '')}`)

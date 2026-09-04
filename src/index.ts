@@ -57,6 +57,9 @@ export function apply(ctx: Context, config: ConfigType): void {
         const res = await fetch(config.callbackUrl, {
           method: 'POST',
           headers,
+          // Hard timeout: a black-holed callback URL must not wedge this chat's
+          // serialized turn for the undici default (~300s) twice over.
+          signal: AbortSignal.timeout(30_000),
           body: JSON.stringify({ chat_id: chatId, text: reply, ts: Date.now() }),
         })
         if (!res.ok) throw new Error(`callback returned ${res.status}`)

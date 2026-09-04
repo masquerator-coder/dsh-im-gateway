@@ -104,6 +104,10 @@ export class ChannelManager {
         } else if (wasEnabled && channel.enabled) {
           // Config changed while enabled: restart to apply.
           void this.restart(channel.id)
+        } else if (!wasEnabled && channel.enabled) {
+          // Re-enabled after a disable: the record was kept in the list with
+          // enabled=false (stopped but present in runtimes). Start it again.
+          void this.start(channel)
         }
         continue
       }
@@ -128,13 +132,27 @@ export class ChannelManager {
     const runtime: ChannelRuntime = { config: channel, status: 'connecting' }
     this.runtimes.set(channel.id, runtime)
     this.emitStatus()
+    let transport: ChatIo | undefined
     try {
-      const transport = await this.buildTransport(channel, runtime)
-      runtime.transport = transport
+      transport = await this.buildTransport(channel, runtime)
       await transport.start()
+      // Guard against supersession: if a later start()/restart() replaced this
+      // runtime while we were building/connecting (rapid config edits), stop
+      // the transport we just built instead of publishing it orphaned.
+      if (this.runtimes.get(channel.id) !== runtime) {
+        await transport.stop().catch(() => {})
+        this.ctx.logger.info(`[im-gateway] channel "${channel.id}" superseded; discarded late transport`)
+        return
+      }
+      runtime.transport = transport
       runtime.status = transport.isConnected() ? 'connected' : 'connecting'
       this.ctx.logger.info(`[im-gateway] channel "${channel.id}" (${channel.type}) connected`)
     } catch (error) {
+      if (this.runtimes.get(channel.id) !== runtime) {
+        // Superseded while failing — nothing to publish.
+        await transport?.stop().catch(() => {})
+        return
+      }
       runtime.status = 'error'
       runtime.detail = error instanceof Error ? error.message : String(error)
       this.ctx.logger.warn(`[im-gateway] channel "${channel.id}" (${channel.type}) failed: ${runtime.detail}`)
@@ -146,8 +164,19 @@ export class ChannelManager {
   private async restart(id: string): Promise<void> {
     const runtime = this.runtimes.get(id)
     if (!runtime) return
-    await this.stop(id)
+    // Dispose the old transport and WAIT for it (stop() is fire-and-forget and
+    // would let a new transport race a half-closed old one — e.g. two live
+    // QQ/IMAP sessions for the same channel during the restart window).
+    const old = runtime.transport
+    runtime.transport = undefined
+    runtime.status = 'idle'
+    if (old) {
+      try { await old.stop() } catch (error: unknown) {
+        this.ctx.logger.warn(`[im-gateway] channel "${id}" stop during restart: ${String(error)}`)
+      }
+    }
     this.runtimes.delete(id)
+    this.emitStatus()
     if (this.scope) {
       const cfg = this.scope.get().channels.find(c => c.id === id)
       if (cfg && cfg.enabled) void this.start(cfg)
@@ -160,18 +189,48 @@ export class ChannelManager {
    * sends the agent reply back through the same transport that received it.
    */
   private async buildTransport(channel: ChannelConfig, runtime: ChannelRuntime): Promise<ChatIo> {
+    this.warnIfInsecureTarget(channel)
+    // Every inbound message is routed into the shared gateway with the full
+    // per-channel agent routing resolved HERE from the channel record (not from
+    // transport options), so schema fields that a transport never saw — cwd,
+    // agentPreset, maxTokens, allowlist — actually take effect. `channelKey`
+    // (the channel INSTANCE id) isolates sessions between two channels of the
+    // same transport type. The reply sink is looked up from the CURRENT runtime
+    // at send time (the latest transport for this channel id wins).
     const routeInbound = (route: InboundRoute): void => {
       void this.gateway.handle(
         { chatId: route.chatId, text: route.text, senderId: route.senderId },
         (reply) => {
           const t = this.runtimes.get(channel.id)?.transport
           if (!t) {
-            this.ctx.logger.warn(`[im-gateway] ${channel.id}: reply dropped (transport gone)`)
-            return Promise.resolve()
+            const message = `channel "${channel.id}" transport gone; reply NOT delivered`
+            this.ctx.logger.warn(`[im-gateway] ${message}`)
+            // Reject (not silently resolve): the caller (gateway delivery /
+            // interaction bridge) must observe the failure — a silent resolve
+            // would let an approval/question prompt appear delivered when it
+            // was dropped, wedging the session until the reply timeout.
+            return Promise.reject(new Error(message))
           }
           return t.sendText(route.chatId, reply)
         },
-        route.runtime,
+        {
+          // Receiving channel identity: instance id for keying, type name for
+          // the model-visible <dsh_im_source> metadata.
+          channelKey: channel.id,
+          channel: route.runtime?.channel,
+          // Per-channel agent routing (explicit channel config wins over the
+          // transport's own defaults which mirror the same fields).
+          provider: channel.provider || route.runtime?.provider,
+          model: channel.model || route.runtime?.model,
+          maxTokens: channel.maxTokens || route.runtime?.maxTokens,
+          cwd: channel.cwd || undefined,
+          agentPreset: channel.agentPreset || undefined,
+          disposeAfterReply: channel.disposeAfterReply,
+          // Explicit allowlist: an unset/empty per-channel allowlist means
+          // ALLOW ALL (never inherit the legacy global webhook allowlist, whose
+          // sender-id semantics belong to the HTTP caller).
+          allowlist: channel.allowlist ?? [],
+        },
       ).catch((error: unknown) => {
         this.ctx.logger.warn(`[im-gateway] ${channel.id} inbound failed: ${String(error)}`)
       })
@@ -289,19 +348,43 @@ export class ChannelManager {
     }
   }
 
-  /** Stop one channel's transport. */
+  /**
+   * Warn once per channel when a target URL carries credentials/tokens over
+   * plaintext `http://` to a NON-loopback host (loopback http is fine — the
+   * risk is a remote URL sniffing the secret on the wire).
+   */
+  private warnIfInsecureTarget(channel: ChannelConfig): void {
+    const record = channel as unknown as Record<string, unknown>
+    for (const key of ['callbackUrl', 'clawUrl', 'serverUrl'] as const) {
+      const value = record[key]
+      if (typeof value !== 'string' || !value.startsWith('http://')) continue
+      let hostname = ''
+      try { hostname = new URL(value).hostname } catch { continue }
+      if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1') continue
+      this.ctx.logger.warn(
+        `[im-gateway] channel "${channel.id}": ${key} is a remote plaintext http:// URL (${hostname}); `
+        + 'tokens/secrets sent to it travel unencrypted — prefer https:// or a loopback address.',
+      )
+    }
+  }
+
+  /** Stop one channel's transport (fire-and-forget dispose; status set immediately). */
   private stop(id: string): void {
     const runtime = this.runtimes.get(id)
     if (runtime === undefined) return
-    void this.disposeTransport(runtime).then(() => { runtime.status = 'idle'; this.emitStatus() })
     runtime.status = 'idle'
+    void this.disposeTransport(runtime)
     this.emitStatus()
   }
 
   private async disposeTransport(runtime: ChannelRuntime): Promise<void> {
     const t = runtime.transport
     runtime.transport = undefined
-    if (t) await t.stop()
+    if (t) {
+      try { await t.stop() } catch (error: unknown) {
+        this.ctx.logger.warn(`[im-gateway] channel "${runtime.config.id}" stop: ${String(error)}`)
+      }
+    }
   }
 
   private emitStatus(): void {

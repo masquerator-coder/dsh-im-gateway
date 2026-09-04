@@ -53,6 +53,26 @@ const EMAIL_PROVIDERS: EmailProvider[] = [
 const DEFAULT_CLAWBOT_URL = 'http://127.0.0.1:9001'
 const DEFAULT_CMCC_WSS = 'wss://5gvas01.cmicmaap.com/gtw-ai/openclaw/ws/msg'
 
+/** Advanced per-channel agent routing keys shown under the fold. */
+const ADVANCED_KEYS = ['allowlist', 'provider', 'model', 'maxTokens', 'cwd', 'agentPreset'] as const
+
+/** Non-secret fields that must be present before a channel can be saved. */
+const REQUIRED_BY_TYPE: Partial<Record<ChannelType, string[]>> = {
+  email: ['account'],
+  http: ['callbackUrl'],
+  feishu: ['appId'],
+}
+
+/** Descriptions rendered under each advanced field key. */
+const ADVANCED_HINTS: Record<string, string> = {
+  allowlist: '每行一个发送者 ID（邮箱/QQ/手机号/HTTP sender_id），留空 = 允许全部',
+  provider: '模型 Provider 路由（留空 = 使用运行时默认模型）',
+  model: '模型 ID（留空 = 使用运行时默认模型）',
+  maxTokens: '单轮输出上限（0 = 不限制）',
+  cwd: 'Agent 工作目录（留空 = ~/.dsh/im-workspace）',
+  agentPreset: 'Agent 预设名（留空 = 默认）',
+}
+
 /** Per-type prefill template + field list (the "傻瓜式" defaults). */
 interface Template {
   defaults: Record<string, unknown>
@@ -131,6 +151,34 @@ export interface ChannelsSectionProps {
   t: (key: string) => string
 }
 
+/**
+ * Front-end required-field check before save. Returns the labelKey of the
+ * first missing field, or null when the record is complete. A stored secret
+ * counts as filled (the client cannot see its value after redaction).
+ */
+function requiredMissing(
+  type: ChannelType,
+  template: Template | undefined,
+  active: ChannelConfig | undefined,
+  draft: Record<string, string>,
+  provider: string,
+): string | null {
+  const rec = active as unknown as Record<string, unknown> | undefined
+  const missing: string[] = []
+  for (const f of template?.fields ?? []) {
+    if (f.secret) {
+      const stored = rec !== undefined && rec[f.key] !== undefined
+      if (!stored && !(draft[f.key] ?? '').trim()) missing.push(f.labelKey)
+      continue
+    }
+    const required = (REQUIRED_BY_TYPE[type] ?? []).includes(f.key)
+    if (required && !(draft[f.key] ?? '').trim()) missing.push(f.labelKey)
+  }
+  // A custom email provider needs an explicit server host (presets fill it).
+  if (type === 'email' && provider === 'custom' && !(draft.host ?? '').trim()) missing.push('field.host')
+  return missing.length > 0 ? missing[0]! : null
+}
+
 export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement {
   const { scope, imGateway, t } = props
   const TP = useMemo(() => templatesFor(), [])
@@ -151,6 +199,9 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
   const [draftName, setDraftName] = useState('')
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState('')
+  const [noticeIsError, setNoticeIsError] = useState(false)
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  const [confirmingDelete, setConfirmingDelete] = useState(false)
 
   // Live status map: channelId -> { status, detail, qr } (pulled via RPC).
   const [status, setStatus] = useState<Record<string, { status: string; detail?: string; qr?: string }>>({})
@@ -163,7 +214,9 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
   // QR for the currently displayed channel, from the live status RPC map.
   const activeQr = status[resolvedActiveId ?? '']?.qr
 
-  // Poll live status from the host RPC (fallback: static).
+  // Poll live status from the host RPC (fallback: static). Polling pauses
+  // while the document is hidden (e.g. another tab holds the settings pane)
+  // and resumes immediately on visibility change.
   useEffect(() => {
     if (!imGateway || typeof imGateway.list !== 'function') return
     let alive = true
@@ -176,9 +229,16 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
         setStatus(map)
       } catch { /* transient */ }
     }
-    void poll()
-    const timer = setInterval(() => void poll(), 3000)
-    return () => { alive = false; clearInterval(timer) }
+    const visible = (): boolean => (typeof document === 'undefined' || !document.hidden)
+    if (visible()) void poll()
+    const timer = setInterval(() => { if (visible()) void poll() }, 3000)
+    const onVisibility = (): void => { if (visible()) void poll() }
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      alive = false
+      clearInterval(timer)
+      if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibility)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [imGateway])
 
@@ -198,6 +258,17 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
       if (f.secret) continue
       const v = (active as unknown as Record<string, unknown>)[f.key]
       if (v !== undefined && v !== null) loaded[f.key] = String(v)
+    }
+    // Advanced agent-routing fields live outside the foolproof templates; bring
+    // them back from the saved record too (allowlist is stored as an array).
+    const rec = active as unknown as Record<string, unknown>
+    for (const key of ADVANCED_KEYS) {
+      const v = rec[key]
+      if (key === 'allowlist') {
+        loaded.allowlist = Array.isArray(v) ? (v as string[]).join('\n') : ''
+        continue
+      }
+      if (v !== undefined && v !== null) loaded[key] = String(v)
     }
     // Match an email provider from the saved host, if any.
     if (active.type === 'email' && active.host) {
@@ -221,11 +292,15 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     setDraft(d)
     setDraftName(t('type.' + type))
     setNotice('')
+    setNoticeIsError(false)
+    setAdvancedOpen(false)
+    setConfirmingDelete(false)
   }, [TP, t])
 
   const select = useCallback((id: string) => {
     setActiveId(id)
     setCreating(null)
+    setConfirmingDelete(false)
   }, [])
 
   /** Fields for the current type (email switches with provider selection). */
@@ -241,18 +316,31 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
   const save = useCallback(async (): Promise<void> => {
     setBusy(true)
     setNotice('')
+    setNoticeIsError(false)
     try {
       const id = creating !== null ? `ch-${Date.now().toString(36)}` : (active?.id ?? '')
       const prev = active
       const type = creating as ChannelType ?? (active?.type as ChannelType)
       const tp = TP[type]
 
+      // Front-end required-field validation (per-type; custom email server host
+      // is only required when the provider is 自定义).
+      const missing = requiredMissing(type, tp, active, draft, provider)
+      if (missing !== null) {
+        setNotice(t('channels.missingField') + ' ' + missing)
+        setNoticeIsError(true)
+        setBusy(false)
+        return
+      }
+
       const nextChannel: Record<string, unknown> = {
         ...(prev ?? {}),
         id,
         type,
         name: draftName || t('type.' + type),
-        enabled: true,
+        // A brand-new channel is enabled by default; editing preserves the
+        // current enabled state (toggled via the separate 启用/停用 button).
+        enabled: creating !== null ? true : (prev?.enabled ?? true),
       }
 
       // Apply prefill defaults on create.
@@ -280,7 +368,23 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
           ? Number(v)
           : v
       }
-      // Other typed fields from defaults (ports/booleans) already set above.
+      // Merge advanced agent-routing fields (allowlist is multi-line here,
+      // stored as an array; maxTokens as a number; blank others are dropped).
+      for (const key of ADVANCED_KEYS) {
+        if (key === 'allowlist') {
+          const lines = (draft.allowlist ?? '').split(/\r?\n/).map(s => s.trim()).filter(s => s !== '')
+          nextChannel.allowlist = lines
+          continue
+        }
+        if (key === 'maxTokens') {
+          const n = Number(draft.maxTokens ?? 0)
+          nextChannel.maxTokens = Number.isFinite(n) && n > 0 ? n : 0
+          continue
+        }
+        const v = (draft[key] ?? '').trim()
+        if (v !== '') nextChannel[key] = v
+        else delete nextChannel[key]
+      }
 
       const nextList = creating !== null
         ? [...channels, nextChannel as unknown as ChannelConfig]
@@ -291,26 +395,56 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
       setNotice(t('channels.saved'))
     } catch (error) {
       setNotice(`${t('channels.saveFailed')}: ${String(error)}`)
+      setNoticeIsError(true)
     } finally {
       setBusy(false)
     }
   }, [creating, active, channels, draft, draftName, provider, currentFields, scope, t, TP])
 
   const remove = useCallback(async (id: string): Promise<void> => {
+    // Two-step delete confirmation: the first click arms, the second deletes.
+    if (!confirmingDelete) {
+      setConfirmingDelete(true)
+      setNotice(t('channels.confirmHint'))
+      setNoticeIsError(true)
+      setTimeout(() => setConfirmingDelete(false), 3000)
+      return
+    }
     setBusy(true)
     setNotice('')
+    setNoticeIsError(false)
     try {
       const nextList = channels.filter(c => c.id !== id)
       await scope.set('channels', nextList)
       if (activeId === id) setActiveId(nextList[0]?.id)
       if (creating !== null) setCreating(null)
-      setNotice(t('channels.saved'))
+      setNotice(t('channels.removed'))
+      setConfirmingDelete(false)
     } catch (error) {
       setNotice(`${t('channels.saveFailed')}: ${String(error)}`)
+      setNoticeIsError(true)
     } finally {
       setBusy(false)
     }
-  }, [channels, activeId, creating, scope, t])
+  }, [channels, activeId, creating, confirmingDelete, scope, t])
+
+  /** Flip one channel's enabled flag in place (host reconciles live state). */
+  const toggleEnabled = useCallback(async (): Promise<void> => {
+    if (!active) return
+    setBusy(true)
+    setNotice('')
+    setNoticeIsError(false)
+    try {
+      const nextList = channels.map(c => (c.id === active.id ? { ...c, enabled: !c.enabled } : c))
+      await scope.set('channels', nextList)
+      setNotice(t('channels.saved'))
+    } catch (error) {
+      setNotice(`${t('channels.saveFailed')}: ${String(error)}`)
+      setNoticeIsError(true)
+    } finally {
+      setBusy(false)
+    }
+  }, [active, channels, scope, t])
 
   const typeLabel = (type: ChannelType): string => t('type.' + type)
 
@@ -375,7 +509,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     ),
     // RIGHT: form for the selected channel.
     h('div', { style: { flex: '1 1 auto', minWidth: '0' } },
-      notice !== '' ? h('div', { style: { color: '#57d18a', fontSize: '12px', marginBottom: '8px' } }, notice) : null,
+      notice !== '' ? h('div', { style: { color: noticeIsError ? '#ff7a7a' : '#57d18a', fontSize: '12px', marginBottom: '8px' } }, notice) : null,
       creating !== null || active
         ? h('div', { style: { display: 'grid', gap: '12px' } },
             // Status line
@@ -383,6 +517,17 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
               `${typeLabel(currentType)} · ${statusLabel(activeStatusKey)}`
               + (status[resolvedActiveId ?? '']?.detail ? ` — ${status[resolvedActiveId ?? '']!.detail}` : ''),
             ),
+            // Enable / disable switch (existing channels only; new ones start enabled).
+            active && !creating ? h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+              h('button', {
+                type: 'button',
+                disabled: busy,
+                onClick: () => void toggleEnabled(),
+                style: { ...ghostStyle, padding: '5px 12px', fontSize: '12px' },
+              }, active.enabled ? t('channels.disable') : t('channels.enable')),
+              h('span', { style: { fontSize: '12px', opacity: 0.7 } },
+                active.enabled ? t('channels.enabledHint') : t('channels.disabledHint')),
+            ) : null,
             h('div', { style: { display: 'grid', gap: '4px' } },
               h('label', { style: labelStyle }, t('field.name')),
               h('input', { value: draftName, onChange: (e: React.ChangeEvent<HTMLInputElement>) => setDraftName(e.target.value), style: inputStyle }),
@@ -413,6 +558,35 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
                 }),
               ),
             ),
+            // Advanced agent-routing options (allowlist / provider / model /
+            // maxTokens / cwd / agentPreset), disclosed on demand.
+            h('div', { style: { borderTop: '1px solid rgba(128,128,128,0.18)', paddingTop: '8px' } },
+              h('button', {
+                type: 'button',
+                onClick: () => setAdvancedOpen(!advancedOpen),
+                style: { ...ghostStyle, padding: '5px 12px', fontSize: '12px', border: 'none', opacity: 0.8 },
+              }, t('channels.advanced') + (advancedOpen ? ' ▴' : ' ▾')),
+              advancedOpen ? h('div', { style: { display: 'grid', gap: '8px', marginTop: '8px' } },
+                ADVANCED_KEYS.map(key => h('div', { key, style: { display: 'grid', gap: '3px' } },
+                  h('label', { style: labelStyle }, t('advanced.' + key)),
+                  key === 'allowlist'
+                    ? h('textarea', {
+                        rows: 3,
+                        style: { ...inputStyle, fontFamily: 'monospace' },
+                        value: draft.allowlist ?? '',
+                        onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) =>
+                          setDraft(prev => ({ ...prev, allowlist: e.target.value })),
+                      })
+                    : h('input', {
+                        style: inputStyle,
+                        value: draft[key] ?? '',
+                        onChange: (e: React.ChangeEvent<HTMLInputElement>) =>
+                          setDraft(prev => ({ ...prev, [key]: e.target.value })),
+                      }),
+                  h('span', { style: { fontSize: '11px', opacity: 0.55 } }, ADVANCED_HINTS[key] ?? ''),
+                )),
+              ) : null,
+            ),
             // QR for QQ / wechat (scan-to-login). Shown live from the host RPC.
             (currentType === 'qq' || currentType === 'wechat') ? h('div', { style: { fontSize: '12px' } },
               activeQr
@@ -424,7 +598,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
             h('div', { style: { display: 'flex', gap: '10px', marginTop: '4px' } },
               h('button', { type: 'button', onClick: () => void save(), disabled: busy, style: primaryStyle }, t('channels.save')),
               active ? h('button', { type: 'button', onClick: () => void remove(active.id), disabled: busy,
-                style: { ...ghostStyle, color: '#ff7a7a' } }, t('channels.delete')) : null,
+                style: { ...ghostStyle, color: '#ff7a7a' } }, confirmingDelete ? t('channels.confirmDelete') : t('channels.delete')) : null,
             ),
           )
         : h('p', { style: { opacity: 0.7, fontSize: '14px' } }, t('channels.empty')),

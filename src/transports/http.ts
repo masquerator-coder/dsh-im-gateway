@@ -78,6 +78,8 @@ export class HttpTransport implements ChannelTransport {
     const response = await fetch(this.options.callbackUrl, {
       method: 'POST',
       headers,
+      // Hard timeout so a black-holed callback cannot wedge the session.
+      signal: AbortSignal.timeout(30_000),
       body: JSON.stringify({ chat_id: chatId, text, ts: Date.now() }),
     })
     if (!response.ok) {

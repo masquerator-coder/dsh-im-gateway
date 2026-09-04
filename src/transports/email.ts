@@ -41,6 +41,24 @@ function stateFileFor(host: string, account: string, inbox: string): string {
   return join(homedir(), '.dsh', 'im-workspace', 'email-state', `${key}.json`)
 }
 
+/**
+ * First-poll scan window: a fresh account ingests at most this many recent
+ * messages (bounded by mailbox uidNext) instead of downloading the whole
+ * inbox history on first connect.
+ */
+const INITIAL_SCAN_MESSAGES = 50
+
+/**
+ * Extract the real recipient address from a compound email chatId. The email
+ * chatId doubles as the session key and is `${account}/${sender}` (see
+ * pollInbox); only the part after the first '/' is a real SMTP recipient.
+ * Exported as a pure function so it is unit-testable without an SMTP client.
+ */
+export function recipientOf(chatId: string): string {
+  const slash = chatId.indexOf('/')
+  return slash >= 0 ? chatId.slice(slash + 1) : chatId
+}
+
 /** Minimal adapter over nodemailer + imapflow, loaded lazily at runtime. */
 export class EmailTransport implements ChannelTransport {
   private transport: any = null
@@ -49,6 +67,8 @@ export class EmailTransport implements ChannelTransport {
   private connected = false
   /** Highest UID already processed, persisted across restarts. */
   private lastUid = 0
+  /** Consecutive poll failures (triggers an error state after a threshold). */
+  private pollFailures = 0
 
   constructor(private readonly options: EmailChannelOptions) {}
 
@@ -103,7 +123,18 @@ export class EmailTransport implements ChannelTransport {
     const poll = async (): Promise<void> => {
       try {
         await this.pollInbox()
-      } catch {
+        // Recovery from a previous error state: report connected again.
+        if (this.pollFailures > 0) {
+          this.pollFailures = 0
+          this.options.onState?.('connected')
+        }
+      } catch (error) {
+        this.pollFailures += 1
+        // Repeated poll failures mean the IMAP connection is unhealthy — surface
+        // it to the UI/log instead of failing silently every 15s forever.
+        if (this.pollFailures >= 3) {
+          this.options.onState?.('error', `poll failed ${this.pollFailures}x: ${error instanceof Error ? error.message : String(error)}`)
+        }
         // transient poll errors are non-fatal; keep polling
       }
     }
@@ -117,8 +148,19 @@ export class EmailTransport implements ChannelTransport {
 
   private async pollInbox(): Promise<void> {
     if (!this.client || !this.client.connection) return
-    const { host, account, inbox } = this.options
-    await this.client.mailboxOpen(inbox || 'INBOX')
+    const { account, inbox } = this.options
+    const mailbox = await this.client.mailboxOpen(inbox || 'INBOX')
+    // First run (no persisted cursor): do NOT scan the whole inbox history —
+    // start just inside the most recent window so an old/large mailbox cannot
+    // stall the first poll. Once the cursor is persisted, polling is strictly
+    // incremental (uidNext only advances).
+    if (this.lastUid === 0) {
+      const uidNext = Number(mailbox?.uidNext) || 0
+      if (uidNext > 1) {
+        this.lastUid = Math.max(0, uidNext - INITIAL_SCAN_MESSAGES - 1)
+        this.options.log?.(`email first run: scanning the newest ${INITIAL_SCAN_MESSAGES} messages (uidNext=${uidNext})`)
+      }
+    }
     // Incremental fetch: only messages newer than the last processed UID. UIDs
     // are monotonic per mailbox, so this never rescans already-handled mail and
     // only transfers the few new messages since the previous poll.
@@ -128,13 +170,20 @@ export class EmailTransport implements ChannelTransport {
       const uid = Number(message.uid)
       if (!Number.isFinite(uid) || uid <= this.lastUid) continue
       if (uid > newest) newest = uid
+      const sender = message.envelope?.from?.[0]?.address || ''
+      if (!sender) {
+        // No From address: the message cannot be attributed to (or replied to)
+        // any chat — do NOT fall back to a synthetic id (that would collide all
+        // anonymous mail into one session). Advance the cursor and move on.
+        this.options.log?.('email skip: message without From address')
+        continue
+      }
       const text = await this.extractText(message)
       if (!text) continue
-      const sender = message.envelope?.from?.[0]?.address || ''
       this.options.onInbound({
-        chatId: `${account}/${sender || uid}`,
+        chatId: `${account}/${sender}`,
         text,
-        senderId: sender || undefined,
+        senderId: sender,
         runtime: {
           provider: this.options.provider,
           model: this.options.model,
@@ -181,8 +230,18 @@ export class EmailTransport implements ChannelTransport {
       try {
         const { simpleParser } = await import('mailparser')
         const parsed = await simpleParser(message.source)
-        const body: string = (parsed.text as string) || ''
-        return body.replace(/>.*\n/g, '').trim().slice(0, 4000)
+        let body: string = (parsed.text as string) || ''
+        // Normalize line endings, then strip quoted/forwarded lines (a line
+        // starting with '>') one line at a time — a whole-line regex would
+        // also eat reply lines that merely begin with '>' content the user
+        // wrote, and would leave `\r` fragments behind on CRLF mail.
+        body = body.replace(/\r\n/g, '\n')
+        body = body.split('\n')
+          .filter((line) => !line.trimStart().startsWith('>'))
+          .join('\n')
+          .trim()
+          .slice(0, 4000)
+        return body
       } catch {
         /* fall through */
       }
@@ -195,7 +254,7 @@ export class EmailTransport implements ChannelTransport {
     if (!this.transport) throw new Error('email channel not started')
     await this.transport.sendMail({
       from: this.options.account,
-      to,
+      to: recipientOf(to),
       subject: 'Re: IM Gateway',
       text,
     })

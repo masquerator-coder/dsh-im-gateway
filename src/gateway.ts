@@ -8,7 +8,7 @@ import { installModelSelection, type ModelSelection, type ModelSelectionRef } fr
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import { createUserMessage, errorChain, type MessageSource } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
-import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { sessionIdForChat } from './session.ts'
 import { InteractionBridge } from './interaction.ts'
 
@@ -55,6 +55,19 @@ export interface MessageRuntime {
    * each transport (cmcc/email/...), defaults to the gateway-level channel.
    */
   channel?: string
+  /**
+   * The configured channel INSTANCE id (not the transport type name). When
+   * present it takes precedence over `channel` for session/dedup keying so two
+   * `http` (or two `email`) channels with the same external chat id stay
+   * isolated. Filled by the ChannelManager from the channel record id.
+   */
+  channelKey?: string
+  /**
+   * Per-message sender allowlist (access control). Non-empty ⇒ only these
+   * senderIds may drive the agent; others (or sender-less messages) are denied
+   * up front. Takes precedence over the gateway-level default allowlist.
+   */
+  allowlist?: string[]
 }
 
 /** A function transport supplies to push one agent reply back out. */
@@ -245,18 +258,22 @@ export class ImGateway {
    *    concurrent messages can't overwrite each other's reply claim).
    */
   async handle(message: InboundMessage, reply: ReplySink, runtime: MessageRuntime = {}): Promise<void> {
-    const channel = runtime.channel ?? this.defaults.channel
-    if (!this.allowSender(message)) {
+    // Session/dedup keying uses the configured channel INSTANCE id when present
+    // (two `http` channels never share a session), else the transport type name.
+    const keyChannel = runtime.channelKey ?? runtime.channel ?? this.defaults.channel
+    // The type-name channel is what the model sees in <dsh_im_source> metadata.
+    const metaChannel = runtime.channel ?? this.defaults.channel
+    if (!this.allowSender(message, runtime.allowlist ?? this.defaults.allowlist)) {
       this.ctx.logger.warn(`[im-gateway] denied message chat=${message.chatId} sender=${message.senderId ?? '(none)'}`)
       return
     }
-    if (this.isRecentDuplicate(message, channel)) {
+    if (this.isRecentDuplicate(message, keyChannel)) {
       this.ctx.logger.info(`[im-gateway] suppressed duplicate chat=${message.chatId} sender=${message.senderId ?? '(none)'}`)
       return
     }
     // Fold the receiving channel into the session key so the same external
     // chat id on different channels never shares a session (isolation).
-    const sessionId = SessionId(sessionIdForChat(message.chatId, channel ?? ''))
+    const sessionId = SessionId(sessionIdForChat(message.chatId, keyChannel ?? ''))
     // Keep the outbound sender hot for this session so an in-flight approval /
     // question prompt can be pushed down the same channel that drives it.
     this.registerSender(String(sessionId), reply)
@@ -268,7 +285,7 @@ export class ImGateway {
     }
     const prev = this.tails.get(sessionId) ?? Promise.resolve()
     const run = prev
-      .then(() => this.process(sessionId, message, reply, runtime, channel))
+      .then(() => this.process(sessionId, message, reply, runtime, metaChannel))
       .catch((error: unknown) => {
         this.ctx.logger.warn(`[im-gateway] handle ${sessionId} failed: ${errorChain(error)}`)
       })
@@ -295,6 +312,11 @@ export class ImGateway {
     const wait = new ReplyWaiter(sessionId, randomUUID())
     this.waiters.set(sessionId, wait)
 
+    // The followup opens the agent turn. The dsh agent API types it as void
+    // (fire-and-forget: the agent loop owns the turn lifecycle and surfaces
+    // errors through session events, which our waiter observes), so there is
+    // no promise to await or catch here — mirroring the webhook/session
+    // controller path.
     handle.agent.followup(createUserMessage({
       content: [{ type: 'text', text: this.composePrompt(message, channel) }],
       // A `user` MessageSource carries `{ kind: 'user' }` plus optional opaque
@@ -308,8 +330,7 @@ export class ImGateway {
   }
 
   /** Sender access control: allow all when no allowlist, else deny-by-default. */
-  private allowSender(message: InboundMessage): boolean {
-    const allow = this.defaults.allowlist
+  private allowSender(message: InboundMessage, allow: string[] | undefined): boolean {
     if (allow === undefined || allow.length === 0) return true
     if (message.senderId === undefined || message.senderId === '') return false
     return allow.includes(message.senderId)
@@ -503,8 +524,16 @@ export class ImGateway {
     try {
       const lease = await query.observeSession(sessionId)
       // Caller-owned lease: release it now — it was only an existence probe.
+      // Honor asyncDispose first (the lease may be an async resource).
       const disposable = lease as { [Symbol.dispose]?: () => void } | undefined
-      try { disposable?.[Symbol.dispose]?.() } catch { /* best-effort release */ }
+      const asyncDisposable = lease as { [Symbol.asyncDispose]?: () => Promise<void> | void } | undefined
+      try {
+        if (typeof asyncDisposable?.[Symbol.asyncDispose] === 'function') {
+          await asyncDisposable[Symbol.asyncDispose]!()
+        } else {
+          disposable?.[Symbol.dispose]?.()
+        }
+      } catch { /* best-effort release */ }
       return true
     } catch (error: unknown) {
       if ((error as { code?: string })?.code === 'SESSION_QUERY_SESSION_NOT_FOUND') return false
@@ -527,6 +556,10 @@ export class ImGateway {
       const outcome = await Promise.race([wait.done.then(() => 'done' as const), timeout(REPLY_TIMEOUT_MS)])
       if (outcome === 'timeout') {
         this.ctx.logger.warn(`[im-gateway] reply for ${sessionId} timed out after ${REPLY_TIMEOUT_MS}ms`)
+        // A pending approval/question is orphaned once we abandon this turn:
+        // abort it (fail-closed `cancelled`) so a later user message is never
+        // mis-consumed as the answer to a stale prompt.
+        this.interactions.clear(String(sessionId))
       }
       const text = wait.settle()
       this.waiters.delete(sessionId)
@@ -538,6 +571,7 @@ export class ImGateway {
     } catch (error: unknown) {
       wait.settle()
       this.waiters.delete(sessionId)
+      this.interactions.clear(String(sessionId))
       this.ctx.logger.warn(`[im-gateway] reply for ${sessionId} failed: ${errorChain(error)}`)
     } finally {
       if (runtime.disposeAfterReply) {

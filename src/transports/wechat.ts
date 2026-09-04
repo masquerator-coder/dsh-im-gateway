@@ -1,5 +1,11 @@
 import type { ChannelTransport, InboundRoute } from './types.ts'
 
+/** Companion inbound poll cadence (from the end of one poll to the next). */
+const WECHAT_POLL_INTERVAL_MS = 3000
+
+/** Per-request timeout for companion HTTP calls. */
+const WECHAT_POST_TIMEOUT_MS = 8000
+
 export interface WechatClawOptions {
   /** Base URL of the clawbot companion gateway (e.g. http://127.0.0.1:9001). */
   clawUrl: string
@@ -32,12 +38,15 @@ export interface WechatClawOptions {
  */
 export class WechatClawTransport implements ChannelTransport {
   private timer: NodeJS.Timeout | null = null
+  private started = false
   private connected = false
   private seen = new Set<string>()
 
   constructor(private readonly options: WechatClawOptions) {}
 
   async start(): Promise<void> {
+    if (this.started) return
+    this.started = true
     const url = this.options.clawUrl || 'http://127.0.0.1:9001'
     if (!url) throw new Error('wechat channel requires a clawbot gateway URL')
 
@@ -62,10 +71,14 @@ export class WechatClawTransport implements ChannelTransport {
       this.options.onState?.('connecting', '等待 clawbot 伴生网关就绪…')
     }
 
+    // Serial scheduling: the next poll starts only after the previous round
+    // finished (a fixed setInterval would stack overlapping polls whenever the
+    // companion is slow). `this.started === false` means stop() ran mid-poll.
     const poll = async (): Promise<void> => {
       try { await this.pollInbound(url) } catch { /* transient */ }
+      if (!this.started) return
+      this.timer = setTimeout(() => { void poll() }, WECHAT_POLL_INTERVAL_MS)
     }
-    this.timer = setInterval(() => { void poll() }, 3000)
     void poll()
 
     // Surface the login QR if the companion exposes one (scan-to-login).
@@ -89,6 +102,9 @@ export class WechatClawTransport implements ChannelTransport {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
+      // Hard timeout so a slow/hung companion never blocks the poll cycle or
+      // an outbound reply for the undici default (~300s).
+      signal: AbortSignal.timeout(WECHAT_POST_TIMEOUT_MS),
       body: body === null || body === undefined ? '{}' : JSON.stringify(body),
     })
     if (!res.ok) {
@@ -140,9 +156,10 @@ export class WechatClawTransport implements ChannelTransport {
   }
 
   async stop(): Promise<void> {
+    this.started = false
     this.connected = false
     if (this.timer) {
-      clearInterval(this.timer)
+      clearTimeout(this.timer)
       this.timer = null
     }
     this.options.onState?.('idle')

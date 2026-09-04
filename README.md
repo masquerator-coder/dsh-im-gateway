@@ -50,12 +50,14 @@ In the DSH **「插件 → 插件设置」** page an **"IM 通道设置"** card 
 | --- | --- | --- | --- |
 | **微信** (clawbot) | `clawUrl` (`http://127.0.0.1:9001`) | token; scan companion QR | polling HTTP client of a clawbot companion gateway |
 | **QQ** | — | (optional qq/password; scan QR to log in) | `icqq` bot (QR or password login) |
-| **Email** | server/ports/TLS from chosen provider (QQ/163/Gmail/Outlook/企业微信/自定义) | account + 授权码/密码 | `nodemailer` (SMTP out) + `imapflow` (IMAP in) |
+| **Email** | server/ports/TLS from chosen provider (QQ/163/Gmail/Outlook/企业微信/自定义) | account + 授权码/密码 | `nodemailer` (SMTP out) + `imapflow` (IMAP in; 首次只处理最近 50 封) |
 | **中国移动 5G消息** | `serverUrl` (`wss://…/ws/msg`), `version: 2.0` | apiKey | WebSocket `SmsClient` to the 5G 消息 gateway |
 | **飞书** | — | App ID + App Secret | official `@larksuiteoapi/node-sdk` WebSocket long connection |
 | **通用 HTTP** | `inboundPath` `/im`, field mapping (`chat_id`/`text`/`sender_id`) | callbackUrl + (optional) secret | shared inbound `node:http` webhook route |
 
 Each enabled channel holds a **live connection** (`connected` / `connecting` / `error` / `idle`) that the host reports back to the UI through the `imGateway` RPC (`remote.define('imGateway', { list })`, polled by the client); the UI also shows the login **QR** for QQ/微信 scan-to-login and the connection error detail when present. Channel records live under the `im-channels` settings namespace, with secret fields (`apiKey`, `password`, `appSecret`, `token`, …) declared `role('secret')` — redacted on every wire boundary, only the host transports read them back from the settings scope.
+
+Every channel card exposes an **高级选项（接入控制 / 模型路由）** fold for the agent-routing fields shared with the legacy webhook: `allowlist` (one sender id per line — email address / QQ / phone / HTTP `sender_id`), `provider`, `model`, `maxTokens`, `cwd`, `agentPreset`, plus a 启用/停用 switch for the whole channel. These are applied **per channel instance**: two channels of the same kind (e.g. two `http` webhooks) never share an agent session even when their external `chat_id` collides, and a channel without its own `allowlist` allows all senders — it never inherits the legacy global webhook allowlist (whose sender-id semantics belong to that HTTP caller).
 
 > **Secrets**: keep real values out of Git. `.gitignore` already excludes `cordis.local.yml` / `.env*` and `lib/`; never commit an apiKey/appSecret/password to a channel record that ends up under version control.
 
@@ -122,6 +124,12 @@ Each enabled channel holds a **live connection** (`connected` / `connecting` / `
 - **Sender access control**: set `allowlist` (per-channel) so only known senders
   can drive the agent. Unauthorized (or sender-less) messages are denied before
   any agent/workspace/model side effect.
+- **Inbound hardening**: the shared webhook caps request bodies at 1 MiB (413)
+  and limits concurrent connections; secret checks are constant-time; internal
+  error details are logged but never returned in 5xx responses.
+- **Outbound timeouts**: every reply callback / companion HTTP call carries an
+  `AbortSignal.timeout`, so a black-holed endpoint cannot wedge a chat's
+  serialized turn for the undici default duration.
 - **Secrets management**: keep the real `secret` and `callbackUrl` out of Git.
   This repo ships `secret: ''` and a loopback placeholder `callbackUrl` only.
   Create a `.env`-backed or local-only `cordis.yml` overlay for real values.

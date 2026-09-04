@@ -40,6 +40,12 @@ assert.notEqual(a, c, 'different chat -> different session id')
 assert.ok(String(a).startsWith('im-'), 'session id stamped with im- prefix')
 step(`sessionIdForChat OK: ${a}`)
 
+// --- 1b. email reply-address parsing (compound chatId -> real recipient) ---
+const { recipientOf } = await import('../src/transports/email.ts')
+assert.equal(recipientOf('you@x.com/sender@foo.com'), 'sender@foo.com', 'compound chatId resolves to sender')
+assert.equal(recipientOf('sender@foo.com'), 'sender@foo.com', 'plain chatId passes through')
+step('email recipientOf OK')
+
 // --- 2 + 3. HTTP route -> dispatch -> reply callback round-trip ---
 const { InboundHttpServer } = await import('../src/inbound.ts')
 const { HttpTransport } = await import('../src/transports/http.ts')
@@ -95,6 +101,15 @@ assert.equal(bad.status, 401, 'bad secret -> 401')
 const nf = await fetch(`http://127.0.0.1:${inboundPort}/nope`, { method: 'POST' })
 assert.equal(nf.status, 404, 'unknown path -> 404')
 step('auth + path guard rails (401/404) OK')
+
+// Oversized body is rejected (413) instead of buffered into memory.
+const huge = await fetch(`http://127.0.0.1:${inboundPort}/im`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', 'x-im-secret': 's3cr3t' },
+  body: JSON.stringify({ chat_id: 'c1', text: 'x'.repeat(1024 * 1024 + 100) }),
+})
+assert.equal(huge.status, 413, `oversized body -> 413, got ${huge.status}`)
+step('HTTP body-size guard (413) OK')
 
 await transport.sendText('c1', 'agent reply')
 await new Promise((r2) => setTimeout(r2, 200))
