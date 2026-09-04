@@ -314,9 +314,17 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
 
   const typeLabel = (type: ChannelType): string => t('type.' + type)
 
-  const statusOf = (ch: ChannelConfig): string => status[ch.id]?.status ?? 'idle'
+  // Live status is only trustworthy when the host exposes the `imGateway` RPC
+  // namespace. Without it (host lacks `ctx.remote`) we must not fall back to a
+  // misleading "未连接"; show a static "已配置" instead.
+  const liveStatus = !!(imGateway && typeof imGateway.list === 'function')
+
+  const statusOf = (ch: ChannelConfig): string =>
+    liveStatus ? (status[ch.id]?.status ?? 'idle') : 'configured'
+
   const statusLabel = (s: string): string => {
     switch (s) {
+      case 'configured': return t('channels.status.configured')
       case 'connected': return t('channels.status.connected')
       case 'connecting': return t('channels.status.connecting')
       case 'error': return t('channels.status.error')
@@ -324,7 +332,9 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     }
   }
 
-  const activeStatusKey = active ? statusOf(active) : creating ? 'connecting' : 'idle'
+  const activeStatusKey = liveStatus
+    ? (active ? statusOf(active) : creating ? 'connecting' : 'idle')
+    : 'configured'
 
   return h('div', { style: { display: 'flex', gap: '20px', padding: '4px 0' } },
     // LEFT: channel list / pickers.

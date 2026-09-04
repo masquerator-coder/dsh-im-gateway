@@ -25,6 +25,9 @@ export const zh = {
   'channels.status.connecting': '连接中…',
   'channels.status.connected': '已连接',
   'channels.status.error': '连接错误',
+  // Static label when the host provides no live status RPC (real connection
+  // state is unobservable, so we must NOT claim "未连接").
+  'channels.status.configured': '已配置',
   'type.wechat': '微信',
   'type.qq': 'QQ',
   'type.email': '邮箱 Email',
@@ -82,6 +85,7 @@ export const en = {
   'channels.status.connecting': 'Connecting…',
   'channels.status.connected': 'Connected',
   'channels.status.error': 'Error',
+  'channels.status.configured': 'Configured',
   'type.wechat': 'WeChat',
   'type.qq': 'QQ',
   'type.email': 'Email',
