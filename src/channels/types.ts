@@ -9,8 +9,8 @@
 
 /** The channel kinds the gateway can manage. */
 export type ChannelType =
-  | 'wechat'   // 微信（clawbot companion）
-  | 'qq'       // QQ（icqq bot，扫码登录）
+  | 'wechat'   // 微信（直连官方 ilink 网关，扫码绑定）
+  | 'qq'       // QQ（官方开放平台机器人，WebSocket 网关）
   | 'email'    // email（SMTP/IMAP 收发）
   | 'cmcc'     // 中国移动 新消息 / 5G消息 (WebSocket)
   | 'feishu'   // 飞书（官方 bot，长连接）
@@ -76,13 +76,17 @@ export interface ChannelConfig {
   appId?: string
   appSecret?: string // SECRET
 
-  // ---- wechat (clawbot companion) ----
-  clawUrl?: string
+  // ---- wechat (official ilink gateway) ----
+  /** ilink gateway base URL (defaults to https://ilinkai.weixin.qq.com). */
+  baseUrl?: string
+  /** ilink bot token (SECRET). Auto-filled at QR bind; may be pre-seeded. */
   token?: string // SECRET
 
-  // ---- qq ----
-  qq?: string
-  qqPassword?: string // SECRET (password login; QR preferred)
+  // ---- qq (official bot; reuses appId/appSecret — same as feishu) ----
+  /** bot API base (defaults to https://api.sgroup.qq.com). */
+  botApiBase?: string
+  /** sandbox=true uses https://sandbox.api.sgroup.qq.com. */
+  sandbox?: boolean
 }
 
 /** Resolved shape of the whole `im-channels` settings section. */

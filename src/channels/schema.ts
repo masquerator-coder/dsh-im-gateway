@@ -69,13 +69,13 @@ export const ChannelsSettingsSchema: z<ChannelsSettings> = z.object({
     appId: z.string().required(false),
     appSecret: SECRET(),
 
-    // wechat
-    clawUrl: z.string().required(false),
+    // wechat (official ilink gateway)
+    baseUrl: z.string().required(false),
     token: SECRET(),
 
-    // qq
-    qq: z.string().required(false),
-    qqPassword: SECRET(),
+    // qq (official bot; appId/appSecret shared with feishu above)
+    botApiBase: z.string().required(false),
+    sandbox: z.boolean().required(false),
   })).default([]),
 })
 

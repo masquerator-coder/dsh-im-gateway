@@ -6,14 +6,14 @@ A [DeepSeek Harness](https://deepseek-harness.github.io/deepseek-harness/) (Cord
 2. **Bridge** — each message is injected into a **persistent Harness Agent** that is stably mapped to the external chat, so a conversation keeps context across messages while separate chats (and separate channels) stay isolated.
 3. **Outbound** — the Agent's reply is collected from the global session-event stream by **rpcId claiming** and delivered back through the **same channel** that received it.
 
-It ships both a **legacy single HTTP webhook** and a **multi-channel settings UI** ("IM 通道" in the DSH settings panel) covering six channel kinds — 微信 (clawbot), QQ (icqq bot), 邮箱 Email (SMTP/IMAP), 中国移动 5G消息 (WebSocket), 飞书 (official bot), and 通用 HTTP 回调.
+It ships both a **legacy single HTTP webhook** and a **multi-channel settings UI** ("IM 通道" in the DSH settings panel) covering six channel kinds — 微信 (ilink bot), QQ (官方 bot), 邮箱 Email (SMTP/IMAP), 中国移动 5G消息 (WebSocket), 飞书 (official bot), and 通用 HTTP 回调.
 
 ---
 
 ## How it works
 
 ```
-external IM --POST--> [channel transport (webhook / WS / IMAP / icqq / claw)] -> [workspace-attached Agent/session per chat]
+external IM --POST--> [channel transport (webhook / WS / IMAP / QQ bot / ilink)] -> [workspace-attached Agent/session per chat]
      ^                                                                                              |
      |                                                                                global session/event stream (rpcId claim)
      +-- <-- same channel delivers (bounded retry) <-- [collected reply]
@@ -48,16 +48,35 @@ In the DSH **「插件 → 插件设置」** page an **"IM 通道设置"** card 
 
 | Type | Fixed items auto-filled | User provides | Transport |
 | --- | --- | --- | --- |
-| **微信** (clawbot) | `clawUrl` (`http://127.0.0.1:9001`) | token; scan companion QR | polling HTTP client of a clawbot companion gateway |
-| **QQ** | — | (optional qq/password; scan QR to log in) | `icqq` bot (QR or password login) |
+| **微信** (wechat) | `baseUrl` (`https://ilinkai.weixin.qq.com`) | token (auto at bind); scan official ilink QR | direct client of Tencent's official ilink bot gateway (QR bind → getupdates poll → sendmessage) |
+| **QQ** | `botApiBase` (`https://api.sgroup.qq.com`) | AppID + AppSecret (create bot at q.qq.com) | official QQ bot WebSocket gateway (`getAppAccessToken` → `api.sgroup.qq.com/gateway` → wss; C2C/group) |
 | **Email** | server/ports/TLS from chosen provider (QQ/163/Gmail/Outlook/企业微信/自定义) | account + 授权码/密码 | `nodemailer` (SMTP out) + `imapflow` (IMAP in; 首次只处理最近 50 封) |
 | **中国移动 5G消息** | `serverUrl` (`wss://…/ws/msg`), `version: 2.0` | apiKey | WebSocket `SmsClient` to the 5G 消息 gateway |
 | **飞书** | — | App ID + App Secret | official `@larksuiteoapi/node-sdk` WebSocket long connection |
 | **通用 HTTP** | `inboundPath` `/im`, field mapping (`chat_id`/`text`/`sender_id`) | callbackUrl + (optional) secret | shared inbound `node:http` webhook route |
 
-Each enabled channel holds a **live connection** (`connected` / `connecting` / `error` / `idle`) that the host reports back to the UI through the `imGateway` RPC (`remote.define('imGateway', { list })`, polled by the client); the UI also shows the login **QR** for QQ/微信 scan-to-login and the connection error detail when present. Channel records live under the `im-channels` settings namespace, with secret fields (`apiKey`, `password`, `appSecret`, `token`, …) declared `role('secret')` — redacted on every wire boundary, only the host transports read them back from the settings scope.
+Each enabled channel holds a **live connection** (`connected` / `connecting` / `error` / `idle`) that the host reports back to the UI through the `imGateway` RPC (`remote.define('imGateway', { list })`, polled by the client); the UI also shows the login **QR** for 微信 scan-to-login and the connection error detail when present. Channel records live under the `im-channels` settings namespace, with secret fields (`apiKey`, `password`, `appSecret`, `token`, …) declared `role('secret')` — redacted on every wire boundary, only the host transports read them back from the settings scope.
 
 Every channel card exposes an **高级选项（接入控制 / 模型路由）** fold for the agent-routing fields shared with the legacy webhook: `allowlist` (one sender id per line — email address / QQ / phone / HTTP `sender_id`), `provider`, `model`, `maxTokens`, `cwd`, `agentPreset`, plus a 启用/停用 switch for the whole channel. These are applied **per channel instance**: two channels of the same kind (e.g. two `http` webhooks) never share an agent session even when their external `chat_id` collides, and a channel without its own `allowlist` allows all senders — it never inherits the legacy global webhook allowlist (whose sender-id semantics belong to that HTTP caller).
+
+### 微信通道（直连官方 ilink 网关）
+
+The WeChat channel is a **direct client of Tencent's official ilink bot gateway** (no local companion process needed), ported from the [dsh-clawbot](dsh-clawbot-main/) reference. Default gateway: `https://ilinkai.weixin.qq.com` (field `baseUrl`; keep default unless you self-host a gateway). Lifecycle:
+
+1. **保存并启用**通道 → 面板显示官方登录二维码（`baseUrl` 预填，`token` 留空）。
+2. **手机微信扫码**确认绑定 → ilink 下发 `bot_token`，自动持久化到 `~/.dsh/im-workspace/wechat-state/<channelId>.json`（跨重启复用，无需重复扫码）。
+3. **在微信里给新出现的 bot 联系人发一条消息**解锁发送凭证 `context_token`。
+4. 状态变为「已连接」后，绑定账号在微信里发的文本/语音转写会驱动 Agent，回复经同一 ilink 网关回送。
+
+> 边界（与参考实现一致）：ilink 网关对**主动发送严重限流**——这是通知/拍板渠道，不是聊天工具；`context_token` 只会在绑定账号先发一条消息后下发；收到 *转发* 的文章/文件收不到（需发原始链接）。绑定状态默认只发给绑定账号自己。
+
+### QQ 通道（官方 QQ 开放平台机器人）
+
+The QQ channel is a **direct client of the official QQ Open Platform robot gateway** — create a robot at [q.qq.com](https://q.qq.com), copy its **AppID + AppSecret**, and this transport handles the **official WebSocket gateway**: `POST https://bots.qq.com/app/getAppAccessToken` → `GET {botApiBase}/gateway` → connect the returned `wss://...` (IDENTIFY + heartbeat) to receive `C2C_MESSAGE_CREATE` / `GROUP_AT_MESSAGE_CREATE`, and posts replies to `api.sgroup.qq.com/v2/users|groups/{openid}/messages`.
+
+- Default gateway `botApiBase`: `https://api.sgroup.qq.com` (预填). `sandbox` toggle switches to `https://sandbox.api.sgroup.qq.com`.
+- AppID is non-secret; **AppSecret** is a `role('secret')` field (reuses the feishu `appSecret` field).
+- **边界**：群 / C2C 能力需在 q.qq.com 提审开通，未过审时接口报权限错误属正常；C2C/群消息为**被动回复**（需先用 `msg_id` 引用，无主动推送）；AppSecret 是机密，勿提交进 Git。
 
 > **Secrets**: keep real values out of Git. `.gitignore` already excludes `cordis.local.yml` / `.env*` and `lib/`; never commit an apiKey/appSecret/password to a channel record that ends up under version control.
 
@@ -75,7 +94,7 @@ Every channel card exposes an **高级选项（接入控制 / 模型路由）** 
 | `src/channels/types.ts` | Channel type model + status (pure types, shared client/host) |
 | `src/channels/schema.ts` | Host-side `im-channels` settings schema (SECRET fields via `role('secret')`) |
 | `src/channels/manager.ts` | Per-channel connection lifecycle, transport build, live status snapshots |
-| `src/transports/*.ts` | One real adapter per channel (http / email / cmcc / feishu / wechat / qq), each tags its runtime with `channel` |
+| `src/transports/*.ts` | One real adapter per channel (http / email / cmcc / feishu / wechat / qq / qqbot), each tags its runtime with `channel` |
 | `src/client/*` | Browser half: expandable plugin card (`ChannelsCard`) wrapping the channel management UI (`ChannelsSection`), foolproof templates, live status + QR |
 | `cordis.yml` | Local source overlay (`--patch`) for development / e2e iteration |
 | `cordis.patch.yml` | Published **bundle** layer — references the package by name (`dsh-im-gateway` → `lib/index.js`) |

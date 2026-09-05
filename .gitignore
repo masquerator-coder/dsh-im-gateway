@@ -36,6 +36,8 @@ Thumbs.db
 # dsh-cmcc-newmsg: local-only cordis overlay carrying the real 5G 消息 API Key
 cordis.local.yml
 dsh-cmcc-newmsg/
+# dsh-clawbot-main: vendored reference plugin (wechat ilink) — dev-time reference only, not part of this package
+dsh-clawbot-main/
 # dsh-cmcc-newmsg: received-media working directory (local only)
 .dsh/cmcc-newmsg/
 

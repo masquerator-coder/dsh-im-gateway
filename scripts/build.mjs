@@ -28,7 +28,7 @@ mkdirSync(outdir, { recursive: true })
 
 // --- node half ---
 // Runtime deps are provided by the host (external @deepseek-ai/*) plus this
-// plugin's own `dependencies` (ws, nodemailer, imapflow, mailparser, icqq,
+// plugin's own `dependencies` (ws, nodemailer, imapflow, mailparser,
 // @larksuiteoapi/*), which resolve from node_modules at load time — never
 // inline the heavy transports into the bundle.
 const nodeExternal = [
@@ -37,7 +37,6 @@ const nodeExternal = [
   'nodemailer',
   'imapflow',
   'mailparser',
-  'icqq',
   '@larksuiteoapi/*',
   'bufferutil',
   'utf-8-validate',

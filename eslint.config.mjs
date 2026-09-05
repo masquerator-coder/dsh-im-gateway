@@ -12,8 +12,6 @@
 import tseslint from 'typescript-eslint'
 import reactHooks from 'eslint-plugin-react-hooks'
 
-const reactHooksConfigs = reactHooks.configs ?? {}
-
 export default tseslint.config(
   {
     ignores: [
@@ -25,6 +23,7 @@ export default tseslint.config(
       'design/**',
       'video/**',
       'dsh-cmcc-newmsg/**',
+      'dsh-clawbot-main/**',
       'pnpm-lock.yaml',
     ],
   },

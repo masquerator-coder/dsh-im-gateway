@@ -50,8 +50,11 @@ const EMAIL_PROVIDERS: EmailProvider[] = [
   { id: 'wework', label: '企业微信邮箱', host: 'imap.exmail.qq.com', imapPort: 993, smtpPort: 465, useTls: true },
 ]
 
-const DEFAULT_CLAWBOT_URL = 'http://127.0.0.1:9001'
+/** Default WeChat ilink gateway (Tencent official bot gateway). */
+const DEFAULT_WECHAT_BASE_URL = 'https://ilinkai.weixin.qq.com'
 const DEFAULT_CMCC_WSS = 'wss://5gvas01.cmicmaap.com/gtw-ai/openclaw/ws/msg'
+/** Default QQ bot API base (official open platform). */
+const DEFAULT_QQ_API_BASE = 'https://api.sgroup.qq.com'
 
 /** Advanced per-channel agent routing keys shown under the fold. */
 const ADVANCED_KEYS = ['allowlist', 'provider', 'model', 'maxTokens', 'cwd', 'agentPreset'] as const
@@ -96,6 +99,13 @@ function emailFields(provider: EmailProvider): Field[] {
   return base
 }
 
+/** QQ channel (official bot): AppID/AppSecret + bot API base. */
+const QQ_BOT_FIELDS: Field[] = [
+  { key: 'appId', labelKey: 'field.appId', secret: true, placeholder: '机器人 AppID' },
+  { key: 'appSecret', labelKey: 'field.appSecret', secret: true, placeholder: '机器人 AppSecret' },
+  { key: 'botApiBase', labelKey: 'field.botApiBase' },
+]
+
 function templatesFor(): Record<ChannelType, Template> {
   const cmcc: Template = {
     defaults: { serverUrl: DEFAULT_CMCC_WSS, version: '2.0' },
@@ -127,18 +137,15 @@ function templatesFor(): Record<ChannelType, Template> {
     ],
   }
   const wechat: Template = {
-    defaults: { clawUrl: DEFAULT_CLAWBOT_URL },
+    defaults: { baseUrl: DEFAULT_WECHAT_BASE_URL },
     fields: [
-      { key: 'clawUrl', labelKey: 'field.clawUrl' },
-      { key: 'token', labelKey: 'field.token', secret: true },
+      { key: 'baseUrl', labelKey: 'field.baseUrl' },
+      { key: 'token', labelKey: 'field.token', secret: true, placeholder: '绑定后自动填入，也可手工预填' },
     ],
   }
   const qq: Template = {
-    defaults: {},
-    fields: [
-      { key: 'qq', labelKey: 'field.qq', placeholder: '留空则扫码登录' },
-      { key: 'qqPassword', labelKey: 'field.qqPassword', secret: true },
-    ],
+    defaults: { botApiBase: DEFAULT_QQ_API_BASE },
+    fields: QQ_BOT_FIELDS,
   }
   return { cmcc, http, email, feishu, wechat, qq }
 }

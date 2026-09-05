@@ -103,7 +103,6 @@
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.73.0",
-    "icqq": "^0.6.10",
     "imapflow": "^1.7.6",
     "mailparser": "^3.9.17",
     "nodemailer": "^9.0.6",

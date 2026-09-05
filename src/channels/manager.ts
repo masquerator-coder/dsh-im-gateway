@@ -8,8 +8,8 @@ import type { CmccTransportOptions } from '../transports/cmcc.ts'
 import type { HttpChannelOptions } from '../transports/http.ts'
 import type { EmailChannelOptions } from '../transports/email.ts'
 import type { FeishuChannelOptions } from '../transports/feishu.ts'
-import type { WechatClawOptions } from '../transports/wechat.ts'
-import type { QQChannelOptions } from '../transports/qq.ts'
+import type { WechatIlinkOptions } from '../transports/wechat.ts'
+import type { QQBotOptions } from '../transports/qqbot.ts'
 
 /** Mutable runtime handle for one channel. */
 export interface ChannelRuntime {
@@ -316,9 +316,10 @@ export class ChannelManager {
         return new FeishuTransport(options) as ChatIo
       }
       case 'wechat': {
-        const { WechatClawTransport } = await import('../transports/wechat.ts')
-        const options: WechatClawOptions = {
-          clawUrl: channel.clawUrl || '',
+        const { WechatIlinkTransport } = await import('../transports/wechat.ts')
+        const options: WechatIlinkOptions = {
+          channelId: channel.id,
+          baseUrl: channel.baseUrl || undefined,
           token: channel.token,
           provider: base.provider,
           model: base.model,
@@ -328,22 +329,24 @@ export class ChannelManager {
           onQr: (url: string) => { runtime.qr = url; this.emitStatus() },
           log: (m: string) => this.ctx.logger.info(`[im-gateway] ${channel.id}: ${m}`),
         }
-        return new WechatClawTransport(options) as ChatIo
+        return new WechatIlinkTransport(options) as ChatIo
       }
       case 'qq': {
-        const { QQTransport } = await import('../transports/qq.ts')
-        const options: QQChannelOptions = {
-          qq: channel.qq,
-          password: channel.qqPassword,
+        // Official QQ bot: appId/appSecret + WebSocket gateway (api.sgroup.qq.com).
+        const { QQBotTransport } = await import('../transports/qqbot.ts')
+        const options: QQBotOptions = {
+          appId: channel.appId || '',
+          clientSecret: channel.appSecret || '',
+          apiBase: channel.botApiBase || undefined,
+          sandbox: channel.sandbox || false,
           provider: base.provider,
           model: base.model,
           disposeAfterReply: base.disposeAfterReply,
           onInbound: routeInbound,
           onState: setState,
-          onQr: (dataUrl: string) => { runtime.qr = dataUrl; this.emitStatus() },
           log: (m: string) => this.ctx.logger.info(`[im-gateway] ${channel.id}: ${m}`),
         }
-        return new QQTransport(options) as ChatIo
+        return new QQBotTransport(options) as ChatIo
       }
     }
   }
@@ -355,7 +358,7 @@ export class ChannelManager {
    */
   private warnIfInsecureTarget(channel: ChannelConfig): void {
     const record = channel as unknown as Record<string, unknown>
-    for (const key of ['callbackUrl', 'clawUrl', 'serverUrl'] as const) {
+    for (const key of ['callbackUrl', 'baseUrl', 'serverUrl', 'botApiBase'] as const) {
       const value = record[key]
       if (typeof value !== 'string' || !value.startsWith('http://')) continue
       let hostname = ''

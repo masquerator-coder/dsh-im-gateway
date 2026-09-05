@@ -54,8 +54,8 @@ ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
   - **email**：先选邮箱服务商（QQ/163/Gmail/Outlook/企业微信/自定义），已知服务商自动填 host/IMAP/SMTP/TLS，用户只填账号 + 授权码；选"自定义"时显示 host/端口字段。
   - **通用HTTP**：填 `callbackUrl` + 可选 `secret`；`inboundPath`/字段映射预填。
   - **飞书**：只填 App ID + App Secret（长连接）。
-  - **微信**：填 clawbot 网关地址（预填） + token；显示伴生网关登录 QR。
-  - **QQ**：留空即扫码登录——登录 QR 由宿主经 RPC 回传并在面板内显示。
+  - **微信**：填 ilink 网关地址（预填 `https://ilinkai.weixin.qq.com`）+ token（可选，绑定后自动回填）；显示官方 ilink 登录 QR，扫码绑定。
+  - **QQ**：官方机器人，填 AppID/AppSecret + botApiBase（默认 `https://api.sgroup.qq.com`，可切沙箱），走官方 WebSocket 网关。
 
 ## 4. 配置持久化
 - 通道记录存于 `im-channels` settings 命名空间（`ChannelsSettingsSchema`），client 经 settings scope 提交，宿主经 settings scope 读取。
@@ -68,6 +68,6 @@ ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
   - `cmcc.ts` + `cmcc/smsClient.ts`：WebSocket 接中国移动 新消息/5G消息 网关（X-API-Key 头 + auth 握手 + 心跳 + 断线重连）。
   - `email.ts`：`nodemailer` 发（SMTP）+ `imapflow` 收（IMAP 轮询 INBOX，uid 去重）。
   - `feishu.ts`：官方 `@larksuiteoapi/node-sdk` WebSocket 长连接事件服务。
-  - `wechat.ts`：clawbot 伴生网关的轻量 HTTP 客户端（/health·/receive·/send·/qr）。
-  - `qq.ts`：`icqq` bot（扫码或密码登录，群/私聊均可收发）。
+  - `wechat.ts`：直连官方 ilink 机器人网关（`https://ilinkai.weixin.qq.com`）——扫码绑定 + getupdates 轮询 + sendmessage（参考 dsh-clawbot）。
+  - `qqbot.ts`：官方 QQ bot 网关（appId/appSecret → token → `api.sgroup.qq.com/gateway` → WebSocket，C2C/群收发）。
 - **连接状态回传**：`ChannelManager` 维护每通道 status（idle/connecting/connected/error）+ detail，`remote.define('imGateway', { list })` 暴露 `statusList()`（含新增的 `qr`），client 每 3s 轮询拉取并渲染；QQ/微信的登录 QR 经同一 RPC 的 `qr` 字段回传到 UI 显示。
