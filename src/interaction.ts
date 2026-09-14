@@ -35,6 +35,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import { trace } from './trace.ts'
 
 /**
  * Local mirrors of the DSH seam event declarations so `agentCtx.on(...)` sees
@@ -165,8 +166,11 @@ export class InteractionBridge {
    * agent's scoped world — no manual disposer is needed or returned.
    */
   install(agentCtx: Context, sessionId: string, send: (text: string) => Promise<void>): void {
+    trace(`[bridge] install agentCtx session=${sessionId}`)
     agentCtx.on('approval/request', (req, next) => {
+      trace(`[bridge] approval/request session=${sessionId} tool=${String((req as { toolName?: string }).toolName ?? '')} callId=${String((req as { callId?: string }).callId ?? '')}`)
       const answer = this.requestApproval(sessionId, send, req)
+      if (answer === undefined) trace(`[bridge] approval/request delegated (pending exists / no handle) session=${sessionId}`)
       return answer ?? next()
     })
     agentCtx.on('user-questions/request', (request, next) => {
@@ -181,7 +185,10 @@ export class InteractionBridge {
     send: (text: string) => Promise<void>,
     req: ApprovalRequestEvent,
   ): Promise<ApprovalOutcome> | undefined {
-    if (this.pending.has(sessionId)) return undefined // one at a time per session → delegate
+    if (this.pending.has(sessionId)) {
+      trace(`[bridge] approval/request SKIPPED: pending exists session=${sessionId}`)
+      return undefined // one at a time per session → delegate
+    }
     const prompt = [
       '【授权请求】Agent 需要执行以下操作，请回复确认：',
       `操作：${req.toolName ?? '(未知名工具)'}`,
@@ -249,10 +256,12 @@ export class InteractionBridge {
   private parseApprovalReply(text: string, resolve: (o: ApprovalOutcome) => void): boolean {
     const t = text.toLowerCase()
     if (/^(y|yes|允许|同意|确认|好的)$/.test(t)) {
+      trace(`[bridge] approval answered ALLOWED session text=${JSON.stringify(text)}`)
       resolve('allowed-once')
       return true
     }
     if (/^(n|no|拒绝|不同意|取消|否)$/.test(t)) {
+      trace(`[bridge] approval answered REJECTED session text=${JSON.stringify(text)}`)
       resolve('rejected')
       return true
     }
@@ -334,8 +343,11 @@ export class InteractionBridge {
     onFailure: () => void,
   ): Promise<void> {
     try {
+      trace(`[bridge] sendPrompt session=${sessionId} head=${JSON.stringify(prompt.slice(0, 60))}`)
       await send(prompt)
+      trace(`[bridge] sendPrompt resolved session=${sessionId}`)
     } catch (error) {
+      trace(`[bridge] sendPrompt FAILED session=${sessionId} err=${String(error)}`)
       this.ctx.logger.warn(`[im-gateway] interaction prompt send for ${sessionId} failed: ${String(error)}`)
       onFailure()
     }

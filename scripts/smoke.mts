@@ -10,6 +10,9 @@
  *   3. HttpTransport — the per-channel reply callback receives the payload.
  *   4. CmccTransport — constructing the WS client wires up, and connecting to an
  *      unreachable endpoint surfaces a clear error (bounded by a timeout).
+ *   5. FeishuTransport — the VENDORED Feishu SDK (lib/vendor/lark-sdk.cjs, not
+ *      an npm dependency) resolves and still exports Client / WSClient /
+ *      EventDispatcher, and missing credentials fail before any socket opens.
  *
  * Real transports that need live services (email / feishu / wechat / qq / a
  * live CMCC gateway) are exercised by starting them in the plugin; this file
@@ -143,6 +146,38 @@ assert.ok(
   `cmcc connect should fail loudly, got: ${cmccError || cmccState}`,
 )
 step('CMCC connect failure surfaced: ' + (cmccError || cmccState))
+
+// --- 5. Feishu transport: vendored SDK resolves offline; guards fail fast ---
+// The Feishu SDK is vendored at lib/vendor/lark-sdk.cjs instead of installed
+// (its transitive `protobufjs` postinstall made `dsh plugin add` fail on clean
+// profiles), so this asserts the committed artifact is present, loadable, and
+// still exports the three constructors the transport destructures.
+const { FeishuTransport, loadFeishuSdk } = await import('../src/transports/feishu.ts')
+const sdk = await loadFeishuSdk()
+for (const name of ['Client', 'WSClient', 'EventDispatcher']) {
+  assert.equal(typeof sdk[name], 'function', `vendored Feishu SDK must export ${name}`)
+}
+const probe = new (sdk.Client as any)({ appId: 'probe', appSecret: 'probe' })
+assert.equal(typeof probe.im.message.create, 'function', 'Client.im.message.create must exist')
+step('vendored Feishu SDK OK: Client / WSClient / EventDispatcher + im.message.create')
+
+let feishuState = ''
+const feishu = new FeishuTransport({
+  appId: '',
+  appSecret: '',
+  onInbound: () => {},
+  onState: (s) => { feishuState = s },
+})
+let feishuError = ''
+try {
+  await withTimeout(feishu.start(), 5000, 'feishu start')
+} catch (e) {
+  feishuError = String((e && e.message) || e)
+}
+assert.match(feishuError, /appId and appSecret/, 'missing credentials must fail before connecting')
+assert.equal(feishuState, 'error', 'missing credentials must report the error state')
+await feishu.stop().catch(() => {})
+step('Feishu missing-credential guard OK: ' + feishuError)
 
 process.stderr.write('\n✔ All local smoke checks passed.\n')
 process.exit(0)

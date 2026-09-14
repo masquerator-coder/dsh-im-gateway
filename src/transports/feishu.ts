@@ -1,5 +1,45 @@
 import type { ChannelTransport, InboundRoute } from './types.ts'
 
+/**
+ * Resolve the vendored Feishu / Lark SDK at `lib/vendor/lark-sdk.cjs`.
+ *
+ * The SDK is **vendored, not installed**: its hard dependency `protobufjs`
+ * carries a `postinstall` script, and pnpm >= 10 refuses to run an unapproved
+ * dependency build script, so `dsh plugin add <git-url>` dies with
+ * `ERR_PNPM_IGNORED_BUILDS` on a clean profile (see `scripts/build.mjs` for the
+ * full rationale). Loading it from a *computed* specifier keeps the vendored
+ * file out of the esbuild graph — the node-half bundle must not inline 1.9 MB
+ * of third-party code — while one code path serves both layouts:
+ *
+ *   - built bundle  `lib/index.js`         -> `./vendor/lark-sdk.cjs`
+ *   - source overlay `src/transports/*.ts` -> `../../lib/vendor/lark-sdk.cjs`
+ *
+ * @returns the SDK's module namespace (`Client`, `EventDispatcher`, `WSClient`, …).
+ */
+let cachedLarkSdk: unknown
+export async function loadFeishuSdk(): Promise<Record<string, unknown>> {
+  if (cachedLarkSdk !== undefined) return cachedLarkSdk as Record<string, unknown>
+  const candidates = ['./vendor/lark-sdk.cjs', '../../lib/vendor/lark-sdk.cjs']
+  let lastError: unknown
+  for (const candidate of candidates) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const mod = (await import(new URL(candidate, import.meta.url).href)) as any
+      // The vendored file is CJS: its named exports survive bundling only as
+      // `default` (`module.exports`), so unwrap when they are not top-level.
+      const sdk = mod?.Client !== undefined ? mod : (mod?.default ?? mod)
+      cachedLarkSdk = sdk
+      return sdk as Record<string, unknown>
+    } catch (error) {
+      lastError = error
+    }
+  }
+  throw new Error(
+    `feishu: vendored SDK not found (tried ${candidates.join(', ')}); `
+    + `run "pnpm build" to regenerate lib/vendor/lark-sdk.cjs — ${String(lastError)}`,
+  )
+}
+
 export interface FeishuChannelOptions {
   appId: string
   appSecret: string
@@ -33,8 +73,9 @@ export class FeishuTransport implements ChannelTransport {
       throw new Error('feishu channel requires appId and appSecret')
     }
 
-    // Lazy-require the SDK so other channels never break if it is missing.
-    const lark = await import('@larksuiteoapi/node-sdk')
+    // Load the vendored SDK lazily so other channels never break if it is
+    // missing, and so plugin startup never pays for it.
+    const lark = await loadFeishuSdk()
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { Client, EventDispatcher, WSClient } = lark as any
 

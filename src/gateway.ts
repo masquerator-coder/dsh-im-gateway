@@ -11,6 +11,7 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { sessionIdForChat } from './session.ts'
 import { InteractionBridge } from './interaction.ts'
+import { trace } from './trace.ts'
 
 /**
  * Safety bound on one reply turn. The inbound HTTP server acks (202) as soon as
@@ -245,6 +246,7 @@ export class ImGateway {
    * chat's IM channel. The latest sender wins; lookup happens at call time.
    */
   registerSender(sessionId: string, sender: (text: string) => Promise<void>): void {
+    trace(`[gw] registerSender session=${sessionId}`)
     this.senders.set(sessionId, sender)
   }
 
@@ -274,12 +276,14 @@ export class ImGateway {
     // Fold the receiving channel into the session key so the same external
     // chat id on different channels never shares a session (isolation).
     const sessionId = SessionId(sessionIdForChat(message.chatId, keyChannel ?? ''))
+    trace(`[gw] inbound session=${sessionId} chat=${message.chatId} head=${JSON.stringify(message.text.slice(0, 40))}`)
     // Keep the outbound sender hot for this session so an in-flight approval /
     // question prompt can be pushed down the same channel that drives it.
     this.registerSender(String(sessionId), reply)
     // If this inbound text answers an outstanding IM-side approval/question,
     // settle it and do NOT feed the text to the agent as a normal message.
     if (this.interactions.consume(String(sessionId), message.text).consumed) {
+      trace(`[gw] inbound consumed as interaction answer session=${sessionId}`)
       this.ctx.logger.info(`[im-gateway] consumed interaction reply for ${sessionId}`)
       return
     }
@@ -407,6 +411,7 @@ export class ImGateway {
       // scope so a question surfaces on the driving IM channel instead of only
       // the web UI. `next()`-falls back when no sender is present.
       this.interactions.install(agentCtx, String(sessionId), (text) => this.sendInteractive(sessionId, text))
+      trace(`[gw] setup(agentCtx) done session=${sessionId}`)
     }
 
     let handle: AgentHandle
@@ -416,6 +421,7 @@ export class ImGateway {
       // collide with it, so resume through the factory instead — this is the
       // step that makes "重启可续" work without an id collision.
       this.ctx.logger.info(`[im-gateway] resuming agent ${sessionId} (workspace=${workspacePath})`)
+      trace(`[gw] ensureAgent RESUME session=${sessionId} workspace=${workspacePath}`)
       handle = await this.ctx.agents.resume({
         resumeSessionId: sessionId,
         agentOptions: options,
@@ -555,6 +561,7 @@ export class ImGateway {
       // drops the turn without a matching `turn/end`.
       const outcome = await Promise.race([wait.done.then(() => 'done' as const), timeout(REPLY_TIMEOUT_MS)])
       if (outcome === 'timeout') {
+        trace(`[gw] reply TIMEOUT after ${REPLY_TIMEOUT_MS}ms session=${sessionId}; clearing pending interactions`)
         this.ctx.logger.warn(`[im-gateway] reply for ${sessionId} timed out after ${REPLY_TIMEOUT_MS}ms`)
         // A pending approval/question is orphaned once we abandon this turn:
         // abort it (fail-closed `cancelled`) so a later user message is never
@@ -624,8 +631,10 @@ export class ImGateway {
   private sendInteractive(sessionId: SessionId, text: string): Promise<void> {
     const sender = this.senders.get(String(sessionId))
     if (sender === undefined) {
+      trace(`[gw] sendInteractive NO SENDER session=${sessionId} head=${JSON.stringify(text.slice(0, 50))}`)
       return Promise.reject(new Error(`no outbound sender for ${sessionId}`))
     }
+    trace(`[gw] sendInteractive session=${sessionId} head=${JSON.stringify(text.slice(0, 50))}`)
     return sender(text)
   }
 

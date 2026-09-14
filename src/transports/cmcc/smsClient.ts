@@ -1,5 +1,6 @@
 import EventEmitter from 'node:events'
 import WebSocket from 'ws'
+import { trace } from '../../trace.ts'
 
 /**
  * Raw WebSocket client for the China Mobile 新消息 (5G Message / RCS) gateway.
@@ -92,6 +93,7 @@ export class SmsClient extends EventEmitter {
   }
 
   connect(): Promise<void> {
+    trace(`[sms] connect ${this.serverUrl} apiKey=${maskApiKey(this.apiKey)}`)
     log('connecting WebSocket', { serverUrl: this.serverUrl })
     return new Promise((resolve, reject) => {
       // `settled` guards against double-settling (a dead socket fires BOTH
@@ -115,6 +117,7 @@ export class SmsClient extends EventEmitter {
           headers: { 'X-API-Key': this.apiKey },
         })
         this.ws.on('open', () => {
+          trace('[sms] ws open')
           log('websocket open')
           this.connected = true
           this.ws?.send(JSON.stringify({ type: 'auth', apiKey: this.apiKey, version: this.version }))
@@ -134,6 +137,7 @@ export class SmsClient extends EventEmitter {
                 authResolved = true
                 clearTimeout(authTimeout)
                 this.ws?.removeListener('message', onFrame)
+                trace('[sms] auth ok')
                 log('auth ok')
                 this.reconnectAttempts = 0
                 this.startHeartbeat()
@@ -160,6 +164,7 @@ export class SmsClient extends EventEmitter {
           this.handleMessage(data.toString())
         })
         this.ws.on('close', (code, reason) => {
+          trace(`[sms] ws close code=${code} reason=${reason.toString()}`)
           log('websocket closed', { code, reason: reason.toString() })
           // A close before auth completes means the connection attempt failed
           // (e.g. ECONNREFUSED); report it instead of hanging until timeout.
@@ -170,6 +175,7 @@ export class SmsClient extends EventEmitter {
           this.attemptReconnect()
         })
         this.ws.on('error', (error) => {
+          trace(`[sms] ws error ${error.message}`)
           this.errLog(`websocket error: ${error.message}`)
           this.emit('error', error)
           if (!settled) fail(error)
@@ -226,6 +232,7 @@ export class SmsClient extends EventEmitter {
 
   private sendFrame(payload: Record<string, unknown>, logRef?: string): Promise<string> {
     if (!this.connected || !this.ws) {
+      trace(`[sms] sendFrame REJECTED (not connected) ${JSON.stringify(payload).slice(0, 160)}`)
       return Promise.reject(new Error('websocket 未连接'))
     }
     return new Promise((resolve, reject) => {
@@ -233,14 +240,24 @@ export class SmsClient extends EventEmitter {
         (payload.messageId as string) ||
         `msg_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`
       const frame: Record<string, unknown> = { ...payload, messageId }
+      trace(
+        '[sms] sendFrame type=' + String(frame.type)
+        + (frame.mediaType ? ` mediaType=${String(frame.mediaType)}` : '')
+        + ` to=${String(frame.to ?? '')} len=${String(frame.content ?? '').length} id=${messageId}`,
+      )
       if (frame.type === 'send' && !frame.mediaType) {
         log('send text', { to: frame.to, len: String(frame.content ?? '').length, messageId })
       } else {
         log('send media', { mediaType: frame.mediaType, ref: logRef })
       }
       this.ws!.send(JSON.stringify(frame), (error) => {
-        if (error) reject(error)
-        else resolve(messageId)
+        if (error) {
+          trace(`[sms] sendFrame ws.send ERROR ${error.message} id=${messageId}`)
+          reject(error)
+        } else {
+          trace(`[sms] sendFrame ws.send OK id=${messageId} (socket-level only, no server ack)`)
+          resolve(messageId)
+        }
       })
     })
   }
@@ -269,6 +286,7 @@ export class SmsClient extends EventEmitter {
       }
       if (!message) return
       log('inbound frame', { type: message.type })
+      trace(`[sms] frame type=${String(message.type)} from=${String(message.from ?? message.phone ?? '')} contentLen=${String(message.content ?? '').length}`)
 
       switch (message.type) {
         case 'message':

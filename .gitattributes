@@ -16,3 +16,7 @@
 *.ico binary
 *.woff binary
 *.woff2 binary
+
+# Generated third-party artifact (scripts/build.mjs output): keep it out of
+# language statistics — it is upstream MIT code, not this project's source.
+lib/vendor/* linguist-vendored

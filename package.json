@@ -30,7 +30,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "node scripts/build.mjs",
+    "build": "node scripts/build.mjs && node scripts/check-install-scripts.mjs",
+    "check:deps": "node scripts/check-install-scripts.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
@@ -118,6 +119,7 @@
     "@deepseek-ai/dsh-client-locale": "^0.1.2-rc.1",
     "@deepseek-ai/dsh-client-ui-settings": "^0.1.2-rc.1",
     "@deepseek-ai/dsh-api-remotes": "^0.1.2-rc.1",
+    "@larksuiteoapi/node-sdk": "^1.73.0",
     "@types/mailparser": "^3.4.6",
     "@types/node": "^22.0.0",
     "@types/nodemailer": "^8.0.1",
@@ -130,7 +132,6 @@
     "typescript-eslint": "^8.69.0"
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.73.0",
     "imapflow": "^1.7.6",
     "mailparser": "^3.9.17",
     "nodemailer": "^9.0.6",

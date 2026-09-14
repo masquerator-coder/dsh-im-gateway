@@ -67,7 +67,7 @@ ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
   - `http.ts`：共享 `InboundHttpServer` 的按路径注册 webhook 路由，回复 POST 回 callbackUrl。
   - `cmcc.ts` + `cmcc/smsClient.ts`：WebSocket 接中国移动 新消息/5G消息 网关（X-API-Key 头 + auth 握手 + 心跳 + 断线重连）。
   - `email.ts`：`nodemailer` 发（SMTP）+ `imapflow` 收（IMAP 轮询 INBOX，uid 去重）。
-  - `feishu.ts`：官方 `@larksuiteoapi/node-sdk` WebSocket 长连接事件服务。
+  - `feishu.ts`：官方 Lark/Feishu SDK WebSocket 长连接事件服务；SDK 不随依赖安装，而是构建期 vendored 到 `lib/vendor/lark-sdk.cjs`（其传递依赖 `protobufjs` 带 postinstall，会让 `dsh plugin add` 在干净 profile 上失败），运行时按计算路径懒加载。
   - `wechat.ts`：直连官方 ilink 机器人网关（`https://ilinkai.weixin.qq.com`）——扫码绑定 + getupdates 轮询 + sendmessage（参考 dsh-clawbot）。
   - `qqbot.ts`：官方 QQ bot 网关（appId/appSecret → token → `api.sgroup.qq.com/gateway` → WebSocket，C2C/群收发）。
 - **连接状态回传**：`ChannelManager` 维护每通道 status（idle/connecting/connected/error）+ detail，`remote.define('imGateway', { list })` 暴露 `statusList()`（含新增的 `qr`），client 每 3s 轮询拉取并渲染；QQ/微信的登录 QR 经同一 RPC 的 `qr` 字段回传到 UI 显示。
