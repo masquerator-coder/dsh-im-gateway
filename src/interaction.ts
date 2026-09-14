@@ -16,9 +16,13 @@
  *
  * Safety contract (do not regress):
  * - The answerer only ever handles an agent this gateway owns (its listeners are
- *   only installed for agents `ImGateway` creates/resumes) and only when a
- *   same-session outbound sender is available. Anything else → `next()` so the
- *   web answerer (or the fail-closed default) keeps working unchanged.
+ *   only installed for agents `ImGateway` creates/resumes) and only while a
+ *   same-session outbound sender is reachable. It is registered with
+ *   `prepend: true` so it heads the waterfall ahead of the api-remotes/web
+ *   forwarder that otherwise always wins in a web profile; when the IM push is
+ *   unavailable it calls `next()` so the web answerer (or the fail-closed
+ *   default) answers instead — an offline IM channel must never fail-closed an
+ *   approval a web user could answer.
  * - Every interaction is aborted by the request's own `AbortSignal`; an abort
  *   settles `'cancelled'` exactly like the core seam.
  * - Inbound text that matches a pending prompt is consumed as the answer and is
@@ -167,16 +171,24 @@ export class InteractionBridge {
    */
   install(agentCtx: Context, sessionId: string, send: (text: string) => Promise<void>): void {
     trace(`[bridge] install agentCtx session=${sessionId}`)
+    // Preparations register `approval/request` / `user-questions/request`
+    // answerers on the agent scope. The api-remotes forwarder that feeds the
+    // web UI's answerer is registered on the ROOT context at startup, so in a
+    // web-profile deployment it would head the waterfall and we would NEVER
+    // get to push the prompt down the IM channel (the web dialog wins). Both
+    // events are Cordis waterfalls over one registration-ordered listener
+    // array (scope filtering only admits listeners; it does not reorder them),
+    // so we must `prepend` to run BEFORE the web forwarder.
     agentCtx.on('approval/request', (req, next) => {
       trace(`[bridge] approval/request session=${sessionId} tool=${String((req as { toolName?: string }).toolName ?? '')} callId=${String((req as { callId?: string }).callId ?? '')}`)
-      const answer = this.requestApproval(sessionId, send, req)
+      const answer = this.requestApproval(sessionId, send, req, next)
       if (answer === undefined) trace(`[bridge] approval/request delegated (pending exists / no handle) session=${sessionId}`)
       return answer ?? next()
-    })
+    }, { prepend: true })
     agentCtx.on('user-questions/request', (request, next) => {
-      const answer = this.requestQuestion(sessionId, send, request)
+      const answer = this.requestQuestion(sessionId, send, request, next)
       return answer ?? next()
-    })
+    }, { prepend: true })
   }
 
   /** Start an approval interaction; returns the promise to await, or `undefined` to delegate. */
@@ -184,6 +196,7 @@ export class InteractionBridge {
     sessionId: string,
     send: (text: string) => Promise<void>,
     req: ApprovalRequestEvent,
+    next: () => Promise<ApprovalOutcome>,
   ): Promise<ApprovalOutcome> | undefined {
     if (this.pending.has(sessionId)) {
       trace(`[bridge] approval/request SKIPPED: pending exists session=${sessionId}`)
@@ -205,7 +218,15 @@ export class InteractionBridge {
       }
       this.pending.set(sessionId, record)
       record.detach = this.attachAbort(req.signal, () => this.abortIfCurrent(sessionId, record))
-      void this.sendPrompt(send, prompt, sessionId, () => this.delegateOnFailure(sessionId, record, () => resolve('unavailable')))
+      // Delegate back to the web answerer (`next()`) when the IM channel is
+      // unreachable or the push fails — never let an offline IM channel wedge
+      // or fail-closed an approval a web user could answer.
+      void this.sendPrompt(send, prompt, sessionId, () => {
+        this.delegateOnFailure(sessionId, record, () => {
+          trace(`[bridge] approval/request delegated to web (IM send failed) session=${sessionId}`)
+          void Promise.resolve(next()).then(resolve, () => resolve('unavailable'))
+        })
+      })
     })
   }
 
@@ -214,6 +235,7 @@ export class InteractionBridge {
     sessionId: string,
     send: (text: string) => Promise<void>,
     req: AskUserQuestionRequestEvent,
+    next: () => Promise<AskUserQuestionAnswer>,
   ): Promise<AskUserQuestionAnswer> | undefined {
     if (this.pending.has(sessionId)) return undefined
     const questions = req.questions
@@ -229,7 +251,13 @@ export class InteractionBridge {
       }
       this.pending.set(sessionId, record)
       record.detach = this.attachAbort(req.signal, () => this.abortIfCurrent(sessionId, record))
-      void this.sendPrompt(send, prompt, sessionId, () => this.delegateOnFailure(sessionId, record, () => resolve({ answers: [] })))
+      // Same IM-unreachable fallback: hand the question to the web answerer.
+      void this.sendPrompt(send, prompt, sessionId, () => {
+        this.delegateOnFailure(sessionId, record, () => {
+          trace(`[bridge] user-questions/request delegated to web (IM send failed) session=${sessionId}`)
+          void Promise.resolve(next()).then(resolve, () => resolve({ answers: [] }))
+        })
+      })
     })
   }
 

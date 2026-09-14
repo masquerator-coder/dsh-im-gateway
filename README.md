@@ -40,6 +40,12 @@ Agents are composed **exactly like the DSH webhook / session-controller path**:
 - **Source metadata injection** — when present, a `<dsh_im_source>{channel, senderId}</dsh_im_source>` block is prepended to the prompt so the model knows which channel/sender asked.
 - **Bounded delivery retry** — a reply is pushed through the sink with up to 2 attempts; every failure is logged and a final give-up is explicitly logged `reply NOT delivered` (no silent loss).
 
+### IM-side confirmations (approval / user-questions)
+
+DSH's tool-approval (`approval/request`) and user-question (`user-questions/request`) are agent-scoped waterfall events. On every agent this gateway creates/resumes a **bridge answerer** is installed that pushes the prompt down the *same* IM channel driving that session and maps the user's textual reply back to the outcome the seam expects — so a 5G消息 / email / … user is asked over IM instead of only seeing a web dialog.
+
+Ordering is load-bearing: in the `web` profile the `dsh-api-remotes` forwarder that feeds the browser answerer registers on the root context at startup, and Cordis waterfalls run listeners in **registration order** (scope filtering admits listeners, it does not reorder them). The bridge therefore registers with `prepend: true` so it heads the waterfall and the IM channel wins. Fallback: if the session has no reachable outbound sender (or the IM push fails) the bridge calls `next()` and **delegates to the web answerer** rather than fail-closing — an offline IM channel never wedges an approval a web user could answer. Pure web conversations are unaffected (only gateway-owned agents install the bridge).
+
 ---
 
 ## Multi-channel IM management (settings UI)
