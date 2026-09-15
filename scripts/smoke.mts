@@ -13,6 +13,10 @@
  *   5. FeishuTransport — the VENDORED Feishu SDK (lib/vendor/lark-sdk.cjs, not
  *      an npm dependency) resolves and still exports Client / WSClient /
  *      EventDispatcher, and missing credentials fail before any socket opens.
+ *   6. ImGateway.composePrompt — the `<dsh_im_source>` block is prepended ONLY
+ *      when the source changes for that session (first message, sender/channel
+ *      change, or after a compaction shadowed the span that carried it), so a
+ *      steady sender no longer repeats the block on every bubble.
  *
  * Real transports that need live services (email / feishu / wechat / qq / a
  * live CMCC gateway) are exercised by starting them in the plugin; this file
@@ -178,6 +182,60 @@ assert.match(feishuError, /appId and appSecret/, 'missing credentials must fail 
 assert.equal(feishuState, 'error', 'missing credentials must report the error state')
 await feishu.stop().catch(() => {})
 step('Feishu missing-credential guard OK: ' + feishuError)
+
+// --- 6. source metadata injection: change-only, per session ---
+// The gateway itself cannot be imported offline (its `@deepseek-ai/dsh-agent`
+// peer pulls `@deepseek-ai/dsh-scope`, absent here), so the contract is verified
+// on the dependency-free module the gateway delegates to.
+const { SourceMetadata } = await import('../src/source-meta.ts')
+const sources = new SourceMetadata()
+const s1 = 'im-src-1'
+
+const first = sources.compose(s1, 'cmcc', undefined, 'hello')
+assert.ok(
+  first.startsWith('<dsh_im_source>{"channel":"cmcc"}</dsh_im_source>\n\n'),
+  'first message carries the source block: ' + first,
+)
+assert.ok(first.endsWith('hello'), 'the user text is preserved after the block')
+
+assert.equal(
+  sources.compose(s1, 'cmcc', undefined, 'again'),
+  'again',
+  'unchanged source must NOT repeat the block',
+)
+
+const other = sources.compose(s1, 'cmcc', 'u2', 'from someone else')
+assert.ok(
+  other.startsWith('<dsh_im_source>{"channel":"cmcc","senderId":"u2"}</dsh_im_source>\n\n'),
+  'a different sender re-attributes: ' + other,
+)
+assert.equal(
+  sources.compose(s1, 'cmcc', 'u2', 'same sender again'),
+  'same sender again',
+  'a steady sender stays clean',
+)
+
+const s2 = 'im-src-2'
+assert.ok(sources.compose(s2, 'cmcc', undefined, 'hi').startsWith('<dsh_im_source>'), 'each session attributes independently')
+assert.equal(sources.compose(s1, undefined, undefined, 'no source at all'), 'no source at all', 'no channel/sender -> plain text')
+assert.ok(
+  sources.compose(s1, 'email', undefined, 'other channel').startsWith('<dsh_im_source>{"channel":"email"}</dsh_im_source>'),
+  'a different channel re-attributes',
+)
+
+// Compaction shadows the span that carried the block (its summary need not keep
+// the channel), so the next inbound message must re-attribute the source.
+sources.reset(s1)
+assert.ok(
+  sources.compose(s1, 'email', undefined, 'after compaction').startsWith('<dsh_im_source>{"channel":"email"}</dsh_im_source>'),
+  'reset (compaction) must force a re-attribution',
+)
+sources.clear()
+assert.ok(
+  sources.compose(s1, 'email', undefined, 'after clear').startsWith('<dsh_im_source>'),
+  'clear() must force a re-attribution',
+)
+step('source metadata injection (change-only) OK')
 
 process.stderr.write('\n✔ All local smoke checks passed.\n')
 process.exit(0)

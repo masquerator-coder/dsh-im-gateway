@@ -37,7 +37,7 @@ Agents are composed **exactly like the DSH webhook / session-controller path**:
 - **Sender access control** — when `allowlist` is configured, only those `senderId`s may drive the agent; unauthorized (or sender-less) messages are **denied before any agent/workspace/model side effect**. Empty allowlist = allow all (rely on `secret` / private network).
 - **Inbound de-duplication** — an identical `chat + text` replayed/echoed within 5s is suppressed, so a platform replay never double-triggers a model turn.
 - **Per-session serialization** — at most one in-flight turn per chat: concurrent messages queue on a per-session tail instead of overwriting each other's reply claim.
-- **Source metadata injection** — when present, a `<dsh_im_source>{channel, senderId}</dsh_im_source>` block is prepended to the prompt so the model knows which channel/sender asked.
+- **Source metadata injection (on change)** — a `<dsh_im_source>{channel, senderId}</dsh_im_source>` block is prepended to the prompt **only when that source changes** for the session (its first message, or a different sender/channel), so the model still learns who/which channel asked while the block is not repeated on every bubble — the first one already remains in the replayed history. It is re-emitted when compaction shadows the span that carried it.
 - **Bounded delivery retry** — a reply is pushed through the sink with up to 2 attempts; every failure is logged and a final give-up is explicitly logged `reply NOT delivered` (no silent loss).
 
 ### IM-side confirmations (approval / user-questions)

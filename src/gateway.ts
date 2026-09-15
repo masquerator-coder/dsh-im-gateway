@@ -11,6 +11,7 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { sessionIdForChat } from './session.ts'
 import { InteractionBridge } from './interaction.ts'
+import { SourceMetadata } from './source-meta.ts'
 import { trace } from './trace.ts'
 
 /**
@@ -224,6 +225,11 @@ export class ImGateway {
    *  approval/question prompts can be pushed down the same channel that drives
    *  that session. Keyed by session id; set by `registerSender`. */
   private readonly senders = new Map<string, (text: string) => Promise<void>>()
+  /**
+   * Per-session `<dsh_im_source>` attribution: the block is only prepended when
+   * the source (channel/sender) changes for a session — see `SourceMetadata`.
+   */
+  private readonly sources = new SourceMetadata()
   /** IM-only bridge for DSH approval / user-question seams. */
   readonly interactions: InteractionBridge
 
@@ -322,7 +328,7 @@ export class ImGateway {
     // no promise to await or catch here — mirroring the webhook/session
     // controller path.
     handle.agent.followup(createUserMessage({
-      content: [{ type: 'text', text: this.composePrompt(message, channel) }],
+      content: [{ type: 'text', text: this.composePrompt(sessionId, message, channel) }],
       // A `user` MessageSource carries `{ kind: 'user' }` plus optional opaque
       // provenance fields in the merge-extensible runtime type. The `rpcId`
       // lets the global session/event collector claim exactly this prompt's
@@ -355,13 +361,12 @@ export class ImGateway {
     return false
   }
 
-  /** Prepend source metadata (⑤) so the model knows who/which channel asked. */
-  private composePrompt(message: InboundMessage, channel?: string): string {
-    const meta: Record<string, string> = {}
-    if (channel !== undefined && channel !== '') meta.channel = channel
-    if (message.senderId !== undefined && message.senderId !== '') meta.senderId = message.senderId
-    if (Object.keys(meta).length === 0) return message.text
-    return `<dsh_im_source>${JSON.stringify(meta)}</dsh_im_source>\n\n${message.text}`
+  /**
+   * Prepend source metadata (⑤) so the model learns who/which channel asked —
+   * only when that source changed for this session (`SourceMetadata`).
+   */
+  private composePrompt(sessionId: SessionId, message: InboundMessage, channel?: string): string {
+    return this.sources.compose(String(sessionId), channel, message.senderId, message.text)
   }
 
   /** Resolve the provider + model: explicit per-channel values win, else the default model selection. */
@@ -642,6 +647,13 @@ export class ImGateway {
   private onSessionEvent(session: unknown, event: SessionEvent): void {
     const sessionId = sessionIdOf(session)
     if (sessionId === undefined) return
+    // Compaction replaces the older span — the message that carried the
+    // `<dsh_im_source>` block included — with a summary that need not preserve
+    // the channel/sender, so the next inbound message re-attributes it.
+    // (`event.type` is widened to `string`: the `compaction/*` vocabulary is
+    // declaration-merged by @deepseek-ai/dsh-compaction, which this plugin
+    // deliberately does not depend on.)
+    if ((event.type as string) === 'compaction/summary') this.sources.reset(String(sessionId))
     const wait = this.waiters.get(sessionId)
     if (wait === undefined) return
     if (wait.observe(event)) {
@@ -669,6 +681,7 @@ export class ImGateway {
     this.tails.clear()
     this.recent.clear()
     this.senders.clear()
+    this.sources.clear()
     this.interactions.clear()
     this.workspaceInFlight.clear()
   }
