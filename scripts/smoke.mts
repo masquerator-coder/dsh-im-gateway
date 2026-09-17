@@ -206,14 +206,14 @@ await new Promise((ready) => ilinkServer.listen(0, '127.0.0.1', ready))
 const ilinkPort = ilinkServer.address().port
 
 let wechatQr = ''
-let wechatDetail = ''
+const wechatDetails = []
 const wechat = new WechatIlinkTransport({
   channelId: 'smoke-wechat-unbound',
   baseUrl: `http://127.0.0.1:${ilinkPort}`,
   token: 'smoke-bot-token',
   onInbound: () => {},
   onQr: (url) => { wechatQr = url },
-  onState: (_status, detail) => { if (detail !== undefined) wechatDetail = detail },
+  onState: (_status, detail) => { if (detail !== undefined) wechatDetails.push(detail) },
 })
 await wechat.start()
 assert.ok(
@@ -221,11 +221,45 @@ assert.ok(
   'a token-only channel must still request the login QR, hits: ' + JSON.stringify(ilinkHits),
 )
 assert.equal(wechatQr, 'https://example.invalid/qr/q-smoke', 'the QR URL must reach the UI')
-assert.match(wechatDetail, /尚未绑定微信/, 'status must say the token alone is not enough, got: ' + wechatDetail)
+assert.ok(
+  wechatDetails.some(d => /尚未绑定微信/.test(d)),
+  'status must say the token alone is not enough, got: ' + JSON.stringify(wechatDetails),
+)
+assert.match(
+  wechatDetails[wechatDetails.length - 1],
+  /请扫码绑定微信/,
+  'the live status must state the next action, got: ' + JSON.stringify(wechatDetails),
+)
+assert.equal(wechat.isConnected(), false, 'an unbound channel must not report itself connected')
 await assert.rejects(() => wechat.sendText('someone', 'hi'), /not bound/, 'unbound channel must refuse to send')
 await wechat.stop()
 ilinkServer.close()
 step('WeChat token-only channel keeps requesting the login QR OK')
+
+// A QR fetch that fails must be visible and retried, not silently swallowed:
+// an inert panel is indistinguishable from "no QR appeared".
+const badIlink = createServer((_req, res) => {
+  res.writeHead(200, { 'content-type': 'application/json' })
+  res.end(JSON.stringify({ qrcode: 'q-no-image', ret: 0 })) // no qrcode_img_content
+})
+await new Promise((ready) => badIlink.listen(0, '127.0.0.1', ready))
+const badPort = badIlink.address().port
+
+for (const [label, baseUrl] of [['unusable response', `http://127.0.0.1:${badPort}`], ['unreachable gateway', 'http://127.0.0.1:1']]) {
+  let detail = ''
+  const broken = new WechatIlinkTransport({
+    channelId: 'smoke-wechat-broken',
+    baseUrl,
+    onInbound: () => {},
+    onState: (_status, d) => { if (d !== undefined) detail = d },
+  })
+  await broken.start()
+  assert.match(detail, /获取二维码失败/, `${label}: failure must be surfaced, got: ${detail}`)
+  assert.equal(broken.isConnected(), false, `${label}: must not claim to be connected`)
+  await broken.stop()
+}
+badIlink.close()
+step('WeChat QR fetch failure surfaced (and left retryable) OK')
 
 // --- 7. source metadata injection: change-only, per session ---
 // The gateway itself cannot be imported offline (its `@deepseek-ai/dsh-agent`

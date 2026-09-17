@@ -43,6 +43,13 @@ const BOT_TYPE = 3
 const POLL_INTERVAL_MS = 1500
 /** Per-request timeout for ilink HTTP calls. */
 const HTTP_TIMEOUT_MS = 20000
+/**
+ * How long to wait before asking the gateway for a login QR again after a failed
+ * attempt. Without this an unbound channel whose first `get_bot_qrcode` failed
+ * (gateway hiccup, DNS, TLS) sat on the static "a QR appears here" hint forever:
+ * the failure was only written to the log, and nothing ever retried.
+ */
+const QR_RETRY_INTERVAL_MS = 10000
 
 /** Per-channel persisted binding state file name (mirror email state pattern). */
 function stateFileFor(channelId: string): string {
@@ -105,6 +112,8 @@ export class WechatIlinkTransport implements ChannelTransport {
   private qrKey = ''
   private qrUrl = ''
   private qrWaiting = false
+  /** Timestamp of the last `get_bot_qrcode` attempt (rate-limits retries). */
+  private lastQrAttempt = 0
 
   constructor(private readonly options: WechatIlinkOptions) {
     const base = (options.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '')
@@ -211,18 +220,31 @@ export class WechatIlinkTransport implements ChannelTransport {
   }
 
   private async requestQr(): Promise<void> {
+    this.lastQrAttempt = Date.now()
     try {
       const r = await this.httpJson(`${this.state.baseUrl}/ilink/bot/get_bot_qrcode?bot_type=${BOT_TYPE}`, { timeoutMs: 25000 })
       const qr = r.json && r.json.qrcode
-      if (!qr) {
-        this.options.onState?.('connecting', '获取二维码失败')
+      const img = String((r.json && r.json.qrcode_img_content) || '').trim()
+      if (!qr || !img) {
+        // Either no QR key or no renderable image: nothing the user can scan, so
+        // stay out of the status-poll branch and let pollOnce retry.
+        this.qrWaiting = false
+        this.options.onState?.('connecting', '获取二维码失败，正在重试…')
+        this.options.log?.(`wechat requestQr: unusable response (status ${r.status}): ${r.text.slice(0, 200)}`)
         return
       }
       this.qrKey = String(qr)
-      this.qrUrl = String((r.json && r.json.qrcode_img_content) || '').trim()
+      this.qrUrl = img
       this.qrWaiting = true
       this.options.onQr?.(this.qrUrl)
+      // Also the post-expiry refresh path lands here, so state the next action
+      // rather than leaving the stale "二维码已过期，请刷新" line under a live QR.
+      this.options.onState?.('connecting', '请扫码绑定微信，并给机器人发一条消息解锁发送')
     } catch (error) {
+      // Surface it instead of only logging: an invisible failure here looks
+      // exactly like "the QR never showed up".
+      this.qrWaiting = false
+      this.options.onState?.('connecting', '获取二维码失败，正在重试…')
       this.options.log?.(`wechat requestQr failed: ${String(error)}`)
     }
   }
@@ -349,7 +371,15 @@ export class WechatIlinkTransport implements ChannelTransport {
         await this.pollQrStatus()
         return
       }
-      if (this.isBound()) await this.pollInbound()
+      if (this.isBound()) {
+        await this.pollInbound()
+        return
+      }
+      // Unbound with no QR in flight: the last `get_bot_qrcode` failed (or the
+      // bind never started). Retry on a slow cadence — the poll loop is the only
+      // thing that can recover this state, and a silent stall here is exactly
+      // what "no QR ever appears" looks like from the panel.
+      if (Date.now() - this.lastQrAttempt >= QR_RETRY_INTERVAL_MS) await this.requestQr()
     } catch (error) {
       this.options.log?.(`wechat poll failed: ${String(error)}`)
     }
