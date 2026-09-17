@@ -58,8 +58,8 @@ const EMAIL_PROVIDERS: EmailProvider[] = [
 /** Default WeChat ilink gateway (Tencent official bot gateway). */
 const DEFAULT_WECHAT_BASE_URL = 'https://ilinkai.weixin.qq.com'
 const DEFAULT_CMCC_WSS = 'wss://5gvas01.cmicmaap.com/gtw-ai/openclaw/ws/msg'
-/** Default QQ bot API base (official open platform). */
-const DEFAULT_QQ_API_BASE = 'https://api.sgroup.qq.com'
+/** Default QQ bot API base (official open platform, canonical host). */
+const DEFAULT_QQ_API_BASE = 'https://api.bot.qq.com'
 
 /** Advanced per-channel agent routing keys shown under the fold. */
 const ADVANCED_KEYS = ['allowlist', 'provider', 'model', 'maxTokens', 'cwd', 'agentPreset'] as const
@@ -72,7 +72,7 @@ const ADVANCED_KEYS = ['allowlist', 'provider', 'model', 'maxTokens', 'cwd', 'ag
  */
 const SETUP_STEPS: Partial<Record<ChannelType, string[]>> = {
   wechat: ['setup.wechat.0', 'setup.wechat.1', 'setup.wechat.2'],
-  qq: ['setup.qq.0', 'setup.qq.1', 'setup.qq.2', 'setup.qq.3'],
+  qq: ['setup.qq.0', 'setup.qq.1', 'setup.qq.2', 'setup.qq.3', 'setup.qq.4'],
 }
 
 /** Non-secret fields that must be present before a channel can be saved. */
@@ -80,6 +80,10 @@ const REQUIRED_BY_TYPE: Partial<Record<ChannelType, string[]>> = {
   email: ['account'],
   http: ['callbackUrl'],
   feishu: ['appId'],
+  // The QQ robot cannot even fetch an access token without both; AppSecret is a
+  // secret field (required implicitly: an empty secret box on a new channel is
+  // reported as missing) and the AppID is required explicitly here.
+  qq: ['appId'],
 }
 
 /** Descriptions rendered under each advanced field key. */
@@ -115,11 +119,16 @@ function emailFields(provider: EmailProvider): Field[] {
   return base
 }
 
-/** QQ channel (official bot): AppID/AppSecret + bot API base. */
+/** QQ channel (official bot): AppID/AppSecret + bot API base + intents. */
 const QQ_BOT_FIELDS: Field[] = [
-  { key: 'appId', labelKey: 'field.appId', secret: true, placeholder: '机器人 AppID' },
+  // AppID is NOT a secret (it identifies the robot); leaving it non-secret lets
+  // the panel show the saved value instead of a permanently empty password box.
+  { key: 'appId', labelKey: 'field.appId', placeholder: '机器人 AppID' },
   { key: 'appSecret', labelKey: 'field.appSecret', secret: true, placeholder: '机器人 AppSecret' },
   { key: 'botApiBase', labelKey: 'field.botApiBase' },
+  // Only needed when the robot's granted permissions differ from the default
+  // subscription (C2C/群聊 + 公域频道@) — see the setup steps.
+  { key: 'intents', labelKey: 'field.intents', placeholder: '留空 = c2c + public_guild' },
 ]
 
 function templatesFor(): Record<ChannelType, Template> {

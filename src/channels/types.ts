@@ -83,10 +83,18 @@ export interface ChannelConfig {
   token?: string // SECRET
 
   // ---- qq (official bot; reuses appId/appSecret — same as feishu) ----
-  /** bot API base (defaults to https://api.sgroup.qq.com). */
+  /** bot API base (defaults to https://api.bot.qq.com). */
   botApiBase?: string
   /** sandbox=true uses https://sandbox.api.sgroup.qq.com. */
   sandbox?: boolean
+  /**
+   * Event subscription (intents) for the QQ WebSocket gateway: a decimal
+   * bitmask or keywords (`c2c,public_guild`). Absent = the transport default
+   * (C2C/群聊 + 公域频道@). Only the default-granted bits may be requested
+   * before the robot's capability review passes — an un-granted bit makes the
+   * gateway close the connection (4014).
+   */
+  intents?: string
 }
 
 /** Resolved shape of the whole `im-channels` settings section. */

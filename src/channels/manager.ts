@@ -362,13 +362,14 @@ export class ChannelManager {
         return new WechatIlinkTransport(options) as ChatIo
       }
       case 'qq': {
-        // Official QQ bot: appId/appSecret + WebSocket gateway (api.sgroup.qq.com).
+        // Official QQ bot: appId/appSecret + WebSocket gateway (api.bot.qq.com).
         const { QQBotTransport } = await import('../transports/qqbot.ts')
         const options: QQBotOptions = {
           appId: channel.appId || '',
           clientSecret: channel.appSecret || '',
           apiBase: channel.botApiBase || undefined,
           sandbox: channel.sandbox || false,
+          intents: channel.intents || undefined,
           provider: base.provider,
           model: base.model,
           disposeAfterReply: base.disposeAfterReply,

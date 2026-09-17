@@ -41,7 +41,7 @@ Agents are composed **exactly like the DSH webhook / session-controller path**:
 - **Bounded delivery retry** — a reply is pushed through the sink with up to 2 attempts; every failure is logged and a final give-up is explicitly logged `reply NOT delivered` (no silent loss).
 - **Live-session reuse (never fight another owner)** — an Agent/Session is single-writer in the host. When the same session is already live elsewhere (the typical case: **the operator has that IM session open in the Web UI**), `resume` cannot take write ownership and `create` cannot re-enter the id — both fail. The gateway therefore reuses the live agent when the host already has one (`ctx.agents.get`, exactly like DSH's `createOrAdopt`) and never disposes an agent it did not create. Without this, opening the session in the browser silently muted the chat: the transport kept polling, reported itself connected, and every inbound message was dropped with nothing but a host-log warning.
 - **Failures are never silent** — a turn that cannot reply (agent acquisition error, acquisition timeout, model error, empty reply, delivery failure) is reported **back down the same chat** (`⚠️ 处理失败，未能回复。原因：…`) and reflected in that channel's status line, so a "已连接 but 永远不回复" channel becomes a visible, actionable error. Agent acquisition is bounded (`60s`), because an unbounded wait there used to pin the chat's serialization tail for ever and drop every later message behind it.
-- **Honest connection state** — the WeChat transport's only liveness signal is the `getupdates` round trip: 10 consecutive failures (~15 s) demote the channel from `connected` to `error` with the reason, and the next success restores `connected`. A revoked session (`errcode -14`) is reported on **any** round trip, not just the first. The CMCC socket gets an independent watchdog (socket state + ping/pong freshness) so a half-open socket after a sleep/network change is force-reconnected instead of staying silently "connected".
+- **Honest connection state** — the WeChat transport's only liveness signal is the `getupdates` round trip: 10 consecutive failures (~15 s) demote the channel from `connected` to `error` with the reason, and the next success restores `connected`. A revoked session (`errcode -14`) is reported on **any** round trip, not just the first. The CMCC socket gets an independent watchdog (socket state + ping/pong freshness) so a half-open socket after a sleep/network change is force-reconnected instead of staying silently "connected". The QQ gateway is held to the same rule: `start()` only succeeds once the gateway answered IDENTIFY/RESUME with READY/RESUMED, an un-retryable close code (`4013`/`4014`/`4914`/`4915`) is surfaced in Chinese with the fix and **stops the reconnect loop** instead of looping for ever, and a socket that stops answering heartbeats is force-reconnected (see [QQ 通道](#qq-通道官方-qq-开放平台机器人)).
 
 ### IM-side confirmations (approval / user-questions)
 
@@ -58,7 +58,7 @@ In the DSH **「插件 → 插件设置」** page an **"IM 通道设置"** card 
 | Type | Fixed items auto-filled | User provides | Transport |
 | --- | --- | --- | --- |
 | **微信** (wechat) | `baseUrl` (`https://ilinkai.weixin.qq.com`) | 什么也不用填：扫码绑定（`bot_token` 由网关下发并落盘） | direct client of Tencent's official ilink bot gateway (QR bind → getupdates poll → sendmessage) |
-| **QQ** | `botApiBase` (`https://api.sgroup.qq.com`) | AppID + AppSecret (create bot at q.qq.com) | official QQ bot WebSocket gateway (`getAppAccessToken` → `api.sgroup.qq.com/gateway` → wss; C2C/group) |
+| **QQ** | `botApiBase` (`https://api.bot.qq.com`) | AppID + AppSecret (create bot at q.qq.com) | official QQ bot WebSocket gateway (`getAppAccessToken` → `/gateway` → wss; C2C/群聊 + 公域频道@) |
 | **Email** | server/ports/TLS from chosen provider (QQ/163/Gmail/Outlook/企业微信/自定义) | account + 授权码/密码 | `nodemailer` (SMTP out) + `imapflow` (IMAP in; 首次只处理最近 50 封) |
 | **中国移动 5G消息** | `serverUrl` (`wss://…/ws/msg`), `version: 2.0` | apiKey | WebSocket `SmsClient` to the 5G 消息 gateway |
 | **飞书** | — | App ID + App Secret | official Lark/Feishu SDK WebSocket long connection (**vendored** into `lib/vendor/` — see [Install](#install-as-a-bundle)) |
@@ -95,11 +95,32 @@ The WeChat channel is a **direct client of Tencent's official ilink bot gateway*
 
 ### QQ 通道（官方 QQ 开放平台机器人）
 
-The QQ channel is a **direct client of the official QQ Open Platform robot gateway** — create a robot at [q.qq.com](https://q.qq.com), copy its **AppID + AppSecret**, and this transport handles the **official WebSocket gateway**: `POST https://bots.qq.com/app/getAppAccessToken` → `GET {botApiBase}/gateway` → connect the returned `wss://...` (IDENTIFY + heartbeat) to receive `C2C_MESSAGE_CREATE` / `GROUP_AT_MESSAGE_CREATE`, and posts replies to `api.sgroup.qq.com/v2/users|groups/{openid}/messages`.
+The QQ channel is a **direct client of the official QQ Open Platform robot gateway** — create a robot at [q.qq.com](https://q.qq.com), copy its **AppID + AppSecret**, and this transport handles the official WebSocket gateway: `POST https://api.bot.qq.com/app/getAppAccessToken` → `GET {botApiBase}/gateway` → connect the returned `wss://…` (Hello → IDENTIFY/RESUME → heartbeat) to receive `C2C_MESSAGE_CREATE` / `GROUP_AT_MESSAGE_CREATE` / `AT_MESSAGE_CREATE`, and posts replies to `{botApiBase}/v2/users|groups/{openid}/messages`.
 
-- Default gateway `botApiBase`: `https://api.sgroup.qq.com` (预填). `sandbox` toggle switches to `https://sandbox.api.sgroup.qq.com`.
-- AppID is non-secret; **AppSecret** is a `role('secret')` field (reuses the feishu `appSecret` field).
+**从零到能用（最短路径）**
+
+1. 在 [q.qq.com](https://q.qq.com) 创建机器人，记下 **AppID / AppSecret**（开发设置里）。
+2. 申请所需能力：**单聊 / 群聊**（这是「在 QQ 里跟机器人对话」的前提），提交审核。**未通过前连接会被网关拒绝**——插件会把拒绝原因原样显示在面板上（见下）。
+3. 面板「IM 通道设置 → QQ」新建通道，填 AppID + AppSecret，保存启用。状态变「已连接」即代表 WebSocket 已 READY。
+4. 在 QQ 里给机器人发消息（单聊直接发；群聊需 @ 机器人），Agent 的回复经同一网关回送。
+5. 先验证链路而**不经过宿主**：`pnpm qq-probe <appId> <appSecret>`（见 [QQ 真机探针](#qq-真机探针)）。
+
+- Default API base `botApiBase`: `https://api.bot.qq.com`（官方 2026-09 口径的「统一请求地址」；旧域名 `https://api.sgroup.qq.com` 仍然可用，老记录不必改）。`sandbox: true`（手工编辑 `settings.yaml`）切到 `https://sandbox.api.sgroup.qq.com`。
+- AppID 字段**非机密**（它是机器人 ID，面板会显示已保存值）；**AppSecret** 是 `role('secret')` 字段（复用飞书的 `appSecret`），只保存在本机设置里、任何线上边界都会被抹掉。
+- **订阅事件（intents）**：默认 `c2c + public_guild`（= `1107296256`）。官方规则是「只有 `guilds` / `public_guild_messages` / `guild_members` 默认有权限，其余事件**必须申请**；在鉴权时传了无权限的 intents，WebSocket 会**直接关闭连接**」。所以默认**故意不含** `direct`（频道私信，需单独申请）——一个只做单聊/群聊的机器人如果默认索要它会连不上。需要用别的组合时，在通道的 `intents` 里填关键字（`c2c,public_guild,direct,interaction,…`）或十进制位掩码。
+- **被动回复的官方约束**（插件已按此实现）：`msg_id` 有效期 **5 分钟**、同一条入站消息**最多回复 5 次**；`msg_seq` 从 1 递增（同一 `msg_id` + 同一 `msg_seq` 会被平台判为重复）。因此：长回复按 ~900 字切分成多条并各自带新 `msg_seq`（超过 5 条会截断并显式标注「已截断」）；被动窗口过期（`40034005`/`304103`/`40034128`）时**自动改发一条主动消息兜底**；`40054005`（消息被去重）按「已送达」处理，避免把成功当失败重发。
+- **「已连接」是可证伪的**（与微信那次同一口径）：网关的关闭码会翻译成中文并写上面板——`4014 intent 无权限`（附「去 q.qq.com 申请，或把 intents 改成已有权限的事件」的下一步）、`4013`、`4914`（已下架，只允许沙箱）、`4915`（已封禁）等**不可重试**的码会**停止重连**并把原因留在面板，而不是每 3~60 秒重试一次把真正的原因埋进日志；`4009` 等可恢复的码会带 **RESUME**（`session_id` + `seq`）重连，由网关补发断线期间遗漏的事件。
+- **心跳 ACK 看门狗**：网关会对每个客户端心跳回 `op=11`。连续两个心跳周期（含 5 秒宽限）收不到**任何**帧就认定为半开连接，强制断开重连——修掉「socket 还 OPEN、面板还是绿的、消息却进不来」这一类。
+- **发送失败不再静默**：发送响应会被真正解析（`err_code` / `code`，注意官方失败也可能返回 HTTP 200）。失败会抛出带中文原因的错误，由网关回发到同一会话并写进面板的通道状态行（`最近一次消息处理失败：…`）。
 - **边界**：群 / C2C 能力需在 q.qq.com 提审开通，未过审时接口报权限错误属正常；C2C/群消息为**被动回复**（需先用 `msg_id` 引用，无主动推送）；AppSecret 是机密，勿提交进 Git。
+
+#### QQ 真机探针
+
+```sh
+pnpm qq-probe <appId> <appSecret> [--ints c2c,public_guild] [--sandbox] [--seconds 90] [--no-reply]
+```
+
+不经过 DSH 宿主，直接把传输层指向真实开放平台跑一遍「取票 → 取网关 → WebSocket 鉴权 → 收消息 → 被动回复」，并把每一步的**平台原话**（含关闭码 / error code）打印出来；失败时按面板口径给出排查建议。它**不会**打印 AppSecret / AccessToken。用途与微信那次的 `scripts/inbound-probe.mjs` 相同：把「面板说连接中」拆成「卡在哪一步」。
 
 > **Secrets**: keep real values out of Git. `.gitignore` already excludes `cordis.local.yml` / `.env*`; never commit an apiKey/appSecret/password to a channel record that ends up under version control.
 
@@ -125,10 +146,13 @@ The QQ channel is a **direct client of the official QQ Open Platform robot gatew
 | `cordis.patch.yml` | Published **bundle** layer — references the package by name (`dsh-im-gateway` → `lib/index.js`) |
 | `scripts/build.mjs` | esbuild build: emits `lib/index.js` (node) + `lib/client.js` (browser) + `lib/vendor/lark-sdk.cjs` (vendored Feishu SDK) |
 | `scripts/check-install-scripts.mjs` | Build guard: fails if any *runtime* dependency (transitively) ships an install-time script |
-| `scripts/smoke.mts` | Local smoke test (session hashing, HTTP route, reply callback, CMCC failure, vendored Feishu SDK) |
+| `scripts/smoke.mts` | Local smoke test (session hashing, HTTP route, reply callback, CMCC failure, vendored Feishu SDK, WeChat QR/liveness, QQ handshake/close-codes/watchdog/sends) |
+| `scripts/qq-probe.mts` | QQ 真机探针 (`pnpm qq-probe <appId> <appSecret>`): token → gateway → WS handshake → inbound → passive reply, prints the platform's own answer |
 | `lib/` | **Committed** build output — no `prepare`; git installs mount it as-is. Rebuild & commit together with every `src/` change |
 | `lib/vendor/lark-sdk.cjs` | **Committed** vendored third-party (Feishu SDK, MIT) — generated by `scripts/build.mjs`, never edited by hand |
 | `docs/channel-ui-design.md` | Design doc for the multi-channel settings UI |
+| `docs/2026-09-17-wechat-connected-but-mute.md` | 微信「已连接但不回复」的完整证据链与修复记录 |
+| `docs/2026-09-17-qq-connect-diagnosis.md` | QQ「连不上」的协议对账、根因与修复记录（含关闭码/错误码速查） |
 | `LICENSE` | MIT license |
 | `README.md` | This file |
 

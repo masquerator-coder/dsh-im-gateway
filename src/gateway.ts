@@ -671,12 +671,17 @@ export class ImGateway {
       const text = wait.settle()
       this.waiters.delete(sessionId)
       if (text !== '') {
-        const delivered = await this.deliverWithRetry(reply, text, sessionId)
-        if (delivered) {
+        const delivery = await this.deliverWithRetry(reply, text, sessionId)
+        if (delivery.ok) {
           // A reply actually reached the chat: this channel is healthy again.
           runtime.onFault?.(undefined)
         } else {
-          runtime.onFault?.('回复未能投递到通道')
+          // Carry the sink's own reason onto the panel: "回复未能投递到通道" alone
+          // leaves the operator without the one thing they can act on (a stale
+          // passive-reply window, a permission error, a dead socket…).
+          runtime.onFault?.(delivery.reason === undefined
+            ? '回复未能投递到通道'
+            : `回复未能投递到通道：${delivery.reason}`)
         }
       } else {
         const detail = outcome === 'timeout'
@@ -709,17 +714,23 @@ export class ImGateway {
    * Push one reply through the sink with a bounded retry. Delivery failures are
    * never silent (④): every failed attempt is logged, and the final give-up is
    * explicitly marked "NOT delivered" so loss is observable by the operator.
-   * @returns whether the reply reached the channel on some attempt.
+   * @returns whether the reply reached the channel, and (when it did not) the
+   * last sink error so the panel can name the reason instead of a generic note.
    */
-  private async deliverWithRetry(reply: ReplySink, text: string, sessionId: SessionId): Promise<boolean> {
+  private async deliverWithRetry(
+    reply: ReplySink,
+    text: string,
+    sessionId: SessionId,
+  ): Promise<{ ok: true } | { ok: false; reason?: string }> {
     for (let attempt = 1; ; attempt++) {
       try {
         await reply(text)
-        return true
+        return { ok: true }
       } catch (error: unknown) {
+        const reason = shortDetail(errorChain(error))
         if (attempt >= REPLY_DELIVERY_MAX_ATTEMPTS) {
           this.ctx.logger.warn(`[im-gateway] reply NOT delivered for ${sessionId} after ${attempt} attempts: ${errorChain(error)}`)
-          return false
+          return { ok: false, reason }
         }
         this.ctx.logger.warn(`[im-gateway] reply attempt ${attempt} failed for ${sessionId}: ${errorChain(error)}`)
         await delay(300 * attempt)

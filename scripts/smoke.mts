@@ -32,6 +32,16 @@
  *      trips all fail must stop reporting "connected" (the panel used to say
  *      已连接 while every message was lost), recovery must report connected
  *      again, and only the bound user's text frames may be dispatched.
+ *  11. QQBotTransport — against a local fake QQ Open Platform (token endpoint +
+ *      /gateway + a real `ws` server): credential errors surface the platform
+ *      code instead of a vague message and do NOT hot-loop; the default IDENTIFY
+ *      never asks for the approval-only DIRECT_MESSAGE intent; an inbound C2C
+ *      frame is dispatched; passive replies carry msg_id + a fresh msg_seq; a
+ *      4014 (intent 无权限) close is reported as the real reason and stops
+ *      reconnecting; a gateway that stops answering heartbeats is force
+ *      reconnected; and send errors are surfaced (never silently swallowed).
+ *  12. QQ intent/close-code helpers — parseIntents / diagnoseClose / chunkText /
+ *      apiFailure, the pure parts the transport's honesty depends on.
  *
  * Real transports that need live services (email / feishu / wechat / qq / a
  * live CMCC gateway) are exercised by starting them in the plugin; this file
@@ -508,6 +518,338 @@ assert.equal(persisted.contextToken, 'ctx-2', 'a fresh context token must be per
 await bound.stop()
 boundServer.close()
 step('bound WeChat inbound extraction + recovery OK')
+
+// --- 11. QQ transport: handshake, intents, close codes, sends ---
+// The QQ channel has no QR: everything hangs off AppID/AppSecret → access token
+// → /gateway → WebSocket IDENTIFY. Every one of those steps failed silently (or
+// with a meaningless message) before, which is exactly what "QQ 连不上" looked
+// like: an endless "重连中…" with the real reason only in the host log. The fake
+// platform below drives each of those outcomes.
+const {
+  QQBotTransport, QqFatalError, QqApiError,
+  DEFAULT_INTENTS, QQ_INTENT, parseIntents, diagnoseClose, chunkText, apiFailure,
+} = await import('../src/transports/qqbot.ts')
+const { WebSocketServer } = await import('ws')
+
+async function startFakeQqPlatform() {
+  const state = {
+    tokenRequests: 0,
+    gatewayRequests: 0,
+    wsConnections: 0,
+    wsHeaders: [] as any[],
+    identify: [] as any[],
+    resumes: [] as any[],
+    heartbeats: 0,
+    sends: [] as Array<{ url: string; body: any }>,
+    sockets: [] as any[],
+    tokenStatus: 200,
+    tokenBody: { access_token: 'tok-smoke', expires_in: '7200' },
+    gatewayStatus: 200,
+    gatewayBody: {} as any,
+    heartbeatInterval: 400,
+    ackHeartbeats: true,
+    // Default: accept the handshake with a READY dispatch.
+    onIdentify: (ws: any) => {
+      ws.send(JSON.stringify({ op: 0, s: 1, t: 'READY', d: { session_id: 'sess-smoke', user: { id: 'bot-smoke' } } }))
+    },
+    sendResponder: (_body: any) => ({ status: 200, body: { id: 'sent-1', timestamp: '2026-09-17T00:00:00+08:00' } }),
+  }
+  const http = createServer((req, res) => {
+    let raw = ''
+    req.on('data', (chunk) => { raw += chunk })
+    req.on('end', () => {
+      const url = req.url ?? ''
+      if (url.startsWith('/app/getAppAccessToken')) {
+        state.tokenRequests++
+        res.writeHead(state.tokenStatus, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(state.tokenBody))
+        return
+      }
+      if (url === '/gateway') {
+        state.gatewayRequests++
+        res.writeHead(state.gatewayStatus, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(state.gatewayBody))
+        return
+      }
+      if (url.endsWith('/messages')) {
+        const body = JSON.parse(raw || '{}')
+        state.sends.push({ url, body })
+        const answer = state.sendResponder(body)
+        res.writeHead(answer.status, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(answer.body))
+        return
+      }
+      res.writeHead(404, { 'content-type': 'application/json' })
+      res.end('{}')
+    })
+  })
+  await new Promise((ready) => http.listen(0, '127.0.0.1', ready))
+  const port = http.address().port
+  const wss = new WebSocketServer({ server: http, path: '/ws' })
+  wss.on('connection', (ws, req) => {
+    state.wsConnections++
+    state.wsHeaders.push(req.headers)
+    state.sockets.push(ws)
+    ws.on('error', () => { /* the transport reports close/error itself */ })
+    ws.on('message', (data) => {
+      const frame = JSON.parse(String(data))
+      if (frame.op === 1) {
+        state.heartbeats++
+        if (state.ackHeartbeats) ws.send(JSON.stringify({ op: 11 }))
+        return
+      }
+      if (frame.op === 2) {
+        state.identify.push(frame.d)
+        state.onIdentify(ws)
+        return
+      }
+      if (frame.op === 6) {
+        state.resumes.push(frame.d)
+        ws.send(JSON.stringify({ op: 0, s: 2, t: 'RESUMED', d: '' }))
+      }
+    })
+    ws.send(JSON.stringify({ op: 10, d: { heartbeat_interval: state.heartbeatInterval } }))
+  })
+  return {
+    state,
+    base: `http://127.0.0.1:${port}`,
+    wsUrl: `ws://127.0.0.1:${port}/ws`,
+    close: () => {
+      for (const socket of state.sockets) { try { socket.terminate() } catch { /* ignore */ } }
+      wss.close()
+      http.close()
+    },
+  }
+}
+
+// 11a. Missing credentials must be reported up front, in actionable Chinese.
+{
+  let state = ''
+  const bare = new QQBotTransport({ appId: '', clientSecret: '', onInbound: () => {}, onState: (s) => { state = s } })
+  await assert.rejects(() => bare.start(), /缺少 AppID/, 'a credential-less QQ channel must fail with the missing field')
+  assert.equal(bare.isConnected(), false, 'it must not claim to be connected')
+  assert.equal(state, '', 'no connection state is reported before credentials exist')
+  await bare.stop()
+}
+step('QQ missing-credential guard OK')
+
+// 11b. A bad AppSecret comes back as HTTP 200 + code 100016 (not an HTTP error):
+// the panel has to name that, otherwise the operator debugs the network.
+{
+  const platform = await startFakeQqPlatform()
+  platform.state.tokenBody = { code: 100016, message: 'invalid appid or secret' }
+  const states: Array<[string, string | undefined]> = []
+  const qq = new QQBotTransport({
+    appId: '102000001', clientSecret: 'wrong-secret',
+    apiBase: platform.base, tokenUrl: `${platform.base}/app/getAppAccessToken`,
+    onInbound: () => {}, onState: (s, detail) => states.push([s, detail]),
+  })
+  await assert.rejects(() => qq.start(), /AppID 或 AppSecret 不正确/)
+  assert.ok(
+    states.some(([s, d]) => s === 'error' && /100016/.test(String(d))),
+    'the platform code must reach the panel, got: ' + JSON.stringify(states),
+  )
+  assert.equal(platform.state.wsConnections, 0, 'a token failure must never open a socket')
+  await qq.stop()
+  platform.close()
+}
+step('QQ token failure surfaces the platform code (100016) OK')
+
+// 11c. Happy path: default intents (no approval-only DIRECT_MESSAGE bit), READY,
+// inbound C2C dispatch, and passive replies numbered with msg_seq.
+{
+  const platform = await startFakeQqPlatform()
+  platform.state.gatewayBody = { url: platform.wsUrl }
+  const inbound: Array<{ chatId: string; text: string; senderId?: string }> = []
+  const states: string[] = []
+  const qq = new QQBotTransport({
+    appId: '102000001', clientSecret: 'smoke-secret',
+    apiBase: platform.base, tokenUrl: `${platform.base}/app/getAppAccessToken`,
+    onInbound: (route) => inbound.push({ chatId: route.chatId, text: route.text, senderId: route.senderId }),
+    onState: (s) => states.push(s),
+  })
+  await withTimeout(qq.start(), 8000, 'qq start')
+  assert.equal(qq.isConnected(), true, 'READY must report the channel connected')
+  assert.equal(platform.state.identify.length, 1, 'exactly one IDENTIFY')
+  assert.equal(platform.state.identify[0].intents, DEFAULT_INTENTS, 'IDENTIFY must carry the default intents')
+  assert.equal(
+    platform.state.identify[0].intents & QQ_INTENT.directMessage,
+    0,
+    'the approval-only DIRECT_MESSAGE intent must not be requested by default',
+  )
+  assert.equal(platform.state.identify[0].shard[0], 0)
+  assert.equal(platform.state.identify[0].token, 'QQBot tok-smoke', 'IDENTIFY carries the QQBot token')
+  assert.equal(platform.state.wsHeaders[0].authorization, 'QQBot tok-smoke', 'socket auth header')
+  assert.equal(platform.state.wsHeaders[0]['x-union-appid'], '102000001', 'socket appid header')
+  await waitUntil(() => platform.state.heartbeats > 0, 3000, 'a heartbeat must be sent')
+  step('QQ handshake + default intents + heartbeat OK')
+
+  // Inbound C2C message.
+  platform.state.sockets[0].send(JSON.stringify({
+    op: 0, s: 3, t: 'C2C_MESSAGE_CREATE',
+    d: { id: 'msg-inbound-1', content: '你好', author: { id: 'user-openid-1' } },
+  }))
+  await waitUntil(() => inbound.length > 0, 3000, 'an inbound C2C frame must be dispatched')
+  assert.deepEqual(inbound[0], { chatId: 'user-openid-1', text: '你好', senderId: 'user-openid-1' })
+
+  // Passive reply: msg_id from the inbound frame + a fresh msg_seq each time.
+  await qq.sendText('user-openid-1', '第一条回复')
+  await qq.sendText('user-openid-1', '第二条回复')
+  assert.equal(platform.state.sends.length, 2, 'two replies -> two POSTs')
+  assert.equal(platform.state.sends[0].url, '/v2/users/user-openid-1/messages')
+  assert.equal(platform.state.sends[0].body.msg_id, 'msg-inbound-1')
+  assert.equal(platform.state.sends[0].body.msg_type, 0)
+  assert.equal(platform.state.sends[0].body.msg_seq, 1, 'first reply of a msg_id is msg_seq 1')
+  assert.equal(
+    platform.state.sends[1].body.msg_seq,
+    2,
+    'the same msg_id must use a NEW msg_seq (a repeat is rejected as a duplicate)',
+  )
+
+  // A failed send must be thrown (the gateway then reports it back down the
+  // chat and on the panel), never swallowed.
+  platform.state.sendResponder = () => ({ status: 200, body: { err_code: 40054007, message: '消息长度超限' } })
+  await assert.rejects(() => qq.sendText('user-openid-1', 'x'), /消息长度超限/)
+  // 40054005 means "same msg_id + msg_seq already sent": that IS a delivery.
+  platform.state.sendResponder = () => ({ status: 200, body: { err_code: 40054005, message: '消息被去重' } })
+  await qq.sendText('user-openid-1', 'x')
+  // Passive window expired (5 minutes) -> fall back to one active message.
+  platform.state.sendResponder = (body: any) => (body.msg_id
+    ? { status: 200, body: { err_code: 40034005, message: '回复消息msg_id已过期' } }
+    : { status: 200, body: { id: 'sent-active', timestamp: 'now' } })
+  await qq.sendText('user-openid-1', '超时之后的回复')
+  const last = platform.state.sends[platform.state.sends.length - 1]
+  assert.equal(last.body.msg_id, undefined, 'the expired passive reply must retry as an active message')
+  step('QQ inbound dispatch + passive reply numbering + send-error surfacing OK')
+
+  await qq.stop()
+  platform.close()
+}
+
+// 11d. An un-granted intent (4014) is not a transient network blip: report it
+// with the fix and stop reconnecting instead of looping for ever.
+{
+  const platform = await startFakeQqPlatform()
+  platform.state.gatewayBody = { url: platform.wsUrl }
+  platform.state.onIdentify = (ws: any) => ws.close(4014, 'intent 无权限')
+  const states: Array<[string, string | undefined]> = []
+  const qq = new QQBotTransport({
+    appId: '102000001', clientSecret: 'smoke-secret',
+    apiBase: platform.base, tokenUrl: `${platform.base}/app/getAppAccessToken`,
+    onInbound: () => {}, onState: (s, detail) => states.push([s, detail]),
+  })
+  await assert.rejects(() => qq.start(), /4014|intent 无权限/, 'a refused intent must fail the start with the real reason')
+  assert.ok(
+    states.some(([s, d]) => s === 'error' && /q\.qq\.com/.test(String(d))),
+    'the panel must get the actionable next step, got: ' + JSON.stringify(states),
+  )
+  assert.equal(qq.isConnected(), false)
+  const connectionsAfterFailure = platform.state.wsConnections
+  await new Promise((r) => setTimeout(r, 1200))
+  assert.equal(
+    platform.state.wsConnections,
+    connectionsAfterFailure,
+    'a fatal close code must NOT be retried in a hot loop',
+  )
+  await qq.stop()
+  platform.close()
+}
+step('QQ fatal close code (4014 intent 无权限) reported + no hot loop OK')
+
+// 11e. A gateway that keeps the socket open but stops answering heartbeats is a
+// half-open connection: the watchdog has to force a reconnect.
+{
+  const platform = await startFakeQqPlatform()
+  platform.state.gatewayBody = { url: platform.wsUrl }
+  platform.state.ackHeartbeats = false
+  platform.state.heartbeatInterval = 250
+  const states: string[] = []
+  const qq = new QQBotTransport({
+    appId: '102000001', clientSecret: 'smoke-secret',
+    apiBase: platform.base, tokenUrl: `${platform.base}/app/getAppAccessToken`,
+    onInbound: () => {}, onState: (s, detail) => { if (detail !== undefined) states.push(`${s}:${detail}`) },
+  })
+  await withTimeout(qq.start(), 8000, 'qq start')
+  await waitUntil(
+    () => states.some(s => /心跳无响应/.test(s)),
+    12000,
+    'the watchdog must report a heartbeat-silent gateway',
+  )
+  assert.equal(qq.isConnected(), false, 'a stale socket must not keep reporting connected')
+  await waitUntil(
+    () => platform.state.wsConnections >= 2,
+    12000,
+    'a silent gateway must be force-reconnected',
+  )
+  await qq.stop()
+  platform.close()
+}
+step('QQ heartbeat-ACK watchdog forces a reconnect OK')
+
+// 11f. RESUME: a reconnect that still holds a session id must RESUME (the
+// gateway then replays the events missed while disconnected) instead of
+// IDENTIFYing a brand-new session.
+{
+  const platform = await startFakeQqPlatform()
+  platform.state.gatewayBody = { url: platform.wsUrl }
+  const qq = new QQBotTransport({
+    appId: '102000001', clientSecret: 'smoke-secret',
+    apiBase: platform.base, tokenUrl: `${platform.base}/app/getAppAccessToken`,
+    onInbound: () => {}, onState: () => {},
+  })
+  await withTimeout(qq.start(), 8000, 'qq start')
+  assert.equal(platform.state.identify.length, 1)
+  // Server-side drop (e.g. 4009 连接过期): the next connection must RESUME.
+  platform.state.sockets[0].close(4009, 'session expired')
+  await waitUntil(() => platform.state.resumes.length > 0, 12000, 'the reconnect must RESUME the session')
+  assert.equal(platform.state.resumes[0].session_id, 'sess-smoke')
+  assert.equal(platform.state.resumes[0].seq, 1, 'RESUME must carry the last dispatch seq (no replay gap)')
+  assert.equal(platform.state.identify.length, 1, 'RESUME must replace IDENTIFY on reconnect')
+  await waitUntil(() => qq.isConnected(), 5000, 'RESUMED must report connected again')
+  await qq.stop()
+  platform.close()
+}
+step('QQ resume-on-reconnect OK')
+
+// --- 12. QQ pure helpers ---
+assert.equal(parseIntents(undefined), DEFAULT_INTENTS, 'empty intents -> the default subscription')
+assert.equal(parseIntents(''), DEFAULT_INTENTS)
+assert.equal(parseIntents('c2c,public_guild'), DEFAULT_INTENTS, 'keywords resolve to the same bits')
+assert.equal(parseIntents('33554432'), QQ_INTENT.groupAndC2C, 'a decimal bitmask is accepted')
+assert.equal(parseIntents('c2c|direct') & QQ_INTENT.directMessage, QQ_INTENT.directMessage)
+assert.throws(() => parseIntents('nonsense'), /无法识别的 intents/, 'an unknown keyword must be rejected loudly')
+assert.throws(() => parseIntents(1 << 20), /未知事件位/, 'a non-existent intent bit must be rejected')
+assert.throws(() => parseIntents(1 << 31), /无效/, 'a negative bitmask must be rejected')
+
+assert.deepEqual(
+  { action: diagnoseClose(4014).action, retry: /无权限/.test(diagnoseClose(4014).reason) },
+  { action: 'stop', retry: true },
+  '4014 must not be retried and must name the permission problem',
+)
+assert.equal(diagnoseClose(4009).action, 'resume', '4009 keeps the session')
+assert.equal(diagnoseClose(4006).action, 'identify', '4006 restarts with IDENTIFY')
+assert.equal(diagnoseClose(4915).action, 'stop', 'a banned robot cannot be retried')
+
+const long = 'a'.repeat(2500)
+const chunks = chunkText(long)
+assert.equal(chunks.length, 3, `2500 chars must split into 3 chunks, got ${chunks.length}`)
+assert.ok(chunks.every(c => c.length <= 900), 'no chunk may exceed the conservative send size')
+const overflow = chunkText('b'.repeat(9000))
+assert.equal(overflow.length, 5, 'at most 5 passive replies per inbound message')
+assert.match(overflow[4], /已截断/, 'the overflow must be marked, never dropped silently')
+assert.deepEqual(chunkText('   '), [], 'blank replies produce nothing to send')
+
+assert.deepEqual(
+  apiFailure(200, { err_code: 40034005, message: '回复消息msg_id已过期' }, ''),
+  { code: 40034005, message: '回复消息msg_id已过期', fatal: false },
+  'a body err_code on HTTP 200 is a failure',
+)
+assert.equal(apiFailure(200, { id: 'msg-1' }, ''), null, 'a successful body is not a failure')
+assert.equal(apiFailure(401, { code: 11253, message: 'no permission' }, '').fatal, true, 'a permission code is fatal')
+assert.equal(apiFailure(500, null, 'boom').code, 500, 'an unparseable failure falls back to the HTTP status')
+assert.ok(new QqApiError('x', 1) instanceof Error)
+assert.ok(new QqFatalError('y') instanceof QqFatalError)
+step('QQ intent/close-code/chunk/api helpers OK')
 
 process.stderr.write('\n✔ All local smoke checks passed.\n')
 process.exit(0)

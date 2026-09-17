@@ -76,6 +76,13 @@ export const ChannelsSettingsSchema: z<ChannelsSettings> = z.object({
     // qq (official bot; appId/appSecret shared with feishu above)
     botApiBase: z.string().required(false),
     sandbox: z.boolean().required(false),
+    /**
+     * Event subscription for the QQ gateway: a decimal bitmask or keywords
+     * (`c2c,public_guild`). Empty = the built-in default. Only `public_guild`
+     * (and `guilds`/`guild_members`) are granted by default on q.qq.com; asking
+     * for anything else before approval makes the gateway close the connection.
+     */
+    intents: z.string().required(false),
   })).default([]),
 })
 
