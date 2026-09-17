@@ -54,7 +54,7 @@ In the DSH **「插件 → 插件设置」** page an **"IM 通道设置"** card 
 
 | Type | Fixed items auto-filled | User provides | Transport |
 | --- | --- | --- | --- |
-| **微信** (wechat) | `baseUrl` (`https://ilinkai.weixin.qq.com`) | token (auto at bind); scan official ilink QR | direct client of Tencent's official ilink bot gateway (QR bind → getupdates poll → sendmessage) |
+| **微信** (wechat) | `baseUrl` (`https://ilinkai.weixin.qq.com`) | 什么也不用填：扫码绑定（`bot_token` 由网关下发并落盘） | direct client of Tencent's official ilink bot gateway (QR bind → getupdates poll → sendmessage) |
 | **QQ** | `botApiBase` (`https://api.sgroup.qq.com`) | AppID + AppSecret (create bot at q.qq.com) | official QQ bot WebSocket gateway (`getAppAccessToken` → `api.sgroup.qq.com/gateway` → wss; C2C/group) |
 | **Email** | server/ports/TLS from chosen provider (QQ/163/Gmail/Outlook/企业微信/自定义) | account + 授权码/密码 | `nodemailer` (SMTP out) + `imapflow` (IMAP in; 首次只处理最近 50 封) |
 | **中国移动 5G消息** | `serverUrl` (`wss://…/ws/msg`), `version: 2.0` | apiKey | WebSocket `SmsClient` to the 5G 消息 gateway |
@@ -73,7 +73,7 @@ Every channel card exposes an **高级选项（接入控制 / 模型路由）** 
 
 The WeChat channel is a **direct client of Tencent's official ilink bot gateway** (no local companion process needed), ported from the [dsh-clawbot](dsh-clawbot-main/) reference. Default gateway: `https://ilinkai.weixin.qq.com` (field `baseUrl`; keep default unless you self-host a gateway). Lifecycle:
 
-1. **保存并启用**通道 → 面板显示官方登录二维码（`baseUrl` 预填，`token` 留空）。
+1. **保存并启用**通道 → 面板在「接入步骤」正下方显示官方登录二维码（`baseUrl` 已预填，**面板不提供 Token 输入框**）。
 2. **手机微信扫码**确认绑定 → ilink 下发 `bot_token`，自动持久化到 `~/.dsh/im-workspace/wechat-state/<channelId>.json`（跨重启复用，无需重复扫码）。
 3. **在微信里给新出现的 bot 联系人发一条消息**解锁发送凭证 `context_token`。
 4. 状态变为「已连接」后，绑定账号在微信里发的文本/语音转写会驱动 Agent，回复经同一 ilink 网关回送。
@@ -82,7 +82,7 @@ The WeChat channel is a **direct client of Tencent's official ilink bot gateway*
 
 > **获取二维码失败会自动重试**：`requestQr` 无论抛异常还是返回不可用内容，都会把「获取二维码失败，正在重试…」写到状态行，并在未绑定期间每 10 秒重试一次——不会再出现「面板静静停在提示文案上」。
 
-> **关于手动填 `token`**：`bot_token` 只是 ilink 网关凭证，**单独填它并不会连接微信**——绑定是「扫码 + 解锁发消息」两步完成的，`token` 在扫码确认后由网关自动填入。若通道只有 token 而没有完成绑定的微信账号（无 `scannedUser`），网关会**仍然显示登录二维码**并明确提示「已填写 token 但尚未绑定微信」，引导你扫码并发送一条消息完成绑定，而不是误报「已连接」。
+> **面板为什么没有 Token 输入框**：`bot_token` 只是 ilink 网关凭证，**单独拥有它并不会连接微信**——绑定是「扫码 + 解锁发消息」两步完成的，`token` 在扫码确认后由网关下发、由宿主写入 `wechat-state/`。所以它不该由用户填写（早先的版本逼着用户粘贴，反而把常见的误解坐实了）。通道记录里的 `token` 字段仍然保留：手工编辑 `settings.yaml` 预置凭证这条路径还在，宿主会优先使用 `wechat-state/` 里的绑定结果。若通道只有 token 而没有绑定微信账号（无 `scannedUser`），网关会**仍然显示登录二维码**并提示「已填写 token 但尚未绑定微信」，而不是误报「已连接」。
 
 > 边界（与参考实现一致）：ilink 网关对**主动发送严重限流**——这是通知/拍板渠道，不是聊天工具；`context_token` 只会在绑定账号先发一条消息后下发；收到 *转发* 的文章/文件收不到（需发原始链接）。绑定状态默认只发给绑定账号自己。
 
