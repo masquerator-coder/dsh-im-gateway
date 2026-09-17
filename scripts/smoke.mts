@@ -13,7 +13,11 @@
  *   5. FeishuTransport — the VENDORED Feishu SDK (lib/vendor/lark-sdk.cjs, not
  *      an npm dependency) resolves and still exports Client / WSClient /
  *      EventDispatcher, and missing credentials fail before any socket opens.
- *   6. ImGateway.composePrompt — the `<dsh_im_source>` block is prepended ONLY
+ *   6. WechatIlinkTransport — against a local fake ilink gateway: a channel that
+ *      has a (manually pasted) bot_token but no bound WeChat account must STILL
+ *      request the login QR and report "token present, not bound yet" instead of
+ *      claiming to be connected, and must refuse to send.
+ *   7. ImGateway.composePrompt — the `<dsh_im_source>` block is prepended ONLY
  *      when the source changes for that session (first message, sender/channel
  *      change, or after a compaction shadowed the span that carried it), so a
  *      steady sender no longer repeats the block on every bubble.
@@ -183,7 +187,47 @@ assert.equal(feishuState, 'error', 'missing credentials must report the error st
 await feishu.stop().catch(() => {})
 step('Feishu missing-credential guard OK: ' + feishuError)
 
-// --- 6. source metadata injection: change-only, per session ---
+// --- 6. WeChat: a pasted token must not suppress the login QR ---
+// The bot_token is only the ilink gateway credential; it attaches no WeChat
+// account. A channel that has one but no bound user (scannedUser) therefore has
+// to keep driving the QR bind — otherwise the panel shows the qrHint forever and
+// nothing can ever be paired. The transport is pointed at a local fake ilink
+// gateway so the handshake is exercised without touching Tencent.
+const { WechatIlinkTransport } = await import('../src/transports/wechat.ts')
+const ilinkHits = []
+const ilinkServer = createServer((req, res) => {
+  ilinkHits.push(req.url ?? '')
+  res.writeHead(200, { 'content-type': 'application/json' })
+  res.end(req.url?.startsWith('/ilink/bot/get_bot_qrcode')
+    ? JSON.stringify({ qrcode: 'q-smoke', qrcode_img_content: 'https://example.invalid/qr/q-smoke', ret: 0 })
+    : JSON.stringify({ status: 'waiting' })) // never "confirmed": no state file is written
+})
+await new Promise((ready) => ilinkServer.listen(0, '127.0.0.1', ready))
+const ilinkPort = ilinkServer.address().port
+
+let wechatQr = ''
+let wechatDetail = ''
+const wechat = new WechatIlinkTransport({
+  channelId: 'smoke-wechat-unbound',
+  baseUrl: `http://127.0.0.1:${ilinkPort}`,
+  token: 'smoke-bot-token',
+  onInbound: () => {},
+  onQr: (url) => { wechatQr = url },
+  onState: (_status, detail) => { if (detail !== undefined) wechatDetail = detail },
+})
+await wechat.start()
+assert.ok(
+  ilinkHits.some(u => u.startsWith('/ilink/bot/get_bot_qrcode')),
+  'a token-only channel must still request the login QR, hits: ' + JSON.stringify(ilinkHits),
+)
+assert.equal(wechatQr, 'https://example.invalid/qr/q-smoke', 'the QR URL must reach the UI')
+assert.match(wechatDetail, /尚未绑定微信/, 'status must say the token alone is not enough, got: ' + wechatDetail)
+await assert.rejects(() => wechat.sendText('someone', 'hi'), /not bound/, 'unbound channel must refuse to send')
+await wechat.stop()
+ilinkServer.close()
+step('WeChat token-only channel keeps requesting the login QR OK')
+
+// --- 7. source metadata injection: change-only, per session ---
 // The gateway itself cannot be imported offline (its `@deepseek-ai/dsh-agent`
 // peer pulls `@deepseek-ai/dsh-scope`, absent here), so the contract is verified
 // on the dependency-free module the gateway delegates to.

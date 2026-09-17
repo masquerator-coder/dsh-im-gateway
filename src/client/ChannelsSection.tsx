@@ -28,6 +28,8 @@ interface Field {
   key: string
   labelKey: string
   secret?: boolean
+  /** Credential the user cannot paste — it arrives out-of-band (wechat QR bind). */
+  autoFilled?: boolean
   placeholder?: string
 }
 
@@ -58,6 +60,17 @@ const DEFAULT_QQ_API_BASE = 'https://api.sgroup.qq.com'
 
 /** Advanced per-channel agent routing keys shown under the fold. */
 const ADVANCED_KEYS = ['allowlist', 'provider', 'model', 'maxTokens', 'cwd', 'agentPreset'] as const
+
+/**
+ * Ordered setup-guidance steps rendered in a callout for a channel type.
+ * `type.wechat.desc` / `type.qq.desc` explain the transport; these steps tell
+ * the user exactly what to do on the IM side to actually go live. Channels
+ * without an entry get no steps block.
+ */
+const SETUP_STEPS: Partial<Record<ChannelType, string[]>> = {
+  wechat: ['setup.wechat.0', 'setup.wechat.1', 'setup.wechat.2', 'setup.wechat.3'],
+  qq: ['setup.qq.0', 'setup.qq.1', 'setup.qq.2', 'setup.qq.3'],
+}
 
 /** Non-secret fields that must be present before a channel can be saved. */
 const REQUIRED_BY_TYPE: Partial<Record<ChannelType, string[]>> = {
@@ -140,7 +153,7 @@ function templatesFor(): Record<ChannelType, Template> {
     defaults: { baseUrl: DEFAULT_WECHAT_BASE_URL },
     fields: [
       { key: 'baseUrl', labelKey: 'field.baseUrl' },
-      { key: 'token', labelKey: 'field.token', secret: true, placeholder: '绑定后自动填入，也可手工预填' },
+      { key: 'token', labelKey: 'field.token', secret: true, autoFilled: true, placeholder: '扫码绑定后自动填入，无需手工填写' },
     ],
   }
   const qq: Template = {
@@ -174,6 +187,10 @@ function requiredMissing(
   const missing: string[] = []
   for (const f of template?.fields ?? []) {
     if (f.secret) {
+      // An out-of-band credential is never required up front: the WeChat token
+      // is issued by the gateway after the QR bind, so demanding it here would
+      // force a bogus paste (and, in older builds, suppress the login QR).
+      if (f.autoFilled) continue
       const stored = rec !== undefined && rec[f.key] !== undefined
       if (!stored && !(draft[f.key] ?? '').trim()) missing.push(f.labelKey)
       continue
@@ -524,6 +541,20 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
               `${typeLabel(currentType)} · ${statusLabel(activeStatusKey)}`
               + (status[resolvedActiveId ?? '']?.detail ? ` — ${status[resolvedActiveId ?? '']!.detail}` : ''),
             ),
+            // Setup guidance callout: what this channel is + concrete steps to
+            // go live on the IM side. Shown for wechat / qq (the channels with
+            // a non-trivial bind/unlock flow); the tokenHint corrects the common
+            // misconception that pasting a Token alone connects WeChat.
+            currentType ? h('div', { style: setupCalloutStyle },
+              h('div', { style: { fontWeight: 600, fontSize: '12px', marginBottom: '4px' } }, t('channels.setup')),
+              h('div', { style: { fontSize: '11.5px', opacity: 0.85, marginBottom: '6px' } }, t('type.' + currentType + '.desc')),
+              currentType === 'wechat' ? h('div', { style: { fontSize: '11.5px', margin: '0 0 6px', color: '#e8b94a' } }, t('type.wechat.tokenHint')) : null,
+              h('ol', { style: { margin: 0, paddingLeft: '18px', fontSize: '11.5px', opacity: 0.9, display: 'grid', gap: '3px' } },
+                (SETUP_STEPS[currentType] ?? []).map(stepKey =>
+                  h('li', { key: stepKey }, t(stepKey)),
+                ),
+              ),
+            ) : null,
             // Enable / disable switch (existing channels only; new ones start enabled).
             active && !creating ? h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
               h('button', {
@@ -619,6 +650,12 @@ const listButtonStyle: React.CSSProperties = {
   color: 'inherit', padding: '8px 10px', fontSize: '13px', cursor: 'pointer', textAlign: 'left',
 }
 const labelStyle: React.CSSProperties = { fontSize: '12px', opacity: 0.75 }
+const setupCalloutStyle: React.CSSProperties = {
+  padding: '10px 12px',
+  borderRadius: '10px',
+  border: '1px solid rgba(128,128,128,0.28)',
+  background: 'rgba(79,140,255,0.06)',
+}
 const inputStyle: React.CSSProperties = {
   width: '100%', boxSizing: 'border-box', padding: '8px 10px', borderRadius: '8px',
   border: '1px solid rgba(128,128,128,0.35)', background: 'transparent', color: 'inherit', fontSize: '13px',

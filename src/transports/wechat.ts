@@ -124,9 +124,14 @@ export class WechatIlinkTransport implements ChannelTransport {
       await this.saveState().catch(() => {})
     }
 
-    if (!this.state.token) {
-      // Unbound — start a QR bind.
-      this.options.onState?.('connecting', '未绑定：请扫码绑定微信')
+    if (!this.isBound()) {
+      // Unbound — start a QR bind. Distinguish "no token yet" from "token
+      // present but no WeChat account attached yet" (a manually pasted token
+      // cannot work on its own; the user still has to scan + unlock).
+      const detail = this.state.token
+        ? '已填写 token 但尚未绑定微信：请扫码绑定并给机器人发一条消息解锁'
+        : '未绑定：请扫码绑定微信，并给机器人发一条消息解锁发送'
+      this.options.onState?.('connecting', detail)
       await this.requestQr()
     }
 
@@ -140,6 +145,19 @@ export class WechatIlinkTransport implements ChannelTransport {
 
   isConnected(): boolean {
     return this.connected
+  }
+
+  /**
+   * Whether this channel is genuinely *bound* to a WeChat account. A token is
+   * only the ilink gateway credential — it alone does NOT attach a WeChat
+   * user. Binding requires the QR `confirmed` handshake, which populates
+   * `scannedUser`. A bare token (e.g. manually pasted) therefore does not make
+   * the channel usable: without a scanned user we cannot match any inbound
+   * message, so we must keep driving the QR bind instead of pretending to be
+   * connected.
+   */
+  private isBound(): boolean {
+    return !!this.state.token && !!this.state.scannedUser
   }
 
   // ── state persistence ──────────────────────────────────────────────────────
@@ -259,7 +277,7 @@ export class WechatIlinkTransport implements ChannelTransport {
   }
 
   private async pollInbound(): Promise<void> {
-    if (!this.state.token) return
+    if (!this.isBound()) return
     const r = await this.httpJson(
       `${this.state.baseUrl}/ilink/bot/getupdates`,
       {
@@ -331,7 +349,7 @@ export class WechatIlinkTransport implements ChannelTransport {
         await this.pollQrStatus()
         return
       }
-      if (this.state.token) await this.pollInbound()
+      if (this.isBound()) await this.pollInbound()
     } catch (error) {
       this.options.log?.(`wechat poll failed: ${String(error)}`)
     }
@@ -339,7 +357,7 @@ export class WechatIlinkTransport implements ChannelTransport {
 
   /** Send a reply to the bound user through the ilink gateway. */
   async sendText(to: string, text: string): Promise<void> {
-    if (!this.state.token) throw new Error('wechat channel not bound')
+    if (!this.isBound()) throw new Error('wechat channel not bound')
     if (!to) throw new Error('wechat send target missing')
     if (!this.state.contextToken) {
       throw new Error('缺少发送凭证（context_token）：请先在微信里给机器人发一条消息')
