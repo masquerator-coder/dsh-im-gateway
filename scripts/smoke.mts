@@ -27,6 +27,11 @@
  *   9. createStatusHandler — the panel's only link to the host. It is a web
  *      route rather than a Remote namespace (those are generated and closed to
  *      out-of-tree plugins): payload shape, auth gate, method guard.
+ *  10. WechatIlinkTransport (bound) — liveness and inbound extraction against a
+ *      local fake gateway with its own state dir: a bound channel whose round
+ *      trips all fail must stop reporting "connected" (the panel used to say
+ *      已连接 while every message was lost), recovery must report connected
+ *      again, and only the bound user's text frames may be dispatched.
  *
  * Real transports that need live services (email / feishu / wechat / qq / a
  * live CMCC gateway) are exercised by starting them in the plugin; this file
@@ -46,6 +51,16 @@ const withTimeout = (p, ms, label) =>
     p,
     new Promise((_, rej) => setTimeout(() => rej(new Error(`${label} timed out`)), ms)),
   ])
+
+/** Poll a predicate until it holds (or fail the smoke run). */
+const waitUntil = async (predicate, ms, label) => {
+  const deadline = Date.now() + ms
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    await new Promise((r) => setTimeout(r, 20))
+  }
+  throw new Error(`${label} did not happen within ${ms}ms`)
+}
 
 // --- 1. session id hashing (pure, no live deps) ---
 const { sessionIdForChat } = await import('../src/session.ts')
@@ -402,6 +417,97 @@ assert.equal(await statusHead.text(), '', 'HEAD must not carry a body')
 
 statusServer.close()
 step('channel-status route (payload + auth gate + method guard) OK')
+
+// --- 10. bound WeChat channel: liveness reporting + inbound extraction ---
+// The gateways' most expensive failure mode is a channel that REPORTS itself as
+// connected while every inbound message is being dropped: the operator sees a
+// healthy green panel and a silent chat. For the WeChat transport the only
+// liveness signal is the getupdates round trip, so a bound channel whose round
+// trips all fail has to leave the `connected` state (and come back when the
+// gateway answers again). Inbound extraction is asserted at the same time: only
+// the bound user's text/voice frames may reach the gateway — a stranger's
+// message, the bot's own echo and a text-less frame must not.
+const { mkdtemp, writeFile: writeStateFile } = await import('node:fs/promises')
+const { tmpdir } = await import('node:os')
+const { join: joinPath } = await import('node:path')
+const boundStateDir = await mkdtemp(joinPath(tmpdir(), 'dsh-im-gateway-smoke-'))
+const boundChannelId = 'smoke-wechat-bound'
+const boundStateKey = Buffer.from(boundChannelId).toString('hex').slice(0, 40)
+await writeStateFile(
+  joinPath(boundStateDir, `${boundStateKey}.json`),
+  JSON.stringify({
+    token: 'smoke-bound-token',
+    baseUrl: '',
+    botId: 'bot@im.bot',
+    scannedUser: 'user@im.wechat',
+    contextToken: 'ctx-1',
+    cursor: '',
+    lastError: '',
+  }),
+  'utf8',
+)
+
+let boundGatewayUp = false
+const boundServer = createServer((req, res) => {
+  res.writeHead(boundGatewayUp ? 200 : 500, { 'content-type': 'application/json' })
+  if (!boundGatewayUp) {
+    res.end('{"errcode":-1,"errmsg":"gateway down"}')
+    return
+  }
+  res.end(JSON.stringify({
+    get_updates_buf: 'cursor-2',
+    msgs: [
+      { from_user_id: 'user@im.wechat', message_type: 1, context_token: 'ctx-2', item_list: [{ type: 1, text_item: { text: '你好' } }] },
+      { from_user_id: 'stranger@im.wechat', message_type: 1, item_list: [{ type: 1, text_item: { text: 'do not route me' } }] },
+      { from_user_id: 'user@im.wechat', message_type: 1, item_list: [{ type: 9, unknown_item: {} }] },
+    ],
+  }))
+})
+await new Promise((ready) => boundServer.listen(0, '127.0.0.1', ready))
+const boundPort = boundServer.address().port
+
+const boundInbound: Array<{ chatId: string; text: string; senderId?: string }> = []
+const boundStates: Array<[string, string | undefined]> = []
+const bound = new WechatIlinkTransport({
+  channelId: boundChannelId,
+  baseUrl: `http://127.0.0.1:${boundPort}`,
+  stateDir: boundStateDir,
+  pollIntervalMs: 20,
+  onInbound: (route) => { boundInbound.push({ chatId: route.chatId, text: route.text, senderId: route.senderId }) },
+  onState: (status, detail) => { boundStates.push([status, detail]) },
+})
+await bound.start()
+assert.equal(bound.isBound(), true, 'the persisted bind state must make the channel bound')
+
+await waitUntil(
+  () => boundStates.some(([, detail]) => /通信失败/.test(String(detail))),
+  5000,
+  'a bound channel with failing round trips must report the link problem',
+)
+assert.equal(
+  bound.isConnected(),
+  false,
+  'a bound channel whose round trips keep failing must stop reporting connected',
+)
+step('bound WeChat channel reports a failing link instead of staying "connected" OK')
+
+boundGatewayUp = true
+await waitUntil(() => boundInbound.length > 0, 5000, 'an inbound text frame must be dispatched')
+assert.equal(boundInbound.length, 1, `only the bound user's text frame may be dispatched, got ${JSON.stringify(boundInbound)}`)
+assert.equal(boundInbound[0].chatId, 'user@im.wechat')
+assert.equal(boundInbound[0].text, '你好')
+assert.ok(
+  boundStates.some(([status]) => status === 'connected'),
+  'a successful round trip must report connected again',
+)
+assert.equal(bound.isConnected(), true)
+
+const persisted = JSON.parse(await (await import('node:fs/promises')).readFile(joinPath(boundStateDir, `${boundStateKey}.json`), 'utf8'))
+assert.equal(persisted.cursor, 'cursor-2', 'the poll cursor must be persisted')
+assert.equal(persisted.contextToken, 'ctx-2', 'a fresh context token must be persisted')
+await bound.stop()
+boundServer.close()
+step('bound WeChat inbound extraction + recovery OK')
 
 process.stderr.write('\n✔ All local smoke checks passed.\n')
 process.exit(0)

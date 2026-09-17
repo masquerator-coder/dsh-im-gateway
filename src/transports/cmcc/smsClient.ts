@@ -51,6 +51,15 @@ interface RawFrame extends InboundMedia {
 
 const DEBUG = false
 
+/** How often the socket watchdog samples the connection. */
+const WATCHDOG_INTERVAL_MS = 5000
+/**
+ * How long a ping/pong round trip may stay unanswered before the socket is
+ * declared dead. Only enforced once at least one `pong` has been observed, so a
+ * server that never answers pings is not torn down on a false positive.
+ */
+const HEARTBEAT_STALE_MS = 45000
+
 /** Leveled logger injected by the owning transport (routes into DSH's logger). */
 export type SmsLog = (level: 'info' | 'warn' | 'error', message: string) => void
 
@@ -71,6 +80,17 @@ export class SmsClient extends EventEmitter {
   private heartbeatInterval: NodeJS.Timeout | null = null
   private heartbeatTimeout: NodeJS.Timeout | null = null
   private reconnectTimer: NodeJS.Timeout | null = null
+  /**
+   * Independent liveness sampler. `connected` is only flipped by socket events,
+   * so a half-open socket (the classic aftermath of a laptop sleep or a network
+   * change: no FIN ever arrives, writes succeed into the kernel buffer) left the
+   * channel reporting itself as connected while nothing could be received. The
+   * watchdog inspects the real socket and forces a reconnect.
+   */
+  private watchdogInterval: NodeJS.Timeout | null = null
+  /** Last observed `pong`; `sawPong` gates the staleness rule. */
+  private lastPongAt = 0
+  private sawPong = false
   /** How long to wait for the `auth_ok` frame after the socket opens. */
   private readonly authTimeoutMs = 20000
   connected = false
@@ -323,6 +343,8 @@ export class SmsClient extends EventEmitter {
           break
         }
         case 'pong': {
+          this.sawPong = true
+          this.lastPongAt = Date.now()
           if (this.heartbeatTimeout) {
             clearTimeout(this.heartbeatTimeout)
             this.heartbeatTimeout = null
@@ -423,16 +445,75 @@ export class SmsClient extends EventEmitter {
     const HEARTBEAT_INTERVAL = 15000
     const HEARTBEAT_TIMEOUT = 10000
     this.stopHeartbeat()
+    this.sawPong = false
+    this.lastPongAt = Date.now()
     this.heartbeatInterval = setInterval(() => {
       if (this.connected && this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({ type: 'ping' }))
+        try {
+          this.ws.send(JSON.stringify({ type: 'ping' }))
+        } catch (error) {
+          // A throwing send means the socket is already unusable; the watchdog
+          // would catch it later, but there is no reason to wait.
+          this.errLog(`heartbeat send failed: ${String(error)}`)
+          this.dropSocket('heartbeat send failed')
+          return
+        }
         this.heartbeatTimeout = setTimeout(() => {
           this.errLog('heartbeat timeout')
           this.emit('error', new Error('heartbeat timeout'))
-          if (this.ws?.readyState === WebSocket.OPEN) this.ws.close()
+          this.dropSocket('heartbeat timeout')
         }, HEARTBEAT_TIMEOUT)
       }
     }, HEARTBEAT_INTERVAL)
+    this.watchdogInterval = setInterval(() => this.checkSocketHealth(), WATCHDOG_INTERVAL_MS)
+  }
+
+  /**
+   * Force the current socket closed so the normal `close` → reconnect path runs.
+   * Used by the heartbeat and by {@link checkSocketHealth}; idempotent through
+   * the `connected` flag.
+   */
+  private dropSocket(reason: string): void {
+    const ws = this.ws
+    if (!ws) {
+      this.connected = false
+      this.attemptReconnect()
+      return
+    }
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      // The `close` listener owns `connected = false` and the reconnect.
+      try { ws.close() } catch { /* ignore */ }
+      return
+    }
+    // No close event will arrive for an already-dead socket: recover here.
+    trace(`[sms] watchdog recovering dead socket (${reason}) readyState=${ws.readyState}`)
+    this.connected = false
+    this.stopHeartbeat()
+    this.emit('disconnected')
+    this.attemptReconnect()
+  }
+
+  /**
+   * Detect a connection that is not actually usable: either the socket object is
+   * gone/closed, or a previously answering peer stopped answering pings. Without
+   * this, a half-open socket kept `connected === true` for ever, the panel said
+   * 已连接, and every inbound message was silently lost.
+   */
+  private checkSocketHealth(): void {
+    if (!this.connected) return
+    const ws = this.ws
+    const open = ws !== null && ws.readyState === WebSocket.OPEN
+    if (!open) {
+      this.errLog(`watchdog: socket not open (readyState=${ws?.readyState ?? 'none'}), reconnecting`)
+      this.emit('error', new Error('websocket watchdog: socket not open'))
+      this.dropSocket('socket not open')
+      return
+    }
+    if (this.sawPong && Date.now() - this.lastPongAt > HEARTBEAT_STALE_MS) {
+      this.errLog(`watchdog: no pong for ${Math.round((Date.now() - this.lastPongAt) / 1000)}s, reconnecting`)
+      this.emit('error', new Error('websocket watchdog: heartbeat stale'))
+      this.dropSocket('heartbeat stale')
+    }
   }
 
   private stopHeartbeat(): void {
@@ -443,6 +524,10 @@ export class SmsClient extends EventEmitter {
     if (this.heartbeatTimeout) {
       clearTimeout(this.heartbeatTimeout)
       this.heartbeatTimeout = null
+    }
+    if (this.watchdogInterval) {
+      clearInterval(this.watchdogInterval)
+      this.watchdogInterval = null
     }
   }
 
@@ -461,9 +546,12 @@ export class SmsClient extends EventEmitter {
     this.emit('reconnecting', { attempt: this.reconnectAttempts })
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
-      if (!this.connected) {
-        this.connect().catch((error) => this.errLog(`reconnect failed: ${String(error)}`))
-      }
+      // `connected` alone is not trustworthy — it can be stale-true on a
+      // half-open socket — so an already OPEN socket is the only reason to skip;
+      // otherwise any dead socket is retired before the replacement dials.
+      if (this.connected && this.ws !== null && this.ws.readyState === WebSocket.OPEN) return
+      this.disconnect()
+      this.connect().catch((error) => this.errLog(`reconnect failed: ${String(error)}`))
     }, finalDelay)
   }
 }

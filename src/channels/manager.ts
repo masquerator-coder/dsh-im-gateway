@@ -16,6 +16,13 @@ export interface ChannelRuntime {
   config: ChannelConfig
   status: ChannelStatus
   detail?: string
+  /**
+   * Last turn-level failure on this channel ("已连接" says nothing about whether
+   * inbound messages are actually being answered). Set by the gateway through
+   * `onFault` and cleared when a reply is delivered again; surfaced to the panel
+   * in place of `detail` while set, so a mute-but-connected channel is visible.
+   */
+  fault?: string
   /** The live transport (set once built). */
   transport?: ChatIo
   /** Latest login QR (qq / wechat) surfaced to the UI so scan-to-login works. */
@@ -90,7 +97,9 @@ export class ChannelManager {
         type: runtime.config.type,
         name: runtime.config.name,
         status: runtime.status,
-        detail: runtime.detail,
+        // A turn-level fault outranks the transport's own note: "connected" plus
+        // a failing turn is exactly the state that used to look healthy.
+        detail: runtime.fault ?? runtime.detail,
         ...(runtime.qr !== undefined ? { qr: runtime.qr } : {}),
         ...(bound === undefined ? {} : { bound }),
       })
@@ -240,6 +249,17 @@ export class ChannelManager {
           // ALLOW ALL (never inherit the legacy global webhook allowlist, whose
           // sender-id semantics belong to the HTTP caller).
           allowlist: channel.allowlist ?? [],
+          // A turn that fails must stop the panel from claiming this channel is
+          // fine; a delivered reply clears the note again.
+          onFault: (detail: string | undefined) => {
+            if (detail === undefined) {
+              if (runtime.fault === undefined) return
+              runtime.fault = undefined
+            } else {
+              runtime.fault = `最近一次消息处理失败：${detail}`
+            }
+            this.emitStatus()
+          },
         },
       ).catch((error: unknown) => {
         this.ctx.logger.warn(`[im-gateway] ${channel.id} inbound failed: ${String(error)}`)

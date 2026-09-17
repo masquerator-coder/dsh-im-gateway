@@ -44,6 +44,14 @@ const POLL_INTERVAL_MS = 1500
 /** Per-request timeout for ilink HTTP calls. */
 const HTTP_TIMEOUT_MS = 20000
 /**
+ * Consecutive failed getupdates rounds before a bound channel stops reporting
+ * itself as connected. The round-trip is the only liveness signal this
+ * transport has: with the flag left at `connected` a dead link (revoked token,
+ * a network that moved out from under the socket) looked exactly like an idle
+ * channel — the panel said 已连接 while nothing was being received.
+ */
+const POLL_FAILURES_BEFORE_ERROR = 10
+/**
  * How long to wait before asking the gateway for a login QR again after a failed
  * attempt. Without this an unbound channel whose first `get_bot_qrcode` failed
  * (gateway hiccup, DNS, TLS) sat on the static "a QR appears here" hint forever:
@@ -52,9 +60,15 @@ const HTTP_TIMEOUT_MS = 20000
 const QR_RETRY_INTERVAL_MS = 10000
 
 /** Per-channel persisted binding state file name (mirror email state pattern). */
-function stateFileFor(channelId: string): string {
+function stateFileFor(channelId: string, stateDir?: string): string {
   const key = Buffer.from(channelId).toString('hex').slice(0, 40) || 'default'
-  return join(homedir(), '.dsh', 'im-workspace', 'wechat-state', `${key}.json`)
+  const dir = stateDir ?? join(homedir(), '.dsh', 'im-workspace', 'wechat-state')
+  return join(dir, `${key}.json`)
+}
+
+/** Default directory holding every channel's persisted binding state. */
+function defaultStateDir(): string {
+  return join(homedir(), '.dsh', 'im-workspace', 'wechat-state')
 }
 
 /** Durable per-channel binding state, persisted across restarts. */
@@ -84,6 +98,14 @@ export interface WechatIlinkOptions {
   channelId: string
   /** ilink gateway base URL (defaults to `https://ilinkai.weixin.qq.com`). */
   baseUrl?: string
+  /**
+   * Directory for the persisted binding state. Defaults to
+   * `~/.dsh/im-workspace/wechat-state`; overridable so a test (or a host that
+   * relocates its state) never touches the operator's real bind state.
+   */
+  stateDir?: string
+  /** Inbound poll cadence in ms (defaults to {@link POLL_INTERVAL_MS}). */
+  pollIntervalMs?: number
   /** Optional pre-seeded ilink bot_token (from the channel's secret field). */
   token?: string
   provider?: string
@@ -105,6 +127,7 @@ export interface WechatIlinkOptions {
 export class WechatIlinkTransport implements ChannelTransport {
   private state: WechatState
   private readonly stateFile: string
+  private readonly stateDir: string
   private timer: NodeJS.Timeout | null = null
   private started = false
   private connected = false
@@ -114,10 +137,13 @@ export class WechatIlinkTransport implements ChannelTransport {
   private qrWaiting = false
   /** Timestamp of the last `get_bot_qrcode` attempt (rate-limits retries). */
   private lastQrAttempt = 0
+  /** Consecutive failed getupdates rounds (drives the connected→error transition). */
+  private pollFailures = 0
 
   constructor(private readonly options: WechatIlinkOptions) {
     const base = (options.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '')
-    this.stateFile = stateFileFor(options.channelId)
+    this.stateDir = options.stateDir ?? defaultStateDir()
+    this.stateFile = stateFileFor(options.channelId, this.stateDir)
     this.state = emptyState(base)
     if (options.token) this.state.token = options.token
     this.state.baseUrl = base
@@ -147,7 +173,7 @@ export class WechatIlinkTransport implements ChannelTransport {
     const poll = async (): Promise<void> => {
       try { await this.pollOnce() } catch { /* transient */ }
       if (!this.started) return
-      this.timer = setTimeout(() => { void poll() }, POLL_INTERVAL_MS)
+      this.timer = setTimeout(() => { void poll() }, this.options.pollIntervalMs ?? POLL_INTERVAL_MS)
     }
     void poll()
   }
@@ -185,7 +211,7 @@ export class WechatIlinkTransport implements ChannelTransport {
 
   private async saveState(): Promise<void> {
     try {
-      await mkdir(join(homedir(), '.dsh', 'im-workspace', 'wechat-state'), { recursive: true })
+      await mkdir(this.stateDir, { recursive: true })
       await writeFile(this.stateFile, JSON.stringify(this.state), 'utf8')
     } catch (error) {
       this.options.log?.(`wechat state persist failed: ${String(error)}`)
@@ -313,20 +339,30 @@ export class WechatIlinkTransport implements ChannelTransport {
         timeoutMs: 20000,
       },
     )
-    if (r.status !== 200 || !r.json) return
+    if (r.status !== 200 || !r.json) {
+      throw new Error(`getupdates returned status ${r.status}: ${r.text.slice(0, 120)}`)
+    }
     const j = r.json
+    // Credential/session death is reported on ANY round trip, not only on the
+    // first one after start: this check used to sit inside the not-yet-connected
+    // branch, so a bound channel whose session was revoked later kept reporting
+    // "connected" on every subsequent poll and never surfaced the failure.
+    const errcode = j.errcode ?? 0
+    if (errcode === -14) {
+      this.connected = false
+      this.state.lastError = '微信连接断线：会话已失效，请重新扫码绑定'
+      this.options.onState?.('error', this.state.lastError)
+      await this.saveState().catch(() => {})
+      return
+    }
+    if (errcode !== 0) {
+      this.options.log?.(`wechat getupdates errcode=${String(errcode)} errmsg=${String(j.errmsg ?? '')}`)
+    }
     if (j.get_updates_buf) this.state.cursor = j.get_updates_buf
 
     // Treat an active getupdates round-trip as "connected" to the gateway.
+    this.pollFailures = 0
     if (!this.connected) {
-      const errcode = j.errcode ?? 0
-      if (errcode === -14) {
-        // Credentials/session dead → back to unbound.
-        this.connected = false
-        this.state.lastError = '微信连接断线：会话已失效，请重新扫码绑定'
-        this.options.onState?.('error', this.state.lastError)
-        return
-      }
       this.connected = true
       this.options.onState?.('connected')
       if (this.state.lastError) { this.state.lastError = ''; await this.saveState().catch(() => {}) }
@@ -349,6 +385,7 @@ export class WechatIlinkTransport implements ChannelTransport {
       if (from !== this.state.scannedUser) continue
       const text = this.extractText(m)
       if (text) incoming.push({ from, text })
+      else this.options.log?.(`wechat inbound frame without extractable text: ${JSON.stringify(m).slice(0, 300)}`)
     }
     if (confirmedIds.size || incoming.length) await this.saveState().catch(() => {})
     for (const it of incoming) {
@@ -383,8 +420,26 @@ export class WechatIlinkTransport implements ChannelTransport {
       // what "no QR ever appears" looks like from the panel.
       if (Date.now() - this.lastQrAttempt >= QR_RETRY_INTERVAL_MS) await this.requestQr()
     } catch (error) {
-      this.options.log?.(`wechat poll failed: ${String(error)}`)
+      this.notePollFailure(error)
     }
+  }
+
+  /**
+   * Count a failed round trip and, once they pile up, stop claiming to be
+   * connected so the panel shows a link problem instead of a healthy idle
+   * channel. Reported exactly once per failure streak (a success resets the
+   * counter and re-reports `connected`); the poll loop keeps retrying either way.
+   */
+  private notePollFailure(error: unknown): void {
+    const detail = error instanceof Error ? error.message : String(error)
+    this.pollFailures += 1
+    this.options.log?.(`wechat poll failed (${this.pollFailures}): ${detail}`)
+    if (this.pollFailures !== POLL_FAILURES_BEFORE_ERROR) return
+    this.connected = false
+    const message = `与微信网关通信失败（连续 ${this.pollFailures} 次），正在重试`
+    this.state.lastError = message
+    this.options.onState?.('error', message)
+    void this.saveState().catch(() => {})
   }
 
   /** Send a reply to the bound user through the ilink gateway. */

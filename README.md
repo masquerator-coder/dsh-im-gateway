@@ -39,6 +39,9 @@ Agents are composed **exactly like the DSH webhook / session-controller path**:
 - **Per-session serialization** — at most one in-flight turn per chat: concurrent messages queue on a per-session tail instead of overwriting each other's reply claim.
 - **Source metadata injection (on change)** — a `<dsh_im_source>{channel, senderId}</dsh_im_source>` block is prepended to the prompt **only when that source changes** for the session (its first message, or a different sender/channel), so the model still learns who/which channel asked while the block is not repeated on every bubble — the first one already remains in the replayed history. It is re-emitted when compaction shadows the span that carried it.
 - **Bounded delivery retry** — a reply is pushed through the sink with up to 2 attempts; every failure is logged and a final give-up is explicitly logged `reply NOT delivered` (no silent loss).
+- **Live-session reuse (never fight another owner)** — an Agent/Session is single-writer in the host. When the same session is already live elsewhere (the typical case: **the operator has that IM session open in the Web UI**), `resume` cannot take write ownership and `create` cannot re-enter the id — both fail. The gateway therefore reuses the live agent when the host already has one (`ctx.agents.get`, exactly like DSH's `createOrAdopt`) and never disposes an agent it did not create. Without this, opening the session in the browser silently muted the chat: the transport kept polling, reported itself connected, and every inbound message was dropped with nothing but a host-log warning.
+- **Failures are never silent** — a turn that cannot reply (agent acquisition error, acquisition timeout, model error, empty reply, delivery failure) is reported **back down the same chat** (`⚠️ 处理失败，未能回复。原因：…`) and reflected in that channel's status line, so a "已连接 but 永远不回复" channel becomes a visible, actionable error. Agent acquisition is bounded (`60s`), because an unbounded wait there used to pin the chat's serialization tail for ever and drop every later message behind it.
+- **Honest connection state** — the WeChat transport's only liveness signal is the `getupdates` round trip: 10 consecutive failures (~15 s) demote the channel from `connected` to `error` with the reason, and the next success restores `connected`. A revoked session (`errcode -14`) is reported on **any** round trip, not just the first. The CMCC socket gets an independent watchdog (socket state + ping/pong freshness) so a half-open socket after a sleep/network change is force-reconnected instead of staying silently "connected".
 
 ### IM-side confirmations (approval / user-questions)
 
@@ -82,6 +85,10 @@ The WeChat channel is a **direct client of Tencent's official ilink bot gateway*
 
 > **获取二维码失败会自动重试**：`requestQr` 无论抛异常还是返回不可用内容，都会把「获取二维码失败，正在重试…」写到状态行，并在未绑定期间每 10 秒重试一次——不会再出现「面板静静停在提示文案上」。
 
+> **「已连接」是可证伪的**：绑定通道的存活信号就是 `getupdates` 往返。连续 10 次失败（约 15 秒）会把状态从「已连接」降级为错误并写明原因（`与微信网关通信失败（连续 N 次），正在重试`），下一次成功再自动回到「已连接」；会话被吊销（`errcode -14`）在**任何**一次往返都会立刻报错，而不是只在首次连接时检查一次。所以「面板说已连接，但发消息不回复」现在只有两种可能：入站没到（状态栏会说话），或者失败原因会**直接回发到微信**（见 [Gateway safeguards](#built-in-gateway-safeguards)）。
+
+> **一个会话同时只能有一个写入者**：如果你在 Web 界面里打开着这个 IM 会话，宿主里它已经是 live 会话。插件会**复用**那个 live agent（与 DSH 自己的 `createOrAdopt` 同一规则），而不是去 resume/抢写锁；抢锁失败在旧版本里是静默的，现象正是「微信发消息不回复」。另外插件永不 dispose 不是自己创建的 agent。
+
 > **面板为什么没有 Token 输入框**：`bot_token` 只是 ilink 网关凭证，**单独拥有它并不会连接微信**——绑定是「扫码 + 解锁发消息」两步完成的，`token` 在扫码确认后由网关下发、由宿主写入 `wechat-state/`。所以它不该由用户填写（早先的版本逼着用户粘贴，反而把常见的误解坐实了）。通道记录里的 `token` 字段仍然保留：手工编辑 `settings.yaml` 预置凭证这条路径还在，宿主会优先使用 `wechat-state/` 里的绑定结果。若通道只有 token 而没有绑定微信账号（无 `scannedUser`），网关会**仍然显示登录二维码**并提示「已填写 token 但尚未绑定微信」，而不是误报「已连接」。
 
 > 边界（与参考实现一致）：ilink 网关对**主动发送严重限流**——这是通知/拍板渠道，不是聊天工具；`context_token` 只会在绑定账号先发一条消息后下发；收到 *转发* 的文章/文件收不到（需发原始链接）。绑定状态默认只发给绑定账号自己。
@@ -104,7 +111,7 @@ The QQ channel is a **direct client of the official QQ Open Platform robot gatew
 | --- | --- |
 | `src/config.ts` | Schemastery `Config` schema (legacy single-webhook tunables, incl. `allowlist`) |
 | `src/inbound.ts` | Embedded `node:http` webhook server (routes by URL path; acks `202` only after `handle()` resolves) |
-| `src/gateway.ts` | Workspace-attached session composition, rpcId reply claiming, allowlist / dedup / serialization / source injection / delivery retry |
+| `src/gateway.ts` | Workspace-attached session composition, live-agent reuse, rpcId reply claiming, allowlist / dedup / serialization / source injection / delivery retry / fault notices |
 | `src/session.ts` | Deterministic channel-scoped `im-<sha1(channel:chat_id)>` session-key derivation |
 | `src/index.ts` | Plugin entry (`name`/`inject`/`Config`/`apply` + lifecycle + `GET /im-gateway/status` route) |
 | `src/status-proto.ts` | Host↔client wire contract for live channel status (dependency-free; why a route, not a Remote namespace) |

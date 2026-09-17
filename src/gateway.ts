@@ -35,6 +35,20 @@ const DEDUP_WINDOW_MS = 5_000
 /** Bounded retries (total delivery attempts) for one reply over a flaky channel. */
 const REPLY_DELIVERY_MAX_ATTEMPTS = 2
 
+/**
+ * Safety bound on ACQUIRING the agent (live-reuse / resume / create + workspace
+ * attachment). Nothing below this point was bounded before, so a resume that
+ * never settles (a session held for write by another owner, a backend that
+ * never answers) left the chat's serialization tail pending FOR EVER: every
+ * later message queued behind it and the user saw a permanently silent
+ * channel that still reported itself as connected. Bounding acquisition turns
+ * that into a reported, retryable failure.
+ */
+const AGENT_SETUP_TIMEOUT_MS = 60_000
+
+/** Longest failure detail echoed back down a chat (keeps one notice readable). */
+const FAULT_NOTICE_MAX_CHARS = 300
+
 /** Per-message routing options resolved from the channel that received it. */
 export interface MessageRuntime {
   /** Optional provider route override for the created agent. */
@@ -70,6 +84,13 @@ export interface MessageRuntime {
    * up front. Takes precedence over the gateway-level default allowlist.
    */
   allowlist?: string[]
+  /**
+   * Observability hook for the turn's health, so a receiving channel can stop
+   * advertising a bare "connected" while every inbound message is dropped (the
+   * panel used to lie). Called with a failure detail when a turn fails, and with
+   * `undefined` once a turn's reply was delivered — i.e. the channel recovered.
+   */
+  onFault?: (detail: string | undefined) => void
 }
 
 /** A function transport supplies to push one agent reply back out. */
@@ -113,6 +134,32 @@ function timeout(ms: number): Promise<'timeout'> {
 /** Resolve after `ms`, used for bounded delivery-retry backoff. */
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => { setTimeout(resolve, ms) })
+}
+
+/**
+ * Bound one promise with a timeout so a never-settling acquisition cannot wedge
+ * a chat's serialization tail. The losing promise is NOT cancelled (the runtime
+ * has no cancellation seam here); the caller only stops waiting on it, which is
+ * why the message is reported as a failure instead of retried silently.
+ */
+async function withTimeout<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), ms)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+/** Shorten one failure detail for a chat notice (newlines collapse to one line). */
+function shortDetail(detail: string): string {
+  const flat = detail.replace(/\s+/g, ' ').trim()
+  return flat.length > FAULT_NOTICE_MAX_CHARS ? `${flat.slice(0, FAULT_NOTICE_MAX_CHARS)}…` : flat
 }
 
 /**
@@ -211,6 +258,13 @@ function defaultWorkspaceDir(): string {
  */
 export class ImGateway {
   private readonly agents = new Map<SessionId, AgentHandle>()
+  /**
+   * Sessions whose handle THIS gateway created/resumed and therefore owns.
+   * A handle adopted from another live owner (see `acquireAgent`) is tracked in
+   * `agents` but never disposed here — disposing another entry point's agent
+   * would tear down a session the Web UI is actively using.
+   */
+  private readonly owned = new Set<SessionId>()
   private readonly waiters = new Map<SessionId, ReplyWaiter>()
   private readonly workspaces = new Map<string, WorkspaceEntity>()
   /** In-flight workspace provision promises (dedups concurrent ensureWorkspace calls). */
@@ -296,8 +350,14 @@ export class ImGateway {
     const prev = this.tails.get(sessionId) ?? Promise.resolve()
     const run = prev
       .then(() => this.process(sessionId, message, reply, runtime, metaChannel))
-      .catch((error: unknown) => {
-        this.ctx.logger.warn(`[im-gateway] handle ${sessionId} failed: ${errorChain(error)}`)
+      .catch(async (error: unknown) => {
+        // Never fail silently: the chat that asked gets the reason, and the
+        // channel status stops claiming everything is fine.
+        const detail = errorChain(error)
+        this.ctx.logger.warn(`[im-gateway] handle ${sessionId} failed: ${detail}`)
+        trace(`[gw] handle FAILED session=${sessionId} err=${JSON.stringify(detail.slice(0, 400))}`)
+        runtime.onFault?.(detail)
+        await this.notifyFailure(reply, sessionId, detail)
       })
     this.tails.set(sessionId, run.finally(() => {
       if (this.tails.get(sessionId) === run) this.tails.delete(sessionId)
@@ -315,7 +375,14 @@ export class ImGateway {
   ): Promise<void> {
     let handle = this.agents.get(sessionId)
     if (handle === undefined) {
-      handle = await this.ensureAgent(sessionId, runtime)
+      // Bounded: acquisition may have to wait on another owner's session or on
+      // a slow persistence backend, and an unbounded wait here is what used to
+      // turn one bad turn into a permanently mute chat.
+      handle = await withTimeout(
+        this.acquireAgent(sessionId, runtime),
+        AGENT_SETUP_TIMEOUT_MS,
+        `agent setup for ${sessionId} timed out after ${AGENT_SETUP_TIMEOUT_MS}ms`,
+      )
       this.agents.set(sessionId, handle)
     }
 
@@ -337,6 +404,32 @@ export class ImGateway {
     }))
 
     await this.awaitReply(sessionId, wait, reply, runtime)
+  }
+
+  /**
+   * Get a usable agent for one chat: reuse a live one when the host already has
+   * it, else resume the persisted session, else create it.
+   *
+   * The live-reuse step is not an optimization — it is required for correctness.
+   * A Session is single-writer: when the same session is already live in this
+   * host (typically because the Web UI has it open, which is exactly what an
+   * operator does while debugging an IM channel), `resume` cannot take write
+   * ownership and `create` cannot re-enter the id. Both fail, and before this
+   * check every inbound message of that chat was dropped with nothing but a
+   * host-log warning: the panel kept saying "connected" while the chat was
+   * mute for ever. DSH's own API session-controller has the same rule
+   * (`createOrAdopt` returns the live agent before touching persistence), so
+   * this mirrors the supported pattern rather than inventing one.
+   */
+  private async acquireAgent(sessionId: SessionId, runtime: MessageRuntime): Promise<AgentHandle> {
+    const live = this.ctx.agents.get(sessionId)
+    if (live !== undefined) {
+      this.ctx.logger.info(`[im-gateway] reusing the live agent for ${sessionId} (owned by another entry point)`)
+      trace(`[gw] acquireAgent REUSE-LIVE session=${sessionId}`)
+      // Not owned here: another entry point created it and will dispose it.
+      return { agent: live, dispose: async () => {} }
+    }
+    return await this.ensureAgent(sessionId, runtime)
   }
 
   /** Sender access control: allow all when no allowlist, else deny-by-default. */
@@ -479,6 +572,8 @@ export class ImGateway {
       `[im-gateway] created agent ${sessionId} (workspace=${workspacePath})`
         + (selection ? ` model=${selection.provider}/${selection.model}` : ''),
     )
+    // This handle is ours: only owned handles are disposed on teardown.
+    this.owned.add(sessionId)
     return handle
   }
 
@@ -576,15 +671,29 @@ export class ImGateway {
       const text = wait.settle()
       this.waiters.delete(sessionId)
       if (text !== '') {
-        await this.deliverWithRetry(reply, text, sessionId)
+        const delivered = await this.deliverWithRetry(reply, text, sessionId)
+        if (delivered) {
+          // A reply actually reached the chat: this channel is healthy again.
+          runtime.onFault?.(undefined)
+        } else {
+          runtime.onFault?.('回复未能投递到通道')
+        }
       } else {
-        this.ctx.logger.warn(`[im-gateway] empty reply for ${sessionId}`)
+        const detail = outcome === 'timeout'
+          ? `本轮超过 ${Math.round(REPLY_TIMEOUT_MS / 1000)} 秒仍未结束`
+          : '模型本轮没有返回任何文本'
+        this.ctx.logger.warn(`[im-gateway] empty reply for ${sessionId} (${detail})`)
+        runtime.onFault?.(detail)
+        await this.notifyFailure(reply, sessionId, detail)
       }
     } catch (error: unknown) {
       wait.settle()
       this.waiters.delete(sessionId)
       this.interactions.clear(String(sessionId))
-      this.ctx.logger.warn(`[im-gateway] reply for ${sessionId} failed: ${errorChain(error)}`)
+      const detail = errorChain(error)
+      this.ctx.logger.warn(`[im-gateway] reply for ${sessionId} failed: ${detail}`)
+      runtime.onFault?.(detail)
+      await this.notifyFailure(reply, sessionId, detail)
     } finally {
       if (runtime.disposeAfterReply) {
         // Await the dispose (not fire-and-forget) so it fully completes before
@@ -600,16 +709,17 @@ export class ImGateway {
    * Push one reply through the sink with a bounded retry. Delivery failures are
    * never silent (④): every failed attempt is logged, and the final give-up is
    * explicitly marked "NOT delivered" so loss is observable by the operator.
+   * @returns whether the reply reached the channel on some attempt.
    */
-  private async deliverWithRetry(reply: ReplySink, text: string, sessionId: SessionId): Promise<void> {
+  private async deliverWithRetry(reply: ReplySink, text: string, sessionId: SessionId): Promise<boolean> {
     for (let attempt = 1; ; attempt++) {
       try {
         await reply(text)
-        return
+        return true
       } catch (error: unknown) {
         if (attempt >= REPLY_DELIVERY_MAX_ATTEMPTS) {
           this.ctx.logger.warn(`[im-gateway] reply NOT delivered for ${sessionId} after ${attempt} attempts: ${errorChain(error)}`)
-          return
+          return false
         }
         this.ctx.logger.warn(`[im-gateway] reply attempt ${attempt} failed for ${sessionId}: ${errorChain(error)}`)
         await delay(300 * attempt)
@@ -617,10 +727,34 @@ export class ImGateway {
     }
   }
 
+  /**
+   * Tell the chat that asked that its message failed, with the reason. Silence
+   * is the one outcome an IM user cannot act on: before this, a failing turn
+   * looked exactly like a healthy idle channel (and the panel agreed), so the
+   * only symptom was "已连接但永远不回复". Delivery of the notice is
+   * best-effort — a channel that cannot send is already logged by the sink.
+   */
+  private async notifyFailure(reply: ReplySink, sessionId: SessionId, detail: string): Promise<void> {
+    const notice = `⚠️ 处理失败，未能回复。\n原因：${shortDetail(detail)}`
+    try {
+      await reply(notice)
+      trace(`[gw] fault notice delivered session=${sessionId}`)
+    } catch (error: unknown) {
+      trace(`[gw] fault notice NOT delivered session=${sessionId} err=${String(error)}`)
+      this.ctx.logger.warn(`[im-gateway] fault notice for ${sessionId} not delivered: ${errorChain(error)}`)
+    }
+  }
+
   private async disposeAgent(sessionId: SessionId): Promise<void> {
     const handle = this.agents.get(sessionId)
     if (handle === undefined) return
     this.agents.delete(sessionId)
+    if (!this.owned.delete(sessionId)) {
+      // Adopted from another entry point (e.g. the Web UI has this session
+      // open): dropping our map entry is all we may do.
+      this.ctx.logger.info(`[im-gateway] releasing (not disposing) the live agent for ${sessionId}`)
+      return
+    }
     try {
       await handle.dispose()
     } catch (error: unknown) {
@@ -669,7 +803,9 @@ export class ImGateway {
     } catch (error: unknown) {
       this.ctx.logger.warn(`[im-gateway] close session/event mux: ${errorChain(error)}`)
     }
-    for (const handle of this.agents.values()) {
+    for (const [sessionId, handle] of [...this.agents]) {
+      // Adopted handles belong to another entry point; never dispose them here.
+      if (!this.owned.has(sessionId)) continue
       try {
         await handle.dispose()
       } catch (error: unknown) {
@@ -677,6 +813,7 @@ export class ImGateway {
       }
     }
     this.agents.clear()
+    this.owned.clear()
     this.waiters.clear()
     this.tails.clear()
     this.recent.clear()
