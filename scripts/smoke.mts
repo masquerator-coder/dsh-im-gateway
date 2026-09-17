@@ -21,6 +21,9 @@
  *      when the source changes for that session (first message, sender/channel
  *      change, or after a compaction shadowed the span that carried it), so a
  *      steady sender no longer repeats the block on every bubble.
+ *   8. qrSvgFor — the login QR is encoded locally from the bind URL the gateway
+ *      reports (that field is an HTML page URL, not an image), with the white
+ *      background and scalable viewBox the panel relies on.
  *
  * Real transports that need live services (email / feishu / wechat / qq / a
  * live CMCC gateway) are exercised by starting them in the plugin; this file
@@ -314,6 +317,28 @@ assert.ok(
   'clear() must force a re-attribution',
 )
 step('source metadata injection (change-only) OK')
+
+// --- 8. login QR is encoded locally ---
+// `get_bot_qrcode` returns an HTML *page* URL in `qrcode_img_content` (the page
+// draws the QR itself from `window.location.href`), so the panel cannot render
+// it as an image and must encode the URL instead. Assert the helper is a thin,
+// faithful wrapper on the encoder.
+const { qrSvgFor, QR_SIZE_PX } = await import('../src/client/qr.ts')
+assert.equal(qrSvgFor(''), '', 'no payload -> no QR markup')
+assert.equal(qrSvgFor('   '), '', 'blank payload -> no QR markup')
+const bindUrl = 'https://liteapp.weixin.qq.com/q/7GiQu1?qrcode=deadbeefdeadbeef&bot_type=3'
+const qrSvg = qrSvgFor(bindUrl)
+assert.ok(qrSvg.startsWith('<svg'), 'helper must return an svg element: ' + qrSvg.slice(0, 40))
+assert.match(qrSvg, /viewBox="0 0 \d+ \d+"/, 'the svg must be scalable so it stays crisp in the panel')
+assert.match(qrSvg, /fill="white"/, 'the QR must paint its own background (dark theme stays scannable)')
+assert.equal(qrSvgFor(bindUrl), qrSvg, 'same payload -> same markup')
+assert.notEqual(
+  qrSvgFor(bindUrl.replace('deadbeefdeadbeef', 'cafebabecafebabe')),
+  qrSvg,
+  'different payload -> different code',
+)
+assert.equal(QR_SIZE_PX, 168, 'the panel slot size is fixed')
+step('login QR encoded locally (gateway URL is a page, not an image) OK')
 
 process.stderr.write('\n✔ All local smoke checks passed.\n')
 process.exit(0)
