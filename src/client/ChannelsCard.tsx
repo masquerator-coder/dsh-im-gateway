@@ -24,14 +24,12 @@ import { ChannelsSection } from './ChannelsSection.tsx'
 export interface ChannelsCardProps {
   /* eslint-disable @typescript-eslint/no-explicit-any */
   scope: any
-  /** Host status RPC namespace (may be null when host lacks ctx.remote). */
-  imGateway: any
   t: (key: string) => string
 }
 
 /** Expandable IM-channel settings card, consistent with other system plugin cards. */
 export function ChannelsCard(props: ChannelsCardProps): React.ReactElement {
-  const { scope, imGateway, t } = props
+  const { scope, t } = props
   const [open, setOpen] = useState(false)
 
   return h('li', { style: open ? cardOpenStyle : cardStyle },
@@ -50,7 +48,7 @@ export function ChannelsCard(props: ChannelsCardProps): React.ReactElement {
     ),
     // Body: the channel-management panel, disclosed in place when open.
     open ? h('div', { style: bodyStyle },
-      h(ChannelsSection, { scope, imGateway, t }),
+      h(ChannelsSection, { scope, t }),
     ) : null,
   )
 }

@@ -24,6 +24,9 @@
  *   8. qrSvgFor — the login QR is encoded locally from the bind URL the gateway
  *      reports (that field is an HTML page URL, not an image), with the white
  *      background and scalable viewBox the panel relies on.
+ *   9. createStatusHandler — the panel's only link to the host. It is a web
+ *      route rather than a Remote namespace (those are generated and closed to
+ *      out-of-tree plugins): payload shape, auth gate, method guard.
  *
  * Real transports that need live services (email / feishu / wechat / qq / a
  * live CMCC gateway) are exercised by starting them in the plugin; this file
@@ -339,6 +342,58 @@ assert.notEqual(
 )
 assert.equal(QR_SIZE_PX, 168, 'the panel slot size is fixed')
 step('login QR encoded locally (gateway URL is a page, not an image) OK')
+
+// --- 9. channel-status route: the panel's only link to the host ---
+// DSH's `ctx.remote.<ns>` is a projection of generated descriptors and its
+// client refuses anything without a strict generated codec, so an out-of-tree
+// plugin cannot publish a namespace. The panel therefore polls a web route the
+// node half registers; this asserts the handler's contract with real req/res.
+const { createStatusHandler, channelStatusPayload } = await import('../src/status-route.ts')
+const { STATUS_ROUTE_PATH } = await import('../src/status-proto.ts')
+assert.equal(STATUS_ROUTE_PATH, '/im-gateway/status', 'route path is part of the contract')
+
+const statusRows = [
+  {
+    id: 'ch-w', type: 'wechat', name: '微信', status: 'connecting',
+    detail: '未绑定：请扫码绑定微信', qr: 'https://liteapp.weixin.qq.com/q/7GiQu1?qrcode=abcdef&bot_type=3',
+  },
+  { id: 'ch-e', type: 'email', name: '邮箱', status: 'idle' },
+]
+assert.deepEqual(
+  channelStatusPayload(statusRows).channels[1],
+  { id: 'ch-e', type: 'email', name: '邮箱', status: 'idle' },
+  'absent optionals must be dropped, not serialized as undefined',
+)
+
+let gate: 0 | 401 | 403 = 0
+const statusServer = createServer(createStatusHandler({
+  list: () => statusRows,
+  reject: () => (gate === 0 ? undefined : gate),
+}))
+await new Promise((ready) => statusServer.listen(0, '127.0.0.1', ready))
+const statusBase = `http://127.0.0.1:${statusServer.address().port}/`
+
+const statusOk = await fetch(statusBase)
+assert.equal(statusOk.status, 200)
+assert.equal(statusOk.headers.get('cache-control'), 'no-store', 'status must never be cached')
+assert.deepEqual(await statusOk.json(), channelStatusPayload(statusRows))
+
+gate = 401
+const statusDenied = await fetch(statusBase)
+assert.equal(statusDenied.status, 401, 'an unauthenticated read must be refused (live bind QR)')
+assert.equal(await statusDenied.text(), 'unauthorized')
+gate = 0
+
+const statusPosted = await fetch(statusBase, { method: 'POST' })
+assert.equal(statusPosted.status, 405, 'the route is read-only')
+assert.equal(statusPosted.headers.get('allow'), 'GET')
+
+const statusHead = await fetch(statusBase, { method: 'HEAD' })
+assert.equal(statusHead.status, 200)
+assert.equal(await statusHead.text(), '', 'HEAD must not carry a body')
+
+statusServer.close()
+step('channel-status route (payload + auth gate + method guard) OK')
 
 process.stderr.write('\n✔ All local smoke checks passed.\n')
 process.exit(0)

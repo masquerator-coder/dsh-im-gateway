@@ -8,6 +8,19 @@ import {
   CHANNELS_NS, ChannelsSettingsSchema,
 } from './channels/schema.ts'
 import { ChannelManager } from './channels/manager.ts'
+import { STATUS_ROUTE_PATH } from './status-proto.ts'
+import { createStatusHandler, type RequestGate, type WebRouteService } from './status-route.ts'
+
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    /**
+     * DSH's web route service, provided by the peer package
+     * `@deepseek-ai/dsh-host-webserver` in web profiles. Declared structurally
+     * here so this plugin needs no build-time dependency on that package.
+     */
+    webServer: WebRouteService
+  }
+}
 
 export const name = 'dsh-im-gateway'
 export const inject = ['agents']
@@ -83,22 +96,25 @@ export function apply(ctx: Context, config: ConfigType): void {
     },
   })
 
-  // Expose live channel status to the client over RPC so the UI reflects real
-  // connection state. This namespace is injected into the client half via the
-  // `remote.imGateway` service (see package.json dsh.client + client/index.ts).
-  // `ctx.get` reads a service WITHOUT requiring it in `inject`, returning
-  // undefined when the host's runtime has no `remote` service — so hosts that
-  // lack ctx.remote (e.g. the server side generally) hit the fallback below
-  // instead of throwing "cannot get property remote without inject".
-  const remote = ctx.get('remote')
-  if (remote && typeof remote.define === 'function') {
-    remote.define('imGateway', () => ({
+  // Live channel status for the settings panel, over a plugin-owned web route.
+  // A plugin cannot publish a Remote namespace (those are Typert-generated and
+  // only DSH's own client assembly may mount them — see src/status-proto.ts), so
+  // the panel fetches this route same-origin instead. It is gated by the same
+  // browser-auth check that guards `/api`: an unauthenticated local request must
+  // not be able to read a live bind QR.
+  ctx.inject(['webServer'], (webCtx: Context) => {
+    const handler = createStatusHandler({
       list: () => channelManager.statusList(),
-    }))
-  } else {
-    // Fallback for hosts without ctx.remote: no live status RPC, UI defaults.
-    ctx.logger.warn('[im-gateway] ctx.remote unavailable; live status RPC disabled')
-  }
+      // Resolved per request: the connection service mounts independently of
+      // this plugin, so an apply-time lookup could miss it.
+      reject: (req) => (webCtx.get('connection') as RequestGate | undefined)?.requestRejection?.(req),
+      log: (message) => webCtx.logger.warn(message),
+    })
+    webCtx.effect(
+      () => webCtx.webServer.register({ kind: 'exact', path: STATUS_ROUTE_PATH, handler }),
+      'dsh-im-gateway.status-route()',
+    )
+  })
 
   ctx.effect(() => {
     let started = false

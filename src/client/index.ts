@@ -15,9 +15,9 @@
  * every wire describe yet readable by the host transports via the settings
  * scope.
  *
- * Live connection status is pulled from the host RPC namespace `imGateway`
- * (wired by the node half); where the host lacks `ctx.remote` the panel falls
- * back to static labels.
+ * Live connection status is fetched by the panel from the host's
+ * `/im-gateway/status` web route (registered by the node half); a plugin cannot
+ * publish a `ctx.remote` namespace — see src/status-proto.ts.
  */
 
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
@@ -28,7 +28,7 @@ import { NS, zh, en } from './locales.ts'
 import { ChannelsCard } from './ChannelsCard.tsx'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export const inject = ['slots', 'locale', 'settingsScope', 'remote'] as any
+export const inject = ['slots', 'locale', 'settingsScope'] as any
 
 /**
  * Mount the plugin card and dictionaries.
@@ -46,22 +46,18 @@ export function apply(ctx: any): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const t = ctx.locale.bind(NS)
 
-  // Try to reach the host status RPC if the platform provides `ctx.remote`.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const remote = (ctx.remote as any) || null
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const imGateway = remote?.imGateway || null
-
   // A plugin card in the configurable-plugins tab, keyed by our settings
   // namespace so the host pairs it with the served `im-channels` section. The
   // tab declares/owns `settings.plugin.item`; we only contribute one entry.
+  // Live channel status is not injected here: the card fetches the host's
+  // `/im-gateway/status` route itself (src/status-route.ts), because DSH's
+  // Remote namespaces are generated and closed to out-of-tree plugins.
   ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
     name: 'settings.plugin.item',
     key: NS, // our settings namespace → dispatched in 插件 → 插件设置
     locale: NS,
     inject: () => ({
       scope,
-      imGateway,
       t,
     }),
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

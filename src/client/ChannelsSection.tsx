@@ -8,8 +8,11 @@
  * never come back over the wire, so on edit an empty secret field means "keep
  * the stored value".
  *
- * Live connection status is pulled from the host RPC namespace `imGateway`;
- * when the host lacks `ctx.remote` the panel falls back to static labels.
+ * Live connection status (and the WeChat bind URL to render as a QR) is polled
+ * from the host's `/im-gateway/status` web route — see src/status-proto.ts for
+ * why a plugin cannot use a `ctx.remote.<namespace>` instead. Until the first
+ * answer arrives the panel shows static "已配置" labels rather than a
+ * misleading "未连接".
  *
  * Compiled with classic-JSX; types are intentionally loose (`any` on DSH
  * client faces) because the DSH client types are not resolvable outside the
@@ -22,6 +25,7 @@ import { createElement as h, useCallback, useEffect, useMemo, useState, useSyncE
 import {
   type ChannelConfig, type ChannelType,
 } from '../channels/types.ts'
+import { STATUS_ROUTE_PATH, type ChannelStatusPayload } from '../status-proto.ts'
 import { QR_SIZE_PX, qrSvgFor } from './qr.ts'
 
 /** One editable field of a channel, keyed by the schema field name. */
@@ -167,8 +171,6 @@ function templatesFor(): Record<ChannelType, Template> {
 export interface ChannelsSectionProps {
   /* eslint-disable @typescript-eslint/no-explicit-any */
   scope: any
-  /** Host status RPC namespace (may be null when host lacks ctx.remote). */
-  imGateway: any
   t: (key: string) => string
 }
 
@@ -205,7 +207,7 @@ function requiredMissing(
 }
 
 export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement {
-  const { scope, imGateway, t } = props
+  const { scope, t } = props
   const TP = useMemo(() => templatesFor(), [])
 
   // Subscribe to the bound scope.
@@ -228,34 +230,40 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [confirmingDelete, setConfirmingDelete] = useState(false)
 
-  // Live status map: channelId -> { status, detail, qr } (pulled via RPC).
+  // Live status map: channelId -> { status, detail, qr } (pulled from the host
+  // route registered by the node half — see src/status-route.ts).
   const [status, setStatus] = useState<Record<string, { status: string; detail?: string; qr?: string }>>({})
+  /** Set once the host route has answered: only then are labels trustworthy. */
+  const [statusLoaded, setStatusLoaded] = useState(false)
 
   const resolvedActiveId: string | undefined = channels.some(ch => ch.id === activeId)
     ? activeId
     : channels[0]?.id
   const active = channels.find(ch => ch.id === resolvedActiveId)
 
-  // QR for the currently displayed channel, from the live status RPC map.
+  // QR for the currently displayed channel, from the live status map.
   const activeQr = status[resolvedActiveId ?? '']?.qr
   // Encoded once per QR payload: the gateway's string is a page URL, not an
   // image, so the scannable code has to be built here (see ./qr.ts).
   const activeQrSvg = useMemo(() => (activeQr ? qrSvgFor(activeQr) : ''), [activeQr])
 
-  // Poll live status from the host RPC (fallback: static). Polling pauses
+  // Poll live status from the host route. Same-origin, so it carries the
+  // browser-auth cookie and needs no CORS or port discovery. Polling pauses
   // while the document is hidden (e.g. another tab holds the settings pane)
   // and resumes immediately on visibility change.
   useEffect(() => {
-    if (!imGateway || typeof imGateway.list !== 'function') return
     let alive = true
     const poll = async (): Promise<void> => {
       try {
-        const list = await imGateway.list()
-        if (!alive || !Array.isArray(list)) return
+        const response = await fetch(STATUS_ROUTE_PATH, { credentials: 'same-origin', cache: 'no-store' })
+        if (!response.ok) return
+        const payload = await response.json() as ChannelStatusPayload
+        if (!alive || !Array.isArray(payload?.channels)) return
         const map: Record<string, { status: string; detail?: string; qr?: string }> = {}
-        for (const it of list) map[it.id] = { status: it.status, detail: it.detail, qr: it.qr }
+        for (const it of payload.channels) map[it.id] = { status: it.status, detail: it.detail, qr: it.qr }
         setStatus(map)
-      } catch { /* transient */ }
+        setStatusLoaded(true)
+      } catch { /* transient: keep the last known status */ }
     }
     const visible = (): boolean => (typeof document === 'undefined' || !document.hidden)
     if (visible()) void poll()
@@ -267,8 +275,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
       clearInterval(timer)
       if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibility)
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [imGateway])
+  }, [])
 
   // Fields for the current creation/selection.
   const currentType = (creating as ChannelType) ?? (active?.type as ChannelType)
@@ -476,13 +483,11 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
 
   const typeLabel = (type: ChannelType): string => t('type.' + type)
 
-  // Live status is only trustworthy when the host exposes the `imGateway` RPC
-  // namespace. Without it (host lacks `ctx.remote`) we must not fall back to a
-  // misleading "未连接"; show a static "已配置" instead.
-  const liveStatus = !!(imGateway && typeof imGateway.list === 'function')
-
+  // Live status is only trustworthy once the host route has answered. Before
+  // that (or on a host without the web carrier) show a static "已配置" instead
+  // of a misleading "未连接".
   const statusOf = (ch: ChannelConfig): string =>
-    liveStatus ? (status[ch.id]?.status ?? 'idle') : 'configured'
+    statusLoaded ? (status[ch.id]?.status ?? 'idle') : 'configured'
 
   const statusLabel = (s: string): string => {
     switch (s) {
@@ -494,7 +499,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     }
   }
 
-  const activeStatusKey = liveStatus
+  const activeStatusKey = statusLoaded
     ? (active ? statusOf(active) : creating ? 'connecting' : 'idle')
     : 'configured'
 

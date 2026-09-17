@@ -61,7 +61,11 @@ In the DSH **「插件 → 插件设置」** page an **"IM 通道设置"** card 
 | **飞书** | — | App ID + App Secret | official Lark/Feishu SDK WebSocket long connection (**vendored** into `lib/vendor/` — see [Install](#install-as-a-bundle)) |
 | **通用 HTTP** | `inboundPath` `/im`, field mapping (`chat_id`/`text`/`sender_id`) | callbackUrl + (optional) secret | shared inbound `node:http` webhook route |
 
-Each enabled channel holds a **live connection** (`connected` / `connecting` / `error` / `idle`) that the host reports back to the UI through the `imGateway` RPC (`remote.define('imGateway', { list })`, polled by the client); the UI also shows the login **QR** for 微信 scan-to-login and the connection error detail when present. Channel records live under the `im-channels` settings namespace, with secret fields (`apiKey`, `password`, `appSecret`, `token`, …) declared `role('secret')` — redacted on every wire boundary, only the host transports read them back from the settings scope.
+Each enabled channel holds a **live connection** (`connected` / `connecting` / `error` / `idle`) that the host reports back to the UI over a **plugin-owned web route** — `GET /im-gateway/status` (registered with `ctx.webServer.register`, gated by the same browser-auth check as `/api`, `cache-control: no-store`), polled by the panel every 3s and paused while the document is hidden. The panel also renders the login **QR** for 微信 scan-to-login plus the connection detail when present.
+
+> **为什么不是 `ctx.remote`**：DSH 的 `ctx.remote.<namespace>` 是 **Typert 生成** 的描述符投影 —— 浏览器侧只挂载 DSH 自带 assembly 里那份固定清单（`@deepseek-ai/dsh-api-remotes/client`），且拒绝任何没有 strict 生成 codec 的描述符（`requireStrictDescriptor`）。**树外插件无法发布 Remote namespace**，所以本插件改为注册一条同源 web 路由（也顺带复用守卫 `/api` 的浏览器鉴权 cookie）。
+
+Channel records live under the `im-channels` settings namespace, with secret fields (`apiKey`, `password`, `appSecret`, `token`, …) declared `role('secret')` — redacted on every wire boundary, only the host transports read them back from the settings scope.
 
 Every channel card exposes an **高级选项（接入控制 / 模型路由）** fold for the agent-routing fields shared with the legacy webhook: `allowlist` (one sender id per line — email address / QQ / phone / HTTP `sender_id`), `provider`, `model`, `maxTokens`, `cwd`, `agentPreset`, plus a 启用/停用 switch for the whole channel. These are applied **per channel instance**: two channels of the same kind (e.g. two `http` webhooks) never share an agent session even when their external `chat_id` collides, and a channel without its own `allowlist` allows all senders — it never inherits the legacy global webhook allowlist (whose sender-id semantics belong to that HTTP caller).
 
@@ -73,6 +77,10 @@ The WeChat channel is a **direct client of Tencent's official ilink bot gateway*
 2. **手机微信扫码**确认绑定 → ilink 下发 `bot_token`，自动持久化到 `~/.dsh/im-workspace/wechat-state/<channelId>.json`（跨重启复用，无需重复扫码）。
 3. **在微信里给新出现的 bot 联系人发一条消息**解锁发送凭证 `context_token`。
 4. 状态变为「已连接」后，绑定账号在微信里发的文本/语音转写会驱动 Agent，回复经同一 ilink 网关回送。
+
+> **关于二维码怎么画出来的**：`get_bot_qrcode` 返回的 `qrcode_img_content` **不是图片**，而是一个 HTML 页面 URL（`https://liteapp.weixin.qq.com/q/...`，`content-type: text/html`）；那个页面自己用 `toCanvas(canvas, window.location.href)` 现画二维码，所以可扫的字符串就是该 URL 本身。面板因此**本地**用 `qrcode-generator` 把同一个 URL 编码成 SVG 二维码（`src/client/qr.ts`，自绘白底、4 模块静默区，暗色主题也能扫）；旁边保留「打开登录二维码」链接作为兜底。之前把它塞进 `<img src>` 只能渲染出一个破损图。
+
+> **获取二维码失败会自动重试**：`requestQr` 无论抛异常还是返回不可用内容，都会把「获取二维码失败，正在重试…」写到状态行，并在未绑定期间每 10 秒重试一次——不会再出现「面板静静停在提示文案上」。
 
 > **关于手动填 `token`**：`bot_token` 只是 ilink 网关凭证，**单独填它并不会连接微信**——绑定是「扫码 + 解锁发消息」两步完成的，`token` 在扫码确认后由网关自动填入。若通道只有 token 而没有完成绑定的微信账号（无 `scannedUser`），网关会**仍然显示登录二维码**并明确提示「已填写 token 但尚未绑定微信」，引导你扫码并发送一条消息完成绑定，而不是误报「已连接」。
 
@@ -98,12 +106,14 @@ The QQ channel is a **direct client of the official QQ Open Platform robot gatew
 | `src/inbound.ts` | Embedded `node:http` webhook server (routes by URL path; acks `202` only after `handle()` resolves) |
 | `src/gateway.ts` | Workspace-attached session composition, rpcId reply claiming, allowlist / dedup / serialization / source injection / delivery retry |
 | `src/session.ts` | Deterministic channel-scoped `im-<sha1(channel:chat_id)>` session-key derivation |
-| `src/index.ts` | Plugin entry (`name`/`inject`/`Config`/`apply` + lifecycle + `imGateway` RPC) |
+| `src/index.ts` | Plugin entry (`name`/`inject`/`Config`/`apply` + lifecycle + `GET /im-gateway/status` route) |
+| `src/status-proto.ts` | Host↔client wire contract for live channel status (dependency-free; why a route, not a Remote namespace) |
+| `src/status-route.ts` | The status route handler (payload projection, browser-auth gate, method guard) |
 | `src/channels/types.ts` | Channel type model + status (pure types, shared client/host) |
 | `src/channels/schema.ts` | Host-side `im-channels` settings schema (SECRET fields via `role('secret')`) |
 | `src/channels/manager.ts` | Per-channel connection lifecycle, transport build, live status snapshots |
 | `src/transports/*.ts` | One real adapter per channel (http / email / cmcc / feishu / wechat / qq / qqbot), each tags its runtime with `channel` |
-| `src/client/*` | Browser half: expandable plugin card (`ChannelsCard`) wrapping the channel management UI (`ChannelsSection`), foolproof templates, live status + QR |
+| `src/client/*` | Browser half: expandable plugin card (`ChannelsCard`) wrapping the channel management UI (`ChannelsSection`), foolproof templates, live status + locally-encoded QR (`qr.ts`) |
 | `cordis.yml` | Local source overlay (`--patch`) for development / e2e iteration |
 | `cordis.patch.yml` | Published **bundle** layer — references the package by name (`dsh-im-gateway` → `lib/index.js`) |
 | `scripts/build.mjs` | esbuild build: emits `lib/index.js` (node) + `lib/client.js` (browser) + `lib/vendor/lark-sdk.cjs` (vendored Feishu SDK) |

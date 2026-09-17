@@ -46,8 +46,7 @@
       "inject": [
         "slots",
         "locale",
-        "settingsScope",
-        "remote"
+        "settingsScope"
       ]
     }
   },
