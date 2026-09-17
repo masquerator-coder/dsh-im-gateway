@@ -228,9 +228,11 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [confirmingDelete, setConfirmingDelete] = useState(false)
 
-  // Live status map: channelId -> { status, detail, qr } (pulled from the host
-  // route registered by the node half — see src/status-route.ts).
-  const [status, setStatus] = useState<Record<string, { status: string; detail?: string; qr?: string }>>({})
+  // Live status map: channelId -> { status, detail, qr, bound } (pulled from the
+  // host route registered by the node half — see src/status-route.ts).
+  const [status, setStatus] = useState<
+    Record<string, { status: string; detail?: string; qr?: string; bound?: boolean }>
+  >({})
   /** Set once the host route has answered: only then are labels trustworthy. */
   const [statusLoaded, setStatusLoaded] = useState(false)
 
@@ -244,6 +246,10 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
   // Encoded once per QR payload: the gateway's string is a page URL, not an
   // image, so the scannable code has to be built here (see ./qr.ts).
   const activeQrSvg = useMemo(() => (activeQr ? qrSvgFor(activeQr) : ''), [activeQr])
+  // Once the host reports the channel as bound there is deliberately no QR, so
+  // the panel must say so instead of the generic "a QR appears here" hint —
+  // otherwise a finished pairing looks like a broken panel.
+  const activeBound = status[resolvedActiveId ?? '']?.bound === true
 
   // Poll live status from the host route. Same-origin, so it carries the
   // browser-auth cookie and needs no CORS or port discovery. Polling pauses
@@ -257,8 +263,10 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
         if (!response.ok) return
         const payload = await response.json() as ChannelStatusPayload
         if (!alive || !Array.isArray(payload?.channels)) return
-        const map: Record<string, { status: string; detail?: string; qr?: string }> = {}
-        for (const it of payload.channels) map[it.id] = { status: it.status, detail: it.detail, qr: it.qr }
+        const map: Record<string, { status: string; detail?: string; qr?: string; bound?: boolean }> = {}
+        for (const it of payload.channels) {
+          map[it.id] = { status: it.status, detail: it.detail, qr: it.qr, bound: it.bound }
+        }
         setStatus(map)
         setStatusLoaded(true)
       } catch { /* transient: keep the last known status */ }
@@ -583,12 +591,15 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
                     }),
                     h('a', { href: activeQr, target: '_blank', rel: 'noreferrer', style: { color: '#4f8cff' } }, t('channels.openQr')),
                   )
-                // Nothing encoded yet (the host has not reported a bind URL, or
-                // the payload could not be encoded): never render a broken image
-                // — offer the official page when there is one.
+                // Nothing encoded: either the channel is already bound (nothing
+                // to scan — say so, or a finished pairing reads as a broken
+                // panel), a bind URL exists but could not be encoded, or the
+                // host has not reported one yet.
                 : activeQr
                   ? h('a', { href: activeQr, target: '_blank', rel: 'noreferrer', style: { color: '#4f8cff' } }, t('channels.openQr'))
-                  : h('span', { style: { opacity: 0.75 } }, t('channels.qrHint')) ) : null,
+                  : activeBound
+                    ? h('span', { style: { opacity: 0.75 } }, t('channels.bound'))
+                    : h('span', { style: { opacity: 0.75 } }, t('channels.qrHint')) ) : null,
             // Enable / disable switch (existing channels only; new ones start enabled).
             active && !creating ? h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
               h('button', {

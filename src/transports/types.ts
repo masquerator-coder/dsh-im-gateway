@@ -50,6 +50,16 @@ export interface ChannelTransport {
 export interface ChatIo extends ChannelTransport {
   /** Send one reply message to a chat/contact id. */
   sendText(chatId: string, text: string): Promise<void>
+  /**
+   * Whether this channel is genuinely attached to an external account, when the
+   * kind has such a notion (wechat: a completed QR bind). Absent means "not
+   * applicable" — the panel then has no bind state to report. Distinct from
+   * `isConnected()`: a wechat channel can hold a gateway credential and still be
+   * unbound, which is exactly the case that must keep showing a login QR.
+   * @returns true when bound, false when the channel kind supports binding but
+   * has not completed it, undefined when the kind has no bind concept.
+   */
+  isBound?(): boolean
 }
 
 export type { InboundMessage }

@@ -31,6 +31,7 @@ export interface StatusSnapshotLike {
   readonly status: string
   readonly detail?: string
   readonly qr?: string
+  readonly bound?: boolean
 }
 
 export interface StatusRouteDeps {
@@ -59,6 +60,7 @@ export function channelStatusPayload(rows: readonly StatusSnapshotLike[]): Chann
       status: row.status,
       ...(row.detail === undefined ? {} : { detail: row.detail }),
       ...(row.qr === undefined ? {} : { qr: row.qr }),
+      ...(row.bound === undefined ? {} : { bound: row.bound }),
     })),
   }
 }

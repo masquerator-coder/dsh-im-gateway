@@ -34,6 +34,7 @@ export const zh = {
   'channels.disabled': '未启用',
   'channels.openQr': '打开登录二维码',
   'channels.qrHint': '保存启用后，将在此显示登录二维码（扫码即可完成配置）。',
+  'channels.bound': '已绑定微信，无需再扫码（如需换绑，请删除该通道后重新创建）。',
   'channels.setup': '接入步骤',
   // 各通道的接入指引步骤（编号从 1 开始自动拼接）。二维码就排在步骤下方，
   // 所以这里不再有「二维码会出现在此处」这类步骤说明。
@@ -115,6 +116,7 @@ export const en = {
   'channels.disabled': 'disabled',
   'channels.openQr': 'Open login QR',
   'channels.qrHint': 'After saving and enabling, a login QR appears here (scan to finish setup).',
+  'channels.bound': 'WeChat is already bound — no QR needed (to bind a different account, delete this channel and create it again).',
   'channels.setup': 'Setup steps',
   'setup.wechat.0': 'Scan the QR below with WeChat and confirm the binding on your phone',
   'setup.wechat.1': 'Once bound, send the bot any message in WeChat to unlock sending',

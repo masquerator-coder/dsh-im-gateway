@@ -34,9 +34,17 @@ export interface ChannelStatusRow {
   readonly detail?: string
   /**
    * Login-QR payload. For WeChat this is the ilink bind URL — a *page* URL that
-   * the panel encodes into a QR itself (see src/client/qr.ts).
+   * the panel encodes into a QR itself (see src/client/qr.ts). Absent once the
+   * channel is bound: a bound channel needs no new code.
    */
   readonly qr?: string
+  /**
+   * Bind state for kinds that have one (wechat): `true` once the QR bind
+   * completed, `false` while it is still pending, absent for other kinds. Lets
+   * the panel tell "already bound, no QR needed" from "no QR yet" without
+   * pattern-matching a localized detail string.
+   */
+  readonly bound?: boolean
 }
 
 /** Response body of {@link STATUS_ROUTE_PATH}. */

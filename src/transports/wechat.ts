@@ -164,8 +164,10 @@ export class WechatIlinkTransport implements ChannelTransport {
    * the channel usable: without a scanned user we cannot match any inbound
    * message, so we must keep driving the QR bind instead of pretending to be
    * connected.
+   * Public because the manager reports it to the panel: a bound channel must
+   * stop advertising a login QR, and the panel must be able to say so.
    */
-  private isBound(): boolean {
+  isBound(): boolean {
     return !!this.state.token && !!this.state.scannedUser
   }
 

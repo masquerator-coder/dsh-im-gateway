@@ -22,15 +22,21 @@ export interface ChannelRuntime {
   qr?: string
 }
 
-/** Snapshot published to subscribers (and to the UI via RPC). */
+/** Snapshot published to subscribers (and to the UI via the status route). */
 export interface ChannelSnapshot {
   id: string
   type: ChannelConfig['type']
   name: string
   status: ChannelStatus
   detail?: string
-  /** Latest login QR for qq / wechat (undefined elsewhere / when none yet). */
+  /** Latest login QR for wechat (undefined elsewhere / when none is needed). */
   qr?: string
+  /**
+   * Bind state for channel kinds that have one (wechat): true once the QR bind
+   * completed, false while it is still pending. Undefined for every other kind.
+   * The panel needs this to tell "bound, no QR needed" from "no QR yet".
+   */
+  bound?: boolean
 }
 
 type StatusListener = (snapshot: ChannelSnapshot[]) => void
@@ -72,10 +78,13 @@ export class ChannelManager {
     return this.runtimes
   }
 
-  /** Status summaries, ordered like the settings list, for the UI RPC. */
+  /** Status summaries, ordered like the settings list, for the status route. */
   statusList(): ChannelSnapshot[] {
     const out: ChannelSnapshot[] = []
     for (const runtime of this.runtimes.values()) {
+      // Only transports that model binding answer this; anything else stays
+      // undefined so the panel knows there is no bind state to report.
+      const bound = runtime.transport?.isBound?.()
       out.push({
         id: runtime.config.id,
         type: runtime.config.type,
@@ -83,6 +92,7 @@ export class ChannelManager {
         status: runtime.status,
         detail: runtime.detail,
         ...(runtime.qr !== undefined ? { qr: runtime.qr } : {}),
+        ...(bound === undefined ? {} : { bound }),
       })
     }
     return out

@@ -354,13 +354,21 @@ assert.equal(STATUS_ROUTE_PATH, '/im-gateway/status', 'route path is part of the
 
 const statusRows = [
   {
-    id: 'ch-w', type: 'wechat', name: '微信', status: 'connecting',
+    id: 'ch-w', type: 'wechat', name: '微信', status: 'connecting', bound: false,
     detail: '未绑定：请扫码绑定微信', qr: 'https://liteapp.weixin.qq.com/q/7GiQu1?qrcode=abcdef&bot_type=3',
   },
+  // A bound channel: no QR on purpose, and the panel needs `bound` to say so
+  // instead of falling back to the "a QR appears here" hint.
+  { id: 'ch-w2', type: 'wechat', name: '微信(已绑定)', status: 'connected', bound: true },
   { id: 'ch-e', type: 'email', name: '邮箱', status: 'idle' },
 ]
+const projected = channelStatusPayload(statusRows).channels
+assert.equal(projected[0].bound, false, 'an unbound channel must report bound: false')
+assert.equal(projected[0].qr, statusRows[0].qr, 'the bind URL must survive projection')
+assert.equal(projected[1].bound, true, 'a bound channel must report bound: true')
+assert.equal(projected[1].qr, undefined, 'a bound channel carries no QR')
 assert.deepEqual(
-  channelStatusPayload(statusRows).channels[1],
+  projected[2],
   { id: 'ch-e', type: 'email', name: '邮箱', status: 'idle' },
   'absent optionals must be dropped, not serialized as undefined',
 )
