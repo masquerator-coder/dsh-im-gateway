@@ -28,9 +28,10 @@ Agents are composed **exactly like the DSH webhook / session-controller path**:
 
 ### Session keying & isolation
 
-- Every chat maps to a stable session id: `SessionId = im-<sha1(f"{channel}:{chat_id}")[0:16]>`.
+- Every chat maps to a stable session id: `SessionId = im-<sha1(f"{channel}:{chat_id}")[0:16]>`, or `im-<sha1(f"{channel}:{chat_id}@{cwd}")[0:16]>` when an **explicitly configured working directory** applies (a channel's own `cwd`, or the settings card's 全局默认工作目录).
 - The **receiving channel** is part of the key, so the same external chat id arriving through two different channels (e.g. email vs cmcc) never shares a session (isolation mirrors dsh-im-main's `ConversationRoute`). An empty namespace keeps the historical chatId-only key for callers that predate multi-channel.
-- The same `channel + chat_id` always reuses the same Agent (durable context); different chats are never shared.
+- The **working directory** is part of the key because a DSH session's `cwd` is pinned when the session is created: `agents.resume` restores the persisted header (`ResumeAgentOptions` has no `cwd`), and `workspaceRegistry` refuses to attach a session whose header cwd differs from the workspace path. A conversation therefore lives in one workspace for its whole life, and pointing a channel at another directory **starts a new conversation there** — the old session stays in its old workspace (still openable in the Web UI). Silently resuming the old one is what used to make a changed working directory look ignored. The key is unchanged (and every existing IM session keeps its id) when no directory is configured: `cordis.yml`'s `cwd` stays a pure deployment fallback and does not scope the identity.
+- The same `channel + chat_id` (+ the same working directory) always reuses the same Agent (durable context); different chats are never shared.
 
 ### Built-in gateway safeguards
 
@@ -71,6 +72,10 @@ Each enabled channel holds a **live connection** (`connected` / `connecting` / `
 Channel records live under the `im-channels` settings namespace, with secret fields (`apiKey`, `password`, `appSecret`, `token`, …) declared `role('secret')` — redacted on every wire boundary, only the host transports read them back from the settings scope.
 
 Every channel card exposes an **高级选项（接入控制 / 模型路由）** fold for the agent-routing fields shared with the legacy webhook: `allowlist` (one sender id per line — email address / QQ / phone / HTTP `sender_id`), `provider`, `model`, `maxTokens`, `cwd`, `agentPreset`, plus a 启用/停用 switch for the whole channel. These are applied **per channel instance**: two channels of the same kind (e.g. two `http` webhooks) never share an agent session even when their external `chat_id` collides, and a channel without its own `allowlist` allows all senders — it never inherits the legacy global webhook allowlist (whose sender-id semantics belong to that HTTP caller).
+
+Above the two columns the card carries one **section-level** field, **全局默认工作目录** (`im-channels.cwd`): the working directory (a real Harness workspace, holding the session log and giving the agent its file scope) used by every channel that has no `cwd` of its own — a channel's own `cwd` always wins. Resolution order per inbound message: **通道 `cwd` → 设置页全局默认 → `cordis.yml` 的 `cwd` → `~/.dsh/im-workspace`**. It is read when the message arrives, so saving it applies to the next message on every channel **without reconnecting anything**; only a change to a channel's *own* record restarts that channel (an unrelated save no longer bounces every enabled connection).
+
+Because a DSH session's `cwd` is pinned at creation (and the workspace registry refuses to attach a session whose header cwd differs), a changed working directory **starts a new conversation in the new directory** on that chat's next message: the old session stays in its old workspace and remains openable in the Web UI, while the chat continues with a fresh context in the directory you configured (see [Session keying](#session-keying--isolation)). A chat that never configured a directory keeps its session id, so nothing is reset by the upgrade itself.
 
 ### 微信通道（直连官方 ilink 网关）
 
@@ -133,12 +138,12 @@ pnpm qq-probe <appId> <appSecret> [--ints c2c,public_guild] [--sandbox] [--secon
 | `src/config.ts` | Schemastery `Config` schema (legacy single-webhook tunables, incl. `allowlist`) |
 | `src/inbound.ts` | Embedded `node:http` webhook server (routes by URL path; acks `202` only after `handle()` resolves) |
 | `src/gateway.ts` | Workspace-attached session composition, live-agent reuse, rpcId reply claiming, allowlist / dedup / serialization / source injection / delivery retry / fault notices |
-| `src/session.ts` | Deterministic channel-scoped `im-<sha1(channel:chat_id)>` session-key derivation |
+| `src/session.ts` | Deterministic session-key derivation: `im-<sha1(channel:chat_id[@cwd])>`, channel-isolated and scoped to an explicitly configured working directory |
 | `src/index.ts` | Plugin entry (`name`/`inject`/`Config`/`apply` + lifecycle + `GET /im-gateway/status` route) |
 | `src/status-proto.ts` | Host↔client wire contract for live channel status (dependency-free; why a route, not a Remote namespace) |
 | `src/status-route.ts` | The status route handler (payload projection, browser-auth gate, method guard) |
 | `src/channels/types.ts` | Channel type model + status (pure types, shared client/host) |
-| `src/channels/schema.ts` | Host-side `im-channels` settings schema (SECRET fields via `role('secret')`) |
+| `src/channels/schema.ts` | Host-side `im-channels` settings schema (SECRET fields via `role('secret')`, plus the plugin-wide default `cwd`) |
 | `src/channels/manager.ts` | Per-channel connection lifecycle, transport build, live status snapshots |
 | `src/transports/*.ts` | One real adapter per channel (http / email / cmcc / feishu / wechat / qq / qqbot), each tags its runtime with `channel` |
 | `src/client/*` | Browser half: expandable plugin card (`ChannelsCard`) wrapping the channel management UI (`ChannelsSection`), foolproof templates, live status + locally-encoded QR (`qr.ts`) |
@@ -146,7 +151,7 @@ pnpm qq-probe <appId> <appSecret> [--ints c2c,public_guild] [--sandbox] [--secon
 | `cordis.patch.yml` | Published **bundle** layer — references the package by name (`dsh-im-gateway` → `lib/index.js`) |
 | `scripts/build.mjs` | esbuild build: emits `lib/index.js` (node) + `lib/client.js` (browser) + `lib/vendor/lark-sdk.cjs` (vendored Feishu SDK) |
 | `scripts/check-install-scripts.mjs` | Build guard: fails if any *runtime* dependency (transitively) ships an install-time script |
-| `scripts/smoke.mts` | Local smoke test (session hashing, HTTP route, reply callback, CMCC failure, vendored Feishu SDK, WeChat QR/liveness, QQ handshake/close-codes/watchdog/sends) |
+| `scripts/smoke.mts` | Local smoke test (session hashing, HTTP route, reply callback, CMCC failure, vendored Feishu SDK, WeChat QR/liveness, QQ handshake/close-codes/watchdog/sends, default-cwd precedence) |
 | `scripts/qq-probe.mts` | QQ 真机探针 (`pnpm qq-probe <appId> <appSecret>`): token → gateway → WS handshake → inbound → passive reply, prints the platform's own answer |
 | `lib/` | **Committed** build output — no `prepare`; git installs mount it as-is. Rebuild & commit together with every `src/` change |
 | `lib/vendor/lark-sdk.cjs` | **Committed** vendored third-party (Feishu SDK, MIT) — generated by `scripts/build.mjs`, never edited by hand |
@@ -177,7 +182,7 @@ pnpm qq-probe <appId> <appSecret> [--ints c2c,public_guild] [--sandbox] [--secon
 | `model` | `''` | Model id override (empty = runtime default model) |
 | `maxTokens` | `0` | Positive output cap, or 0 for default |
 | `agentPreset` | `''` | Optional agent preset applied on creation |
-| `cwd` | `''` | Optional working directory for the Agent session (a real Harness workspace) |
+| `cwd` | `''` | Optional working directory for the Agent session (a real Harness workspace). Fallback only: a channel's own `cwd` and the settings card's 全局默认工作目录 take precedence (`~/.dsh/im-workspace` when nothing is set) |
 | `disposeAfterReply` | `false` | Dispose the Agent after each reply (frees resources, drops context) |
 
 > ⚠️ Only `host`/`port`/`inboundPath`/`chatIdField`/`textField`/`senderField`/`allowlist`/`callbackChatHeader`/`callbackSecretHeader`

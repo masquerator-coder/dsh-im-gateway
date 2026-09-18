@@ -26,6 +26,13 @@ const SECRET = (): z<any> => z.string().required(false).role('secret')
 
 /** schemastery schema for the `im-channels` namespace. */
 export const ChannelsSettingsSchema: z<ChannelsSettings> = z.object({
+  /**
+   * Plugin-wide default working directory for the Agent sessions of every
+   * channel that does not carry its own `cwd` below. Optional with no default:
+   * absent = "no plugin-wide choice", which leaves the legacy `Config.cwd` and
+   * then `~/.dsh/im-workspace` as the fallbacks (see ChannelManager).
+   */
+  cwd: z.string().required(false),
   channels: z.array(z.object({
     id: z.string().required(),
     type: z.union([...CHANNEL_TYPES]).required(),

@@ -4,7 +4,9 @@
  *
  * Verifies the pieces that can run without a live DSH host or external IM
  * services:
- *   1. sessionIdForChat — deterministic per-chat agent session-id strings.
+ *   1. sessionIdForChat — deterministic per-chat agent session-id strings, with
+ *      the legacy (no channel / no working directory) keys frozen and an
+ *      explicitly configured working directory folded into the identity.
  *   2. InboundHttpServer — POST a message to a registered route, confirm parse
  *      + dispatch + 202 ack, and the 404 / 401 guard rails.
  *   3. HttpTransport — the per-channel reply callback receives the payload.
@@ -42,6 +44,9 @@
  *      reconnected; and send errors are surfaced (never silently swallowed).
  *  12. QQ intent/close-code helpers — parseIntents / diagnoseClose / chunkText /
  *      apiFailure, the pure parts the transport's honesty depends on.
+ *  13. Default working directory — resolveChannelCwd (a channel's own `cwd`
+ *      beats the plugin-wide default from the settings card) and the
+ *      `im-channels.cwd` schema field itself.
  *
  * Real transports that need live services (email / feishu / wechat / qq / a
  * live CMCC gateway) are exercised by starting them in the plugin; this file
@@ -80,6 +85,30 @@ const c = sessionIdForChat('chat-456')
 assert.equal(a, b, 'same chat -> same session id')
 assert.notEqual(a, c, 'different chat -> different session id')
 assert.ok(String(a).startsWith('im-'), 'session id stamped with im- prefix')
+// Frozen legacy keys: the digest seeds for a chat with no configured working
+// directory must stay byte-identical, or every live IM chat silently resets.
+assert.equal(sessionIdForChat('chat-123'), 'im-1bc8e29e57550e2a', 'the bare chatId key must not change')
+assert.equal(sessionIdForChat('chat-123', 'cmcc'), 'im-2280b012dec09004', 'the channel-scoped key must not change')
+
+// An explicitly configured working directory scopes the conversation: DSH pins
+// a session's cwd at creation (resume restores the persisted header and the
+// workspace registry refuses to attach a session whose cwd differs), so another
+// directory has to be another session — resuming the old one is what made a
+// changed working directory look ignored.
+const scoped = sessionIdForChat('chat-123', 'cmcc', 'C:\\work\\im')
+assert.notEqual(scoped, sessionIdForChat('chat-123', 'cmcc'), 'a configured cwd must start its own conversation')
+assert.equal(scoped, sessionIdForChat('chat-123', 'cmcc', 'C:\\work\\im'), 'stable for the same directory')
+assert.notEqual(scoped, sessionIdForChat('chat-123', 'cmcc', 'C:\\work\\other'), 'another directory is another conversation')
+assert.equal(
+  scoped,
+  sessionIdForChat('chat-123', 'cmcc', '  C:\\work\\im\\  '),
+  'surrounding whitespace / a trailing separator name the same workspace',
+)
+assert.notEqual(
+  sessionIdForChat('chat-123', 'cmcc', 'C:\\'),
+  sessionIdForChat('chat-123', 'cmcc', 'C:'),
+  'a drive root must not collapse into a drive-relative path',
+)
 step(`sessionIdForChat OK: ${a}`)
 
 // --- 1b. email reply-address parsing (compound chatId -> real recipient) ---
@@ -850,6 +879,35 @@ assert.equal(apiFailure(500, null, 'boom').code, 500, 'an unparseable failure fa
 assert.ok(new QqApiError('x', 1) instanceof Error)
 assert.ok(new QqFatalError('y') instanceof QqFatalError)
 step('QQ intent/close-code/chunk/api helpers OK')
+
+// --- 13. plugin-wide default working directory (settings card) ---
+// Precedence: a channel's OWN cwd wins, else the plugin-wide default set on the
+// settings card, else nothing (which leaves the gateway's Config.cwd and
+// ~/.dsh/im-workspace fallbacks in charge).
+const { resolveChannelCwd, channelRecordChanged } = await import('../src/channels/manager.ts')
+assert.equal(resolveChannelCwd('/chan/dir', '/global/dir'), '/chan/dir', "a channel's own cwd must win")
+assert.equal(resolveChannelCwd('  /chan/dir  ', '/global/dir'), '/chan/dir', "a channel's own cwd is trimmed")
+assert.equal(resolveChannelCwd(undefined, '/global/dir'), '/global/dir', 'a channel without cwd inherits the default')
+assert.equal(resolveChannelCwd('', '/global/dir'), '/global/dir', 'an empty channel cwd is "not set"')
+assert.equal(resolveChannelCwd('   ', '  /global/dir  '), '/global/dir', 'whitespace is not a directory')
+assert.equal(resolveChannelCwd(undefined, ''), undefined, 'no choice anywhere leaves the gateway fallbacks in charge')
+assert.equal(resolveChannelCwd('', undefined), undefined)
+assert.equal(resolveChannelCwd(undefined, undefined), undefined)
+
+const { ChannelsSettingsSchema } = await import('../src/channels/schema.ts')
+const withCwd = ChannelsSettingsSchema({ cwd: '/srv/im', channels: [] })
+assert.equal(withCwd.cwd, '/srv/im', 'the settings card value is stored on the section root')
+assert.deepEqual(withCwd.channels, [])
+const withoutCwd = ChannelsSettingsSchema({ channels: [] })
+assert.equal(withoutCwd.cwd, undefined, 'an untouched field stays unset (no bogus default directory)')
+
+// The restart gate: only a channel whose OWN record changed may be restarted, so
+// saving the section-level default (or another channel) never bounces this one.
+const record = { id: 'ch-a', type: 'http', name: 'A', enabled: true, callbackUrl: 'https://x.example/reply' } as const
+assert.equal(channelRecordChanged(record, { ...record }), false, 'a re-resolved identical record is not a change')
+assert.equal(channelRecordChanged(record, { ...record, cwd: '/other' }), true, "the channel's own edit is a change")
+assert.equal(channelRecordChanged(record, { ...record, enabled: false }), true)
+step('plugin-wide default cwd precedence OK')
 
 process.stderr.write('\n✔ All local smoke checks passed.\n')
 process.exit(0)

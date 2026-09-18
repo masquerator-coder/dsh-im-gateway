@@ -92,7 +92,7 @@ const ADVANCED_HINTS: Record<string, string> = {
   provider: '模型 Provider 路由（留空 = 使用运行时默认模型）',
   model: '模型 ID（留空 = 使用运行时默认模型）',
   maxTokens: '单轮输出上限（0 = 不限制）',
-  cwd: 'Agent 工作目录（留空 = ~/.dsh/im-workspace）',
+  cwd: 'Agent 工作目录（留空 = 使用上面的全局默认工作目录）；改动会让该通道在新目录里开始新会话，旧会话仍留在原工作区',
   agentPreset: 'Agent 预设名（留空 = 默认）',
 }
 
@@ -223,6 +223,8 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     useCallback(() => scope.getSnapshot(), [scope]),
   )
   const channels: ChannelConfig[] = snapshot?.value?.channels ?? []
+  /** Host value of the plugin-wide default working directory (may be absent). */
+  const hostCwd: string = snapshot?.value?.cwd ?? ''
 
   const [activeId, setActiveId] = useState<string | undefined>(
     channels.length > 0 ? channels[0]!.id : undefined,
@@ -236,6 +238,12 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
   const [noticeIsError, setNoticeIsError] = useState(false)
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [confirmingDelete, setConfirmingDelete] = useState(false)
+  /**
+   * Draft for the plugin-wide default working directory. `null` = "no local
+   * edit yet", so the box follows the host value (including a change made by
+   * another editor) until the user actually types.
+   */
+  const [cwdDraft, setCwdDraft] = useState<string | null>(null)
 
   // Live status map: channelId -> { status, detail, qr, bound } (pulled from the
   // host route registered by the node half — see src/status-route.ts).
@@ -496,6 +504,31 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     }
   }, [active, channels, scope, t])
 
+  /** Plugin-wide default working dir as shown in the box (a local draft wins). */
+  const defaultCwd = cwdDraft ?? hostCwd
+
+  /**
+   * Persist the plugin-wide default working directory — the fallback for every
+   * channel that does not carry its own `cwd` (a channel's own value always
+   * wins). The host resolves it per inbound message, so saving this needs no
+   * channel restart.
+   */
+  const saveDefaultCwd = useCallback(async (): Promise<void> => {
+    setBusy(true)
+    setNotice('')
+    setNoticeIsError(false)
+    try {
+      await scope.set('cwd', defaultCwd.trim())
+      setCwdDraft(null)
+      setNotice(t('channels.saved'))
+    } catch (error) {
+      setNotice(`${t('channels.saveFailed')}: ${String(error)}`)
+      setNoticeIsError(true)
+    } finally {
+      setBusy(false)
+    }
+  }, [defaultCwd, scope, t])
+
   const typeLabel = (type: ChannelType): string => t('type.' + type)
 
   // Live status is only trustworthy once the host route has answered. Before
@@ -518,174 +551,199 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     ? (active ? statusOf(active) : creating ? 'connecting' : 'idle')
     : 'configured'
 
-  return h('div', { style: { display: 'flex', gap: '20px', padding: '4px 0' } },
-    // LEFT: channel list / pickers.
-    h('div', { style: { width: '220px', flex: '0 0 auto', borderRight: '1px solid rgba(128,128,128,0.25)', paddingRight: '12px' } },
-      h('div', { style: { fontSize: '13px', fontWeight: 600, marginBottom: '8px' } }, t('channels.add')),
-      h('div', { style: { display: 'grid', gap: '6px' } },
-        (['wechat', 'qq', 'email', 'cmcc', 'feishu', 'http'] as ChannelType[]).map(type =>
+  return h('div', { style: { display: 'grid', gap: '14px', padding: '4px 0' } },
+    // Plugin-wide default working directory. It belongs to the whole section,
+    // not to one channel, so it sits ABOVE the list/form columns and stays
+    // visible whatever is selected (or while nothing is).
+    h('div', { style: defaultCwdStyle },
+      h('div', { style: { display: 'grid', gap: '4px' } },
+        h('label', { style: labelStyle }, t('global.cwd')),
+        h('div', { style: { display: 'flex', gap: '8px' } },
+          h('input', {
+            value: defaultCwd,
+            placeholder: 'D:\\work\\im 或 /home/me/im',
+            onChange: (e: React.ChangeEvent<HTMLInputElement>) => setCwdDraft(e.target.value),
+            style: inputStyle,
+          }),
           h('button', {
-            key: type,
             type: 'button',
-            onClick: () => beginCreate(type),
-            style: listButtonStyle,
-          },
-            h('span', null, typeLabel(type)),
-          ),
+            disabled: busy,
+            onClick: () => void saveDefaultCwd(),
+            style: { ...ghostStyle, padding: '8px 14px', whiteSpace: 'nowrap' },
+          }, t('channels.save')),
         ),
+        h('span', { style: { fontSize: '11px', opacity: 0.55 } }, t('global.cwdHint')),
       ),
-      channels.length > 0 ? h('div', { style: { marginTop: '14px' } },
-        h('div', { style: { fontSize: '12px', opacity: 0.7, marginBottom: '6px' } }, t('channels.existing')),
+    ),
+    h('div', { style: { display: 'flex', gap: '20px' } },
+      // LEFT: channel list / pickers.
+      h('div', { style: { width: '220px', flex: '0 0 auto', borderRight: '1px solid rgba(128,128,128,0.25)', paddingRight: '12px' } },
+        h('div', { style: { fontSize: '13px', fontWeight: 600, marginBottom: '8px' } }, t('channels.add')),
         h('div', { style: { display: 'grid', gap: '6px' } },
-          channels.map(ch =>
-            h('div', {
-              key: ch.id,
-              onClick: () => select(ch.id),
-              style: {
-                padding: '7px 10px', borderRadius: '8px', cursor: 'pointer', fontSize: '13px',
-                border: resolvedActiveId === ch.id ? '1px solid #4f8cff' : '1px solid rgba(128,128,128,0.25)',
-                background: resolvedActiveId === ch.id ? 'rgba(79,140,255,0.08)' : 'transparent',
-              },
+          (['wechat', 'qq', 'email', 'cmcc', 'feishu', 'http'] as ChannelType[]).map(type =>
+            h('button', {
+              key: type,
+              type: 'button',
+              onClick: () => beginCreate(type),
+              style: listButtonStyle,
             },
-              h('div', { style: { fontWeight: 600 } }, ch.name),
-              h('div', { style: { fontSize: '11px', opacity: 0.65 } },
-                typeLabel(ch.type) + ' · ' + statusLabel(statusOf(ch)) + (ch.enabled ? '' : ' · ' + t('channels.disabled'))),
+              h('span', null, typeLabel(type)),
             ),
           ),
         ),
-      ) : null,
-    ),
-    // RIGHT: form for the selected channel.
-    h('div', { style: { flex: '1 1 auto', minWidth: '0' } },
-      notice !== '' ? h('div', { style: { color: noticeIsError ? '#ff7a7a' : '#57d18a', fontSize: '12px', marginBottom: '8px' } }, notice) : null,
-      creating !== null || active
-        ? h('div', { style: { display: 'grid', gap: '12px' } },
-            // Status line
-            h('div', { style: { fontSize: '12px', opacity: currentType ? 0.8 : 0.6 } },
-              `${typeLabel(currentType)} · ${statusLabel(activeStatusKey)}`
-              + (status[resolvedActiveId ?? '']?.detail ? ` — ${status[resolvedActiveId ?? '']!.detail}` : ''),
+        channels.length > 0 ? h('div', { style: { marginTop: '14px' } },
+          h('div', { style: { fontSize: '12px', opacity: 0.7, marginBottom: '6px' } }, t('channels.existing')),
+          h('div', { style: { display: 'grid', gap: '6px' } },
+            channels.map(ch =>
+              h('div', {
+                key: ch.id,
+                onClick: () => select(ch.id),
+                style: {
+                  padding: '7px 10px', borderRadius: '8px', cursor: 'pointer', fontSize: '13px',
+                  border: resolvedActiveId === ch.id ? '1px solid #4f8cff' : '1px solid rgba(128,128,128,0.25)',
+                  background: resolvedActiveId === ch.id ? 'rgba(79,140,255,0.08)' : 'transparent',
+                },
+              },
+                h('div', { style: { fontWeight: 600 } }, ch.name),
+                h('div', { style: { fontSize: '11px', opacity: 0.65 } },
+                  typeLabel(ch.type) + ' · ' + statusLabel(statusOf(ch)) + (ch.enabled ? '' : ' · ' + t('channels.disabled'))),
+              ),
             ),
-            // Setup guidance callout: what this channel is + the short version of
-            // what to do on the IM side. The QR follows immediately below it —
-            // that code is what the user came for, so it must not sit under the
-            // config fields.
-            currentType ? h('div', { style: setupCalloutStyle },
-              h('div', { style: { fontWeight: 600, fontSize: '12px', marginBottom: '4px' } }, t('channels.setup')),
-              h('div', { style: { fontSize: '11.5px', opacity: 0.85, marginBottom: '6px' } }, t('type.' + currentType + '.desc')),
-              h('ol', { style: { margin: 0, paddingLeft: '18px', fontSize: '11.5px', opacity: 0.9, display: 'grid', gap: '3px' } },
-                (SETUP_STEPS[currentType] ?? []).map(stepKey =>
-                  h('li', { key: stepKey }, t(stepKey)),
+          ),
+        ) : null,
+      ),
+      // RIGHT: form for the selected channel.
+      h('div', { style: { flex: '1 1 auto', minWidth: '0' } },
+        notice !== '' ? h('div', { style: { color: noticeIsError ? '#ff7a7a' : '#57d18a', fontSize: '12px', marginBottom: '8px' } }, notice) : null,
+        creating !== null || active
+          ? h('div', { style: { display: 'grid', gap: '12px' } },
+              // Status line
+              h('div', { style: { fontSize: '12px', opacity: currentType ? 0.8 : 0.6 } },
+                `${typeLabel(currentType)} · ${statusLabel(activeStatusKey)}`
+                + (status[resolvedActiveId ?? '']?.detail ? ` — ${status[resolvedActiveId ?? '']!.detail}` : ''),
+              ),
+              // Setup guidance callout: what this channel is + the short version of
+              // what to do on the IM side. The QR follows immediately below it —
+              // that code is what the user came for, so it must not sit under the
+              // config fields.
+              currentType ? h('div', { style: setupCalloutStyle },
+                h('div', { style: { fontWeight: 600, fontSize: '12px', marginBottom: '4px' } }, t('channels.setup')),
+                h('div', { style: { fontSize: '11.5px', opacity: 0.85, marginBottom: '6px' } }, t('type.' + currentType + '.desc')),
+                h('ol', { style: { margin: 0, paddingLeft: '18px', fontSize: '11.5px', opacity: 0.9, display: 'grid', gap: '3px' } },
+                  (SETUP_STEPS[currentType] ?? []).map(stepKey =>
+                    h('li', { key: stepKey }, t(stepKey)),
+                  ),
+                ),
+              ) : null,
+              // Login QR — wechat only. The qq transport authenticates with
+              // AppID/AppSecret over the WebSocket gateway and never reports a QR
+              // (only the wechat branch wires the transport's `onQr`), so the
+              // fallback hint there would be pure noise. The gateway hands over a
+              // URL whose page draws its own QR, so the panel encodes that URL
+              // locally (see ./qr.ts) — feeding it to an `<img src>` only ever
+              // produced a broken image.
+              currentType === 'wechat' ? h('div', { style: { fontSize: '12px' } },
+                activeQrSvg !== ''
+                  ? h('div', { style: { display: 'grid', gap: '6px', justifyItems: 'start' } },
+                      h('div', {
+                        style: {
+                          width: QR_SIZE_PX + 'px', height: QR_SIZE_PX + 'px', borderRadius: '8px',
+                          border: '1px solid rgba(128,128,128,0.35)', background: '#fff',
+                          overflow: 'hidden', lineHeight: 0,
+                        },
+                        // Data-driven SVG generated by the QR encoder: the payload
+                        // selects modules, it is never interpolated into markup.
+                        dangerouslySetInnerHTML: { __html: activeQrSvg },
+                      }),
+                      h('a', { href: activeQr, target: '_blank', rel: 'noreferrer', style: { color: '#4f8cff' } }, t('channels.openQr')),
+                    )
+                  // Nothing encoded: either the channel is already bound (nothing
+                  // to scan — say so, or a finished pairing reads as a broken
+                  // panel), a bind URL exists but could not be encoded, or the
+                  // host has not reported one yet.
+                  : activeQr
+                    ? h('a', { href: activeQr, target: '_blank', rel: 'noreferrer', style: { color: '#4f8cff' } }, t('channels.openQr'))
+                    : activeBound
+                      ? h('span', { style: { opacity: 0.75 } }, t('channels.bound'))
+                      : h('span', { style: { opacity: 0.75 } }, t('channels.qrHint')) ) : null,
+              // Enable / disable switch (existing channels only; new ones start enabled).
+              active && !creating ? h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+                h('button', {
+                  type: 'button',
+                  disabled: busy,
+                  onClick: () => void toggleEnabled(),
+                  style: { ...ghostStyle, padding: '5px 12px', fontSize: '12px' },
+                }, active.enabled ? t('channels.disable') : t('channels.enable')),
+                h('span', { style: { fontSize: '12px', opacity: 0.7 } },
+                  active.enabled ? t('channels.enabledHint') : t('channels.disabledHint')),
+              ) : null,
+              h('div', { style: { display: 'grid', gap: '4px' } },
+                h('label', { style: labelStyle }, t('field.name')),
+                h('input', { value: draftName, onChange: (e: React.ChangeEvent<HTMLInputElement>) => setDraftName(e.target.value), style: inputStyle }),
+              ),
+              // Email provider picker (only for email).
+              currentType === 'email' ? h('div', { style: { display: 'grid', gap: '4px' } },
+                h('label', { style: labelStyle }, t('field.provider')),
+                h('select', {
+                  value: provider,
+                  onChange: (e: React.ChangeEvent<HTMLSelectElement>) => setProvider(e.target.value),
+                  style: inputStyle,
+                },
+                  EMAIL_PROVIDERS.map(p => h('option', { key: p.id, value: p.id }, p.label)),
+                ),
+              ) : null,
+              // Fields
+              ...currentFields.map(f =>
+                h('div', { key: f.key, style: { display: 'grid', gap: '4px' } },
+                  h('label', { style: labelStyle }, t(f.labelKey)
+                    + (f.secret && activeSecretSet ? ` (${t('credential.set')})` : '')),
+                  h('input', {
+                    type: f.secret ? 'password' : 'text',
+                    placeholder: f.placeholder ?? '',
+                    value: draft[f.key] ?? '',
+                    onChange: (e: React.ChangeEvent<HTMLInputElement>) =>
+                      setDraft(prev => ({ ...prev, [f.key]: e.target.value })),
+                    style: inputStyle,
+                  }),
                 ),
               ),
-            ) : null,
-            // Login QR — wechat only. The qq transport authenticates with
-            // AppID/AppSecret over the WebSocket gateway and never reports a QR
-            // (only the wechat branch wires the transport's `onQr`), so the
-            // fallback hint there would be pure noise. The gateway hands over a
-            // URL whose page draws its own QR, so the panel encodes that URL
-            // locally (see ./qr.ts) — feeding it to an `<img src>` only ever
-            // produced a broken image.
-            currentType === 'wechat' ? h('div', { style: { fontSize: '12px' } },
-              activeQrSvg !== ''
-                ? h('div', { style: { display: 'grid', gap: '6px', justifyItems: 'start' } },
-                    h('div', {
-                      style: {
-                        width: QR_SIZE_PX + 'px', height: QR_SIZE_PX + 'px', borderRadius: '8px',
-                        border: '1px solid rgba(128,128,128,0.35)', background: '#fff',
-                        overflow: 'hidden', lineHeight: 0,
-                      },
-                      // Data-driven SVG generated by the QR encoder: the payload
-                      // selects modules, it is never interpolated into markup.
-                      dangerouslySetInnerHTML: { __html: activeQrSvg },
-                    }),
-                    h('a', { href: activeQr, target: '_blank', rel: 'noreferrer', style: { color: '#4f8cff' } }, t('channels.openQr')),
-                  )
-                // Nothing encoded: either the channel is already bound (nothing
-                // to scan — say so, or a finished pairing reads as a broken
-                // panel), a bind URL exists but could not be encoded, or the
-                // host has not reported one yet.
-                : activeQr
-                  ? h('a', { href: activeQr, target: '_blank', rel: 'noreferrer', style: { color: '#4f8cff' } }, t('channels.openQr'))
-                  : activeBound
-                    ? h('span', { style: { opacity: 0.75 } }, t('channels.bound'))
-                    : h('span', { style: { opacity: 0.75 } }, t('channels.qrHint')) ) : null,
-            // Enable / disable switch (existing channels only; new ones start enabled).
-            active && !creating ? h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
-              h('button', {
-                type: 'button',
-                disabled: busy,
-                onClick: () => void toggleEnabled(),
-                style: { ...ghostStyle, padding: '5px 12px', fontSize: '12px' },
-              }, active.enabled ? t('channels.disable') : t('channels.enable')),
-              h('span', { style: { fontSize: '12px', opacity: 0.7 } },
-                active.enabled ? t('channels.enabledHint') : t('channels.disabledHint')),
-            ) : null,
-            h('div', { style: { display: 'grid', gap: '4px' } },
-              h('label', { style: labelStyle }, t('field.name')),
-              h('input', { value: draftName, onChange: (e: React.ChangeEvent<HTMLInputElement>) => setDraftName(e.target.value), style: inputStyle }),
-            ),
-            // Email provider picker (only for email).
-            currentType === 'email' ? h('div', { style: { display: 'grid', gap: '4px' } },
-              h('label', { style: labelStyle }, t('field.provider')),
-              h('select', {
-                value: provider,
-                onChange: (e: React.ChangeEvent<HTMLSelectElement>) => setProvider(e.target.value),
-                style: inputStyle,
-              },
-                EMAIL_PROVIDERS.map(p => h('option', { key: p.id, value: p.id }, p.label)),
+              // Advanced agent-routing options (allowlist / provider / model /
+              // maxTokens / cwd / agentPreset), disclosed on demand.
+              h('div', { style: { borderTop: '1px solid rgba(128,128,128,0.18)', paddingTop: '8px' } },
+                h('button', {
+                  type: 'button',
+                  onClick: () => setAdvancedOpen(!advancedOpen),
+                  style: { ...ghostStyle, padding: '5px 12px', fontSize: '12px', border: 'none', opacity: 0.8 },
+                }, t('channels.advanced') + (advancedOpen ? ' ▴' : ' ▾')),
+                advancedOpen ? h('div', { style: { display: 'grid', gap: '8px', marginTop: '8px' } },
+                  ADVANCED_KEYS.map(key => h('div', { key, style: { display: 'grid', gap: '3px' } },
+                    h('label', { style: labelStyle }, t('advanced.' + key)),
+                    key === 'allowlist'
+                      ? h('textarea', {
+                          rows: 3,
+                          style: { ...inputStyle, fontFamily: 'monospace' },
+                          value: draft.allowlist ?? '',
+                          onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) =>
+                            setDraft(prev => ({ ...prev, allowlist: e.target.value })),
+                        })
+                      : h('input', {
+                          style: inputStyle,
+                          value: draft[key] ?? '',
+                          onChange: (e: React.ChangeEvent<HTMLInputElement>) =>
+                            setDraft(prev => ({ ...prev, [key]: e.target.value })),
+                        }),
+                    h('span', { style: { fontSize: '11px', opacity: 0.55 } }, ADVANCED_HINTS[key] ?? ''),
+                  )),
+                ) : null,
               ),
-            ) : null,
-            // Fields
-            ...currentFields.map(f =>
-              h('div', { key: f.key, style: { display: 'grid', gap: '4px' } },
-                h('label', { style: labelStyle }, t(f.labelKey)
-                  + (f.secret && activeSecretSet ? ` (${t('credential.set')})` : '')),
-                h('input', {
-                  type: f.secret ? 'password' : 'text',
-                  placeholder: f.placeholder ?? '',
-                  value: draft[f.key] ?? '',
-                  onChange: (e: React.ChangeEvent<HTMLInputElement>) =>
-                    setDraft(prev => ({ ...prev, [f.key]: e.target.value })),
-                  style: inputStyle,
-                }),
+              h('div', { style: { display: 'flex', gap: '10px', marginTop: '4px' } },
+                h('button', { type: 'button', onClick: () => void save(), disabled: busy, style: primaryStyle }, t('channels.save')),
+                active ? h('button', { type: 'button', onClick: () => void remove(active.id), disabled: busy,
+                  style: { ...ghostStyle, color: '#ff7a7a' } }, confirmingDelete ? t('channels.confirmDelete') : t('channels.delete')) : null,
               ),
-            ),
-            // Advanced agent-routing options (allowlist / provider / model /
-            // maxTokens / cwd / agentPreset), disclosed on demand.
-            h('div', { style: { borderTop: '1px solid rgba(128,128,128,0.18)', paddingTop: '8px' } },
-              h('button', {
-                type: 'button',
-                onClick: () => setAdvancedOpen(!advancedOpen),
-                style: { ...ghostStyle, padding: '5px 12px', fontSize: '12px', border: 'none', opacity: 0.8 },
-              }, t('channels.advanced') + (advancedOpen ? ' ▴' : ' ▾')),
-              advancedOpen ? h('div', { style: { display: 'grid', gap: '8px', marginTop: '8px' } },
-                ADVANCED_KEYS.map(key => h('div', { key, style: { display: 'grid', gap: '3px' } },
-                  h('label', { style: labelStyle }, t('advanced.' + key)),
-                  key === 'allowlist'
-                    ? h('textarea', {
-                        rows: 3,
-                        style: { ...inputStyle, fontFamily: 'monospace' },
-                        value: draft.allowlist ?? '',
-                        onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) =>
-                          setDraft(prev => ({ ...prev, allowlist: e.target.value })),
-                      })
-                    : h('input', {
-                        style: inputStyle,
-                        value: draft[key] ?? '',
-                        onChange: (e: React.ChangeEvent<HTMLInputElement>) =>
-                          setDraft(prev => ({ ...prev, [key]: e.target.value })),
-                      }),
-                  h('span', { style: { fontSize: '11px', opacity: 0.55 } }, ADVANCED_HINTS[key] ?? ''),
-                )),
-              ) : null,
-            ),
-            h('div', { style: { display: 'flex', gap: '10px', marginTop: '4px' } },
-              h('button', { type: 'button', onClick: () => void save(), disabled: busy, style: primaryStyle }, t('channels.save')),
-              active ? h('button', { type: 'button', onClick: () => void remove(active.id), disabled: busy,
-                style: { ...ghostStyle, color: '#ff7a7a' } }, confirmingDelete ? t('channels.confirmDelete') : t('channels.delete')) : null,
-            ),
-          )
-        : h('p', { style: { opacity: 0.7, fontSize: '14px' } }, t('channels.empty')),
+            )
+          : h('p', { style: { opacity: 0.7, fontSize: '14px' } }, t('channels.empty')),
+      ),
     ),
   )
 }
@@ -701,6 +759,13 @@ const setupCalloutStyle: React.CSSProperties = {
   borderRadius: '10px',
   border: '1px solid rgba(128,128,128,0.28)',
   background: 'rgba(79,140,255,0.06)',
+}
+/** Section-level row (the plugin-wide default working directory). */
+const defaultCwdStyle: React.CSSProperties = {
+  padding: '10px 12px',
+  borderRadius: '10px',
+  border: '1px solid rgba(128,128,128,0.28)',
+  background: 'rgba(128,128,128,0.06)',
 }
 const inputStyle: React.CSSProperties = {
   width: '100%', boxSizing: 'border-box', padding: '8px 10px', borderRadius: '8px',

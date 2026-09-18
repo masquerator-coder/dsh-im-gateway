@@ -99,6 +99,13 @@ export interface ChannelConfig {
 
 /** Resolved shape of the whole `im-channels` settings section. */
 export interface ChannelsSettings {
+  /**
+   * Plugin-wide default working directory (set on the settings card). Used by
+   * every channel that does not set its own `cwd`; a channel's own `cwd` always
+   * wins. Absent/empty = no plugin-wide choice, so the gateway falls back to
+   * the legacy `Config.cwd` and finally `~/.dsh/im-workspace`.
+   */
+  cwd?: string
   /** Ordered list of configured channels. */
   channels: ChannelConfig[]
 }

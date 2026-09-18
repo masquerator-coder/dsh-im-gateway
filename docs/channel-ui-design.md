@@ -48,6 +48,8 @@ ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
 
 ## 3. UI 结构（已实现）
 「插件 → 插件设置」页中「IM 通道设置」卡片点击展开后：
+- 卡片顶部（两列之上）为**全局默认工作目录**（section 级字段 `im-channels.cwd`）：未单独设置 `cwd` 的通道都用它，通道自己的设置优先；留空则退回 `cordis.yml` 的 `cwd`，再退回 `~/.dsh/im-workspace`。宿主在**每条入站消息到达时**解析，因此保存它不会重启任何通道。因为 DSH 会话的 cwd 在创建时即固定（resume 只还原持久化会话头，`workspaceRegistry.attachSession()` 还会拒绝把 cwd 不一致的会话挂到工作区上），**改工作目录会让该聊天在下一轮消息时于新目录里开始新会话**，旧会话仍留在原工作区（网页端可打开）；从未配置过工作目录的聊天 session id 保持不变。
+- 工作目录参与会话身份：`sessionIdForChat(chatId, channel, cwd)` → 有显式配置时用 `sha1("<channel>:<chatId>@<cwd>")`，否则保持历史的 `sha1("<channel>:<chatId>")`（老会话不被重置）。
 - 左列："新建通道"六类按钮（微信 / QQ / email / 5G消息 / 飞书 / 通用HTTP），下方"已配置"通道列表（名称 + 类型 + 实时状态）。
 - 右列（选中某通道/新建时）：**状态行**（类型 · 实时连接状态 + 错误详情）、名称、该类型的**傻瓜式配置表单**、保存/删除。
   - **5G消息**：只填 `apiKey`；`serverUrl`、`version` 预填模板自动带入。
@@ -59,6 +61,7 @@ ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
 
 ## 4. 配置持久化
 - 通道记录存于 `im-channels` settings 命名空间（`ChannelsSettingsSchema`），client 经 settings scope 提交，宿主经 settings scope 读取。
+- 同一命名空间**根字段** `cwd` = 插件级全局默认工作目录：client 用 `scope.set('cwd', …)` 提交，宿主经 `ChannelManager.defaultCwd()` 实时读取，与通道自身的 `cwd` 一起由 `resolveChannelCwd()` 决定实际工作目录（通道优先）。
 - 密钥字段用 `Schema.string().role('secret')`（与 dsh-cmcc-newmsg 的 apiKey 一致），描述/回显时被框架抹除，宿主 transports 从 settings scope 直接读回。
 - 本地覆盖层 cordis.local.yml 承载真实密钥，不入 Git。
 

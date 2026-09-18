@@ -49,6 +49,41 @@ export interface ChannelSnapshot {
 type StatusListener = (snapshot: ChannelSnapshot[]) => void
 
 /**
+ * Effective working directory for one inbound message.
+ *
+ * The channel's OWN `cwd` always wins; a channel without one inherits the
+ * plugin-wide default from the settings card (`im-channels.cwd`). `undefined`
+ * means "no explicit choice anywhere", which leaves the gateway's own fallbacks
+ * (`Config.cwd` from cordis.yml, then `~/.dsh/im-workspace`) in charge.
+ * @param channelCwd - the channel record's own `cwd` (optional).
+ * @param defaultCwd - the plugin-wide default from the settings section (optional).
+ * @returns the directory to use, or undefined when nothing is configured.
+ */
+export function resolveChannelCwd(channelCwd?: string, defaultCwd?: string): string | undefined {
+  const own = channelCwd?.trim()
+  if (own !== undefined && own !== '') return own
+  const fallback = defaultCwd?.trim()
+  return fallback !== undefined && fallback !== '' ? fallback : undefined
+}
+
+/**
+ * Whether one channel's stored record actually changed between two resolutions
+ * of the settings section — the gate for restarting a live channel.
+ *
+ * Both sides come from the same schema resolution, so their key order is stable
+ * and a plain JSON comparison is enough. A false positive costs exactly the
+ * restart the previous code performed on EVERY commit, so the gate can only
+ * reduce needless reconnects (a re-bind dance for a QR-bound channel) and never
+ * loses a config change.
+ * @param prev - the record the running channel was built from.
+ * @param next - the freshly resolved record.
+ * @returns true when the channel must be restarted to honour the change.
+ */
+export function channelRecordChanged(prev: ChannelConfig, next: ChannelConfig): boolean {
+  return JSON.stringify(prev) !== JSON.stringify(next)
+}
+
+/**
  * Owns every channel's connection lifecycle. Reads the durable `im-channels`
  * settings scope; builds the correct transport for each enabled channel,
  * routes inbound messages through the shared gateway, and pushes live status
@@ -85,6 +120,16 @@ export class ChannelManager {
     return this.runtimes
   }
 
+  /**
+   * The plugin-wide default working directory from the settings card
+   * (`im-channels.cwd`), read LIVE on every use: editing it must apply to the
+   * next inbound message without tearing down any channel's connection.
+   * @returns the configured directory, or '' when the user set none.
+   */
+  defaultCwd(): string {
+    return this.scope?.get().cwd?.trim() ?? ''
+  }
+
   /** Status summaries, ordered like the settings list, for the status route. */
   statusList(): ChannelSnapshot[] {
     const out: ChannelSnapshot[] = []
@@ -117,10 +162,16 @@ export class ChannelManager {
       const current = this.runtimes.get(channel.id)
       if (current !== undefined) {
         const wasEnabled = current.config.enabled
+        // Compare the channel record itself: a commit that only touched some
+        // OTHER part of the section (another channel, or the plugin-wide default
+        // working directory) must not tear this channel's live connection down
+        // and reconnect it — with a QR-bound channel that means a pointless
+        // re-bind dance every time an unrelated field is saved.
+        const changed = channelRecordChanged(current.config, channel)
         current.config = channel
         if (wasEnabled && !channel.enabled) {
           this.stop(channel.id)
-        } else if (wasEnabled && channel.enabled) {
+        } else if (wasEnabled && changed) {
           // Config changed while enabled: restart to apply.
           void this.restart(channel.id)
         } else if (!wasEnabled && channel.enabled) {
@@ -217,6 +268,11 @@ export class ChannelManager {
     // same transport type. The reply sink is looked up from the CURRENT runtime
     // at send time (the latest transport for this channel id wins).
     const routeInbound = (route: InboundRoute): void => {
+      // The effective working directory is resolved PER MESSAGE (the settings
+      // card can change it at any time) and is also the conversation's identity
+      // scope: DSH pins a session's cwd at creation, so a chat pointed at another
+      // directory must continue as a new session there.
+      const cwd = resolveChannelCwd(channel.cwd, this.defaultCwd())
       void this.gateway.handle(
         { chatId: route.chatId, text: route.text, senderId: route.senderId },
         (reply) => {
@@ -242,7 +298,12 @@ export class ChannelManager {
           provider: channel.provider || route.runtime?.provider,
           model: channel.model || route.runtime?.model,
           maxTokens: channel.maxTokens || route.runtime?.maxTokens,
-          cwd: channel.cwd || undefined,
+          // Per-channel cwd wins; a channel without one inherits the settings
+          // card's plugin-wide default (read live, so editing it needs no
+          // restart), and only then the gateway's legacy fallbacks apply. The
+          // same explicit choice scopes the session identity (see session.ts).
+          cwd,
+          sessionWorkspace: cwd,
           agentPreset: channel.agentPreset || undefined,
           disposeAfterReply: channel.disposeAfterReply,
           // Explicit allowlist: an unset/empty per-channel allowlist means

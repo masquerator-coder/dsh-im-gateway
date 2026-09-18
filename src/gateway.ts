@@ -59,6 +59,17 @@ export interface MessageRuntime {
   maxTokens?: number
   /** Optional working directory for the agent session (a real Harness workspace). */
   cwd?: string
+  /**
+   * Working directory that ALSO participates in the session identity, filled by
+   * the ChannelManager from the user-editable working directory (the channel's
+   * own `cwd`, or the settings card's plugin-wide default). DSH pins a session's
+   * cwd when it is created and cannot move it, so pointing a chat at another
+   * directory must mint a NEW session there — resuming the old one would keep
+   * working in the old workspace and make the setting look ignored. Filled only
+   * from an explicitly configured directory, so chats that never configured one
+   * keep their existing session ids.
+   */
+  sessionWorkspace?: string
   /** Optional agent preset label. */
   agentPreset?: string
   /** Optional human-readable session title shown in the web UI. */
@@ -335,7 +346,11 @@ export class ImGateway {
     }
     // Fold the receiving channel into the session key so the same external
     // chat id on different channels never shares a session (isolation).
-    const sessionId = SessionId(sessionIdForChat(message.chatId, keyChannel ?? ''))
+    // An explicitly configured working directory is folded in as well: a session
+    // cannot be moved between workspaces, so a chat pointed at another directory
+    // continues as a NEW conversation there instead of silently resuming into
+    // the old one.
+    const sessionId = SessionId(sessionIdForChat(message.chatId, keyChannel ?? '', runtime.sessionWorkspace ?? ''))
     trace(`[gw] inbound session=${sessionId} chat=${message.chatId} head=${JSON.stringify(message.text.slice(0, 40))}`)
     // Keep the outbound sender hot for this session so an in-flight approval /
     // question prompt can be pushed down the same channel that drives it.
@@ -543,7 +558,19 @@ export class ImGateway {
       try {
         await workspace.attachSession(sessionId)
       } catch (error: unknown) {
-        this.ctx.logger.warn(`[im-gateway] attach session ${sessionId} to workspace: ${errorChain(error)}`)
+        // The registry refuses to attach a session whose stored header cwd
+        // differs from the workspace path — and that header is what every file /
+        // shell tool roots at. So the turn below runs in the OLD directory while
+        // the operator believes they changed it: say which directory won, and
+        // why, instead of a bare attach failure. (A directory taken from the
+        // channel record or the settings card never lands here: it is part of the
+        // session identity, so such a chat is a new session in the new workspace.)
+        this.ctx.logger.warn(
+          `[im-gateway] session ${sessionId} keeps working in its original workspace `
+          + `(header cwd), NOT ${workspacePath}: ${errorChain(error)} — `
+          + 'a DSH session cannot be moved between workspaces; configure the working directory '
+          + 'in the IM channel settings to start a new session there instead.',
+        )
       }
     }
 
