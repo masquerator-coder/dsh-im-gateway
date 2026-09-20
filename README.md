@@ -6,7 +6,7 @@ A [DeepSeek Harness](https://deepseek-harness.github.io/deepseek-harness/) (Cord
 2. **Bridge** — each message is injected into a **persistent Harness Agent** that is stably mapped to the external chat, so a conversation keeps context across messages while separate chats (and separate channels) stay isolated.
 3. **Outbound** — the Agent's reply is collected from the global session-event stream by **rpcId claiming** and delivered back through the **same channel** that received it.
 
-It ships both a **legacy single HTTP webhook** and a **multi-channel settings UI** ("IM 通道" in the DSH settings panel) covering six channel kinds — 微信 (ilink bot), QQ (官方 bot), 邮箱 Email (SMTP/IMAP), 中国移动 5G消息 (WebSocket), 飞书 (official bot), and 通用 HTTP 回调.
+It ships both a **legacy single HTTP webhook** and a **multi-channel settings UI** (on the DSH **Plugins** page, under this bundle's own card) covering six channel kinds — 微信 (ilink bot), QQ (官方 bot), 邮箱 Email (SMTP/IMAP), 中国移动 5G消息 (WebSocket), 飞书 (official bot), and 通用 HTTP 回调.
 
 ---
 
@@ -54,7 +54,7 @@ Ordering is load-bearing: in the `web` profile the `dsh-api-remotes` forwarder t
 
 ## Multi-channel IM management (settings UI)
 
-In the DSH **「插件 → 插件设置」** page an **"IM 通道设置"** card (styled like the other system plugin cards) expands on click to reveal the per-channel management UI. Each channel kind ships a **foolproof prefill template**, so fixed items are already correct and the user only fills in the cherry-picked key/token/account (or scans a QR):
+In the DSH **Plugins page** (sidebar → **插件**) the panel lives on **this bundle's own card**: open **`dsh-im-gateway`** (under **已安装**) and the per-channel management UI is on its page, between the package description and the row list. Each channel kind ships a **foolproof prefill template**, so fixed items are already correct and the user only fills in the cherry-picked key/token/account (or scans a QR):
 
 | Type | Fixed items auto-filled | User provides | Transport |
 | --- | --- | --- | --- |
@@ -69,11 +69,13 @@ Each enabled channel holds a **live connection** (`connected` / `connecting` / `
 
 > **为什么不是 `ctx.remote`**：DSH 的 `ctx.remote.<namespace>` 是 **Typert 生成** 的描述符投影 —— 浏览器侧只挂载 DSH 自带 assembly 里那份固定清单（`@deepseek-ai/dsh-api-remotes/client`），且拒绝任何没有 strict 生成 codec 的描述符（`requireStrictDescriptor`）。**树外插件无法发布 Remote namespace**，所以本插件改为注册一条同源 web 路由（也顺带复用守卫 `/api` 的浏览器鉴权 cookie）。
 
+> **为什么面板现在挂在「插件」页**：旧版 DSH 的「插件 → 插件设置」是一张 `settings.plugin.item` 卡片，**该 slot 已被上游退役**（`ui-settings-plugins` 不再声明它，`ConfigurablePluginsTab`/`tab-store` 一并删除），继续往那里注册会让面板**静默消失**——`ctx.slots.inject` 等一个永远没人声明的 slot，不报错也不打印。现行扩展点是「插件」页声明的三个 slot：`plugins.item`（宿主平面官方插件）、`plugins.bundle.config`（以包名为键，组合包自己的配置，显示在该组合包页面里）、`plugins.row.config`（以 `<包名>#<行 id>` 为键，单行的配置）。本插件是普通组合包、配置属于整包，故取 **`plugins.bundle.config`**，键为包名 `dsh-im-gateway`。页面会按 `summary` / `page` 两种视图各索取一次：`summary` 是卡片标题下的一句话简介，`page` 是插件页面里的表单本体（页面自己画标题、图标与面包屑）。注册与组合包的浏览器半侧同生共死，所以插件行关掉时面板一并消失。
+
 Channel records live under the `im-channels` settings namespace, with secret fields (`apiKey`, `password`, `appSecret`, `token`, …) declared `role('secret')` — redacted on every wire boundary, only the host transports read them back from the settings scope.
 
 Every channel card exposes an **高级选项（接入控制 / 模型路由）** fold for the agent-routing fields shared with the legacy webhook: `allowlist` (one sender id per line — email address / QQ / phone / HTTP `sender_id`), `provider`, `model`, `maxTokens`, `cwd`, `agentPreset`, plus a 启用/停用 switch for the whole channel. These are applied **per channel instance**: two channels of the same kind (e.g. two `http` webhooks) never share an agent session even when their external `chat_id` collides, and a channel without its own `allowlist` allows all senders — it never inherits the legacy global webhook allowlist (whose sender-id semantics belong to that HTTP caller).
 
-Above the two columns the card carries one **section-level** field, **全局默认工作目录** (`im-channels.cwd`): the working directory (a real Harness workspace, holding the session log and giving the agent its file scope) used by every channel that has no `cwd` of its own — a channel's own `cwd` always wins. Resolution order per inbound message: **通道 `cwd` → 设置页全局默认 → `cordis.yml` 的 `cwd` → `~/.dsh/im-workspace`**. It is read when the message arrives, so saving it applies to the next message on every channel **without reconnecting anything**; only a change to a channel's *own* record restarts that channel (an unrelated save no longer bounces every enabled connection).
+Above the two columns the card carries one **section-level** field, **全局默认工作目录** (`im-channels.cwd`): the working directory (a real Harness workspace, holding the session log and giving the agent its file scope) used by every channel that has no `cwd` of its own — a channel's own `cwd` always wins. Resolution order per inbound message: **通道 `cwd` → 插件页全局默认 → `cordis.yml` 的 `cwd` → `~/.dsh/im-workspace`**. It is read when the message arrives, so saving it applies to the next message on every channel **without reconnecting anything**; only a change to a channel's *own* record restarts that channel (an unrelated save no longer bounces every enabled connection).
 
 Because a DSH session's `cwd` is pinned at creation (and the workspace registry refuses to attach a session whose header cwd differs), a changed working directory **starts a new conversation in the new directory** on that chat's next message: the old session stays in its old workspace and remains openable in the Web UI, while the chat continues with a fresh context in the directory you configured (see [Session keying](#session-keying--isolation)). A chat that never configured a directory keeps its session id, so nothing is reset by the upgrade itself.
 
@@ -106,7 +108,7 @@ The QQ channel is a **direct client of the official QQ Open Platform robot gatew
 
 1. 在 [q.qq.com](https://q.qq.com) 创建机器人，记下 **AppID / AppSecret**（开发设置里）。
 2. 申请所需能力：**单聊 / 群聊**（这是「在 QQ 里跟机器人对话」的前提），提交审核。**未通过前连接会被网关拒绝**——插件会把拒绝原因原样显示在面板上（见下）。
-3. 面板「IM 通道设置 → QQ」新建通道，填 AppID + AppSecret，保存启用。状态变「已连接」即代表 WebSocket 已 READY。
+3. 面板「插件 → `dsh-im-gateway` → IM 通道 → QQ」新建通道，填 AppID + AppSecret，保存启用。状态变「已连接」即代表 WebSocket 已 READY。
 4. 在 QQ 里给机器人发消息（单聊直接发；群聊需 @ 机器人），Agent 的回复经同一网关回送。
 5. 先验证链路而**不经过宿主**：`pnpm qq-probe <appId> <appSecret>`（见 [QQ 真机探针](#qq-真机探针)）。
 
@@ -146,7 +148,7 @@ pnpm qq-probe <appId> <appSecret> [--ints c2c,public_guild] [--sandbox] [--secon
 | `src/channels/schema.ts` | Host-side `im-channels` settings schema (SECRET fields via `role('secret')`, plus the plugin-wide default `cwd`) |
 | `src/channels/manager.ts` | Per-channel connection lifecycle, transport build, live status snapshots |
 | `src/transports/*.ts` | One real adapter per channel (http / email / cmcc / feishu / wechat / qq / qqbot), each tags its runtime with `channel` |
-| `src/client/*` | Browser half: expandable plugin card (`ChannelsCard`) wrapping the channel management UI (`ChannelsSection`), foolproof templates, live status + locally-encoded QR (`qr.ts`) |
+| `src/client/*` | Browser half: the bundle's Plugins-page configuration entry (`ChannelsCard`) around the channel management UI (`ChannelsSection`), foolproof templates, live status + locally-encoded QR (`qr.ts`) |
 | `cordis.yml` | Local source overlay (`--patch`) for development / e2e iteration |
 | `cordis.patch.yml` | Published **bundle** layer — references the package by name (`dsh-im-gateway` → `lib/index.js`) |
 | `scripts/build.mjs` | esbuild build: emits `lib/index.js` (node) + `lib/client.js` (browser) + `lib/vendor/lark-sdk.cjs` (vendored Feishu SDK) |

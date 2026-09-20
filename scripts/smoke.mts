@@ -47,6 +47,14 @@
  *  13. Default working directory — resolveChannelCwd (a channel's own `cwd`
  *      beats the plugin-wide default from the settings card) and the
  *      `im-channels.cwd` schema field itself.
+ *  14. The client half's registration target — the built `lib/client.js` must
+ *      register into `plugins.bundle.config` (keyed by the package name) and
+ *      must no longer reference the retired `settings.plugin.item`. A stale
+ *      target fails SILENTLY (the slot is never declared, so `ctx.slots.inject`
+ *      waits forever and prints nothing), which is exactly why it is asserted.
+ *      Asserted on the BUILT bundle rather than on the source: `.tsx` modules
+ *      cannot be loaded by `node --experimental-transform-types`, and the
+ *      bundle is what the browser actually executes.
  *
  * Real transports that need live services (email / feishu / wechat / qq / a
  * live CMCC gateway) are exercised by starting them in the plugin; this file
@@ -908,6 +916,31 @@ assert.equal(channelRecordChanged(record, { ...record }), false, 'a re-resolved 
 assert.equal(channelRecordChanged(record, { ...record, cwd: '/other' }), true, "the channel's own edit is a change")
 assert.equal(channelRecordChanged(record, { ...record, enabled: false }), true)
 step('plugin-wide default cwd precedence OK')
+
+// --- 14. the client half's registration target ---
+// DSH retired `settings.plugin.item` (the old 「插件 → 插件设置」 card slot) when
+// it moved plugin configuration onto the Plugins page, so a stale registration
+// there leaves the panel INVISIBLE: `ctx.slots.inject` waits for a slot nobody
+// declares, forever, printing nothing. These are cheap assertions on the built
+// client bundle — the only artifact the browser actually loads — because the
+// failure mode is silence, not an error.
+const { readFileSync } = await import('node:fs')
+const clientBundle = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+assert.ok(
+  clientBundle.includes('plugins.bundle.config'),
+  'the client half must register into the Plugins page slot the current DSH declares',
+)
+assert.ok(
+  !clientBundle.includes('settings.plugin.item'),
+  'the retired settings.plugin.item slot must not be referenced (it renders nothing now)',
+)
+// The key has to equal package.json's name verbatim: the Plugins page looks a
+// bundle's configuration up by `entry.options.key === pkg.name`.
+const { BUNDLE_NAME } = await import('../src/client/bundle-name.ts')
+const manifestName = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).name
+assert.equal(BUNDLE_NAME, manifestName, 'the registration key must be the package name the Plugins page dispatches on')
+assert.equal(BUNDLE_NAME, 'dsh-im-gateway')
+step('client half targets plugins.bundle.config, keyed by the package name OK')
 
 process.stderr.write('\n✔ All local smoke checks passed.\n')
 process.exit(0)

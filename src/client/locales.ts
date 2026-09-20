@@ -7,7 +7,9 @@
 export const NS = 'im-channels'
 
 export const zh = {
-  'card.title': 'IM 通道设置',
+  // The Plugins page draws the card's title (the bundle name) and the page's
+  // heading itself, so the only copy this entry owns above the panel is the
+  // one-liner the page renders in the card's summary view.
   'card.description': '连接并管理 IM 网关通道（5G消息 / 邮箱 / HTTP / 飞书 / 微信 / QQ）。',
   'channels.empty': '尚未配置任何通道。选择一个类型开始接入。',
   'global.cwd': '全局默认工作目录',
@@ -93,7 +95,6 @@ export const zh = {
 } as const
 
 export const en = {
-  'card.title': 'IM channel settings',
   'card.description': 'Connect and manage IM gateway channels (5G Message / email / HTTP / Feishu / WeChat / QQ).',
   'channels.empty': 'No channels configured. Pick a type to begin.',
   'global.cwd': 'Default working directory',
