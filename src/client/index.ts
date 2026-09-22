@@ -31,6 +31,19 @@
  * Live connection status is fetched by the panel from the host's
  * `/im-gateway/status` web route (registered by the node half); a plugin cannot
  * publish a `ctx.remote` namespace — see src/status-proto.ts.
+ *
+ * WHY `configForms` AND NOT `settingsScope`: DSH 0.1.7-alpha.1 rewrote the
+ * settings layer as "profile-owned live Config + form projection" and DELETED
+ * the client `settingsScope` service outright. Cordis does not error on an
+ * unsatisfied `inject` — the fiber simply parks in `pending` forever — but the
+ * Web client boot audit (`apps/web` -> `assertEntriesActive`) requires EVERY
+ * entry to be `active` and throws `Failed to load plugins` otherwise. So the
+ * stale name did not degrade this panel; it took down the whole client boot.
+ *
+ * The replacement is `ctx.configForms.get<T>(namespace)` (provided by
+ * `@deepseek-ai/dsh-client-ui-settings`). Its `ConfigForm` exposes
+ * `getSnapshot()` / `subscribe()` / `set()` — the same three calls the panel
+ * already made against the old scope — so the form body needed no rewrite.
  */
 
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
@@ -40,15 +53,19 @@ import type {} from '@deepseek-ai/dsh-client-ui-settings'
 // entry). Cross-plugin collaboration goes through cordis services, never a
 // value import (the client bundle-purity gate rejects the latter).
 import type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
+// Type-only: the `ctx.configForms` Context merge plus its `ConfigForm` face.
+import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type {} from '@deepseek-ai/dsh-api-remotes'
 import { NS, zh, en } from './locales.ts'
 import { BUNDLE_NAME } from './bundle-name.ts'
 import { ChannelsConfigEntry } from './ChannelsCard.tsx'
+import type { ChannelsForm } from './settings-form.ts'
 
 export { BUNDLE_NAME }
+export type { ChannelsForm } from './settings-form.ts'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export const inject = ['slots', 'locale', 'settingsScope'] as any
+export const inject = ['slots', 'locale', 'configForms'] as any
 
 /**
  * Mount the bundle's configuration entry and dictionaries.
@@ -58,10 +75,12 @@ export const inject = ['slots', 'locale', 'settingsScope'] as any
 export function apply(ctx: any): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'im-channels: dictionaries')
 
-  // Bound to this plugin's fiber; the settings base plugin handles the
-  // describe read and disposes the scope when this entry unloads.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const scope = ctx.settingsScope.bind({ namespace: NS }) as any
+  // The shared form for THIS bundle's settings namespace, owned by the
+  // ui-settings provider (so this plugin never declares `remote.settings`).
+  // `get` is idempotent per namespace and the provider disposes every form
+  // when it unloads. `ctx` is untyped here, so the section type is applied by
+  // assertion rather than by the generic parameter.
+  const form = ctx.configForms.get(NS) as ChannelsForm
 
   const t = ctx.locale.bind(NS)
 
@@ -76,7 +95,7 @@ export function apply(ctx: any): void {
     key: BUNDLE_NAME,
     locale: NS,
     inject: () => ({
-      scope,
+      form,
       t,
     }),
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

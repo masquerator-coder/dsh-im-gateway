@@ -22,12 +22,25 @@
 
 import * as React from 'react'
 import { createElement as h } from 'react'
+import type { ChannelsForm } from './settings-form.ts'
 import { ChannelsSection } from './ChannelsSection.tsx'
 
-/** Props the entry's slot registration injects (bound in `client/index.ts`). */
+/**
+ * Props the entry's slot registration injects (bound in `client/index.ts`).
+ *
+ * The OWNER supplies only `view`: unlike `plugins.item` and
+ * `plugins.row.config`, the bundle-config render site passes no `form`
+ * (`PluginManagerPage.tsx:584` -> `renderSlot('plugins.bundle.config', { view: 'page' }, …)`),
+ * so a bundle's entry self-supplies its own settings state through `inject`.
+ * The shipped voice-input bundle does the same (`mount.ts:42`).
+ *
+ * What changed in DSH 0.1.7-alpha.1 is only WHERE that state comes from: the
+ * deleted `settingsScope.bind({ namespace })` became
+ * `ctx.configForms.get(namespace)` (bound in `client/index.ts`).
+ */
 export interface ChannelsConfigEntryProps {
-  /* eslint-disable @typescript-eslint/no-explicit-any */
-  scope: any
+  /** This bundle's bound settings form, injected by `client/index.ts`. */
+  form: ChannelsForm
   t: (key: string) => string
   /** Which view the Plugins page is asking for (owner props of the slot). */
   view: 'summary' | 'page'
@@ -43,12 +56,12 @@ export interface ChannelsConfigEntryProps {
  * string child as a text node, which is exactly the shape the seat wants.
  */
 export function ChannelsConfigEntry(props: ChannelsConfigEntryProps): React.ReactNode {
-  const { scope, t, view } = props
+  const { form, t, view } = props
   if (view === 'summary') return t('card.description')
   // The page only ever asks for the two views above; anything else renders
   // nothing rather than guessing.
   if (view !== 'page') return null
-  return h('div', { style: pageStyle }, h(ChannelsSection, { scope, t }))
+  return h('div', { style: pageStyle }, h(ChannelsSection, { form, t }))
 }
 
 /* --- Page body, styled with the same DSW tokens as the host's sections. --- */

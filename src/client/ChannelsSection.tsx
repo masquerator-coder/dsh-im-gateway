@@ -25,6 +25,7 @@ import { createElement as h, useCallback, useEffect, useMemo, useState, useSyncE
 import {
   type ChannelConfig, type ChannelType,
 } from '../channels/types.ts'
+import type { ChannelsForm } from './settings-form.ts'
 import { STATUS_ROUTE_PATH, type ChannelStatusPayload } from '../status-proto.ts'
 import { QR_SIZE_PX, qrSvgFor } from './qr.ts'
 
@@ -180,8 +181,12 @@ function templatesFor(): Record<ChannelType, Template> {
 }
 
 export interface ChannelsSectionProps {
-  /* eslint-disable @typescript-eslint/no-explicit-any */
-  scope: any
+  /**
+   * This bundle's bound settings form, from `ctx.configForms.get(NS)` (see
+   * client/index.ts). It replaced DSH's deleted `settingsScope`, and exposes
+   * the same `getSnapshot` / `subscribe` / `set` trio this section already used.
+   */
+  form: ChannelsForm
   t: (key: string) => string
 }
 
@@ -214,13 +219,14 @@ function requiredMissing(
 }
 
 export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement {
-  const { scope, t } = props
+  const { form, t } = props
   const TP = useMemo(() => templatesFor(), [])
 
-  // Subscribe to the bound scope.
+  // Subscribe to the bound form (`ctx.configForms.get(NS)` — the replacement
+  // for DSH's deleted `settingsScope` service).
   const snapshot = useSyncExternalStore(
-    useCallback((cb: () => void) => scope.subscribe(cb), [scope]),
-    useCallback(() => scope.getSnapshot(), [scope]),
+    useCallback((cb: () => void) => form.subscribe(cb), [form]),
+    useCallback(() => form.getSnapshot(), [form]),
   )
   const channels: ChannelConfig[] = snapshot?.value?.channels ?? []
   /** Host value of the plugin-wide default working directory (may be absent). */
@@ -447,7 +453,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
       const nextList = creating !== null
         ? [...channels, nextChannel as unknown as ChannelConfig]
         : channels.map(c => (c.id === id ? (nextChannel as unknown as ChannelConfig) : c))
-      await scope.set('channels', nextList)
+      await form.set('channels', nextList)
       setActiveId(id)
       setCreating(null)
       setNotice(t('channels.saved'))
@@ -457,7 +463,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     } finally {
       setBusy(false)
     }
-  }, [creating, active, channels, draft, draftName, provider, currentFields, scope, t, TP])
+  }, [creating, active, channels, draft, draftName, provider, currentFields, form, t, TP])
 
   const remove = useCallback(async (id: string): Promise<void> => {
     // Two-step delete confirmation: the first click arms, the second deletes.
@@ -473,7 +479,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     setNoticeIsError(false)
     try {
       const nextList = channels.filter(c => c.id !== id)
-      await scope.set('channels', nextList)
+      await form.set('channels', nextList)
       if (activeId === id) setActiveId(nextList[0]?.id)
       if (creating !== null) setCreating(null)
       setNotice(t('channels.removed'))
@@ -484,7 +490,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     } finally {
       setBusy(false)
     }
-  }, [channels, activeId, creating, confirmingDelete, scope, t])
+  }, [channels, activeId, creating, confirmingDelete, form, t])
 
   /** Flip one channel's enabled flag in place (host reconciles live state). */
   const toggleEnabled = useCallback(async (): Promise<void> => {
@@ -494,7 +500,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     setNoticeIsError(false)
     try {
       const nextList = channels.map(c => (c.id === active.id ? { ...c, enabled: !c.enabled } : c))
-      await scope.set('channels', nextList)
+      await form.set('channels', nextList)
       setNotice(t('channels.saved'))
     } catch (error) {
       setNotice(`${t('channels.saveFailed')}: ${String(error)}`)
@@ -502,7 +508,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     } finally {
       setBusy(false)
     }
-  }, [active, channels, scope, t])
+  }, [active, channels, form, t])
 
   /** Plugin-wide default working dir as shown in the box (a local draft wins). */
   const defaultCwd = cwdDraft ?? hostCwd
@@ -518,7 +524,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     setNotice('')
     setNoticeIsError(false)
     try {
-      await scope.set('cwd', defaultCwd.trim())
+      await form.set('cwd', defaultCwd.trim())
       setCwdDraft(null)
       setNotice(t('channels.saved'))
     } catch (error) {
@@ -527,7 +533,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     } finally {
       setBusy(false)
     }
-  }, [defaultCwd, scope, t])
+  }, [defaultCwd, form, t])
 
   const typeLabel = (type: ChannelType): string => t('type.' + type)
 
