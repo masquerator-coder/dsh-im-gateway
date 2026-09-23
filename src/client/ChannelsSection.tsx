@@ -26,6 +26,7 @@ import {
   type ChannelConfig, type ChannelType,
 } from '../channels/types.ts'
 import type { ChannelsForm } from './settings-form.ts'
+import { writeField } from './write-field.ts'
 import { STATUS_ROUTE_PATH, type ChannelStatusPayload } from '../status-proto.ts'
 import { QR_SIZE_PX, qrSvgFor } from './qr.ts'
 
@@ -453,7 +454,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
       const nextList = creating !== null
         ? [...channels, nextChannel as unknown as ChannelConfig]
         : channels.map(c => (c.id === id ? (nextChannel as unknown as ChannelConfig) : c))
-      await form.set('channels', nextList)
+      await writeField(form, 'channels', nextList, t)
       setActiveId(id)
       setCreating(null)
       setNotice(t('channels.saved'))
@@ -479,7 +480,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     setNoticeIsError(false)
     try {
       const nextList = channels.filter(c => c.id !== id)
-      await form.set('channels', nextList)
+      await writeField(form, 'channels', nextList, t)
       if (activeId === id) setActiveId(nextList[0]?.id)
       if (creating !== null) setCreating(null)
       setNotice(t('channels.removed'))
@@ -500,7 +501,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     setNoticeIsError(false)
     try {
       const nextList = channels.map(c => (c.id === active.id ? { ...c, enabled: !c.enabled } : c))
-      await form.set('channels', nextList)
+      await writeField(form, 'channels', nextList, t)
       setNotice(t('channels.saved'))
     } catch (error) {
       setNotice(`${t('channels.saveFailed')}: ${String(error)}`)
@@ -524,7 +525,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     setNotice('')
     setNoticeIsError(false)
     try {
-      await form.set('channelsCwd', defaultCwd.trim())
+      await writeField(form, 'channelsCwd', defaultCwd.trim(), t)
       setCwdDraft(null)
       setNotice(t('channels.saved'))
     } catch (error) {

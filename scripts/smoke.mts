@@ -55,6 +55,12 @@
  *      Asserted on the BUILT bundle rather than on the source: `.tsx` modules
  *      cannot be loaded by `node --experimental-transform-types`, and the
  *      bundle is what the browser actually executes.
+ *  15. The client write path — `writeField` must turn a Host-REFUSED write
+ *      (`set` resolving false) into a throw. It used to be awaited for its
+ *      side effect only, so a refusal was indistinguishable from success: the
+ *      panel said 已保存, cleared the create form, and dropped back to the
+ *      "尚未配置任何通道" empty state — which reads as "the QR never appeared".
+ *      Exercised for real (not string-matched) because the failure is silence.
  *
  * Real transports that need live services (email / feishu / wechat / qq / a
  * live CMCC gateway) are exercised by starting them in the plugin; this file
@@ -971,6 +977,41 @@ assert.ok(
   'the client bundle must key its form on the plugin profile entry id',
 )
 step('client half targets plugins.bundle.config, keyed by the package name OK')
+
+// --- 15. the client write path ---
+// `ConfigForm.set` answers FALSE when the Host refuses a write (revision
+// conflict, entry no longer configurable, section shadowed by an overlay) and
+// only rejects on a transport failure. The panel used to await it purely for
+// its side effect, so a refusal took the success branch: 已保存 was reported,
+// the create form was cleared, and the still-empty channel list rendered the
+// "尚未配置任何通道" empty state. From the user's seat that is indistinguishable
+// from "the WeChat QR never appeared", so it gets a real behavioural test.
+const { writeField } = await import('../src/client/write-field.ts')
+
+/** A minimal stand-in for a bound ConfigForm that always refuses. */
+const refusingForm = { set: async () => false }
+await assert.rejects(
+  () => writeField(refusingForm, 'channels', [{ id: 'ch-1', type: 'wechat' }], (k) => k),
+  /channels\.writeRefused/,
+  'a Host-refused write must surface as an error, never as a silent success',
+)
+
+/** A form that accepts: the helper must resolve and pass the value through. */
+let seen: { field?: string; value?: unknown } = {}
+const acceptingForm = {
+  set: async (field: string, value: unknown) => { seen = { field, value }; return true },
+}
+await writeField(acceptingForm, 'channels', [{ id: 'ch-2' }], (k) => k)
+assert.equal(seen.field, 'channels', 'the accepted write must reach the bound form')
+assert.deepEqual(seen.value, [{ id: 'ch-2' }], 'the accepted write must carry the value through')
+
+/** A form that rejects (transport failure) must propagate the original error. */
+await assert.rejects(
+  () => writeField({ set: async () => { throw new Error('offline') } }, 'channels', [], (k) => k),
+  /offline/,
+  'a transport failure must propagate unchanged (not be masked as a refusal)',
+)
+step('client write path surfaces a refused save OK')
 
 process.stderr.write('\n✔ All local smoke checks passed.\n')
 process.exit(0)

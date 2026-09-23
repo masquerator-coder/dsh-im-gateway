@@ -19,6 +19,10 @@ export const zh = {
   'channels.save': '保存',
   'channels.saved': '已保存',
   'channels.saveFailed': '保存失败',
+  // Surfaces a write the HOST refused (read-only section, revision conflict, or
+  // an overlay shadowing this entry). Without it such a refusal looked exactly
+  // like a successful save: the panel said 已保存 while nothing was stored.
+  'channels.writeRefused': '主机拒绝了本次写入（该配置当前不可写，或已被其他改动覆盖）。请刷新页面后重试',
   'channels.delete': '删除',
   'channels.confirmDelete': '确认删除？',
   'channels.confirmHint': '再次点击删除按钮以确认删除该通道',
@@ -104,6 +108,7 @@ export const en = {
   'channels.save': 'Save',
   'channels.saved': 'Saved',
   'channels.saveFailed': 'Save failed',
+  'channels.writeRefused': 'The host refused this write (the section is not writable, or it changed elsewhere). Refresh the page and try again.',
   'channels.delete': 'Delete',
   'channels.confirmDelete': 'Confirm delete?',
   'channels.confirmHint': 'Click delete again to confirm removing this channel',
