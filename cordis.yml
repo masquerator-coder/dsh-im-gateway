@@ -33,3 +33,7 @@
         agentPreset: ''
         cwd: ''
         disposeAfterReply: false
+        # VOLATILE channel settings (DSH 0.1.7+); see cordis.patch.yml. Edited
+        # from the plugin's own page on the Plugins page.
+        channelsCwd: ''
+        channels: []

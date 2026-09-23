@@ -15,3 +15,14 @@
 
 /** Must equal `package.json`'s `name` verbatim. Asserted by the smoke test. */
 export const BUNDLE_NAME = 'dsh-im-gateway'
+
+/**
+ * This plugin's profile loader ENTRY id — the `id:` of the row this bundle's
+ * `cordis.patch.yml` inserts (and the id a user's own patch would target).
+ *
+ * DSH 0.1.7 removed the plugin-registrable settings namespace, so the client
+ * panel can no longer ask for a namespace it named itself: it must ask
+ * `configForms.get()` for the plugin's own entry. Must stay in step with
+ * `cordis.patch.yml` and `cordis.yml`. Asserted by the smoke test.
+ */
+export const ENTRY_ID = 'im-gateway'

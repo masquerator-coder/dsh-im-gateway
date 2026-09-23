@@ -902,12 +902,25 @@ assert.equal(resolveChannelCwd(undefined, ''), undefined, 'no choice anywhere le
 assert.equal(resolveChannelCwd('', undefined), undefined)
 assert.equal(resolveChannelCwd(undefined, undefined), undefined)
 
-const { ChannelsSettingsSchema } = await import('../src/channels/schema.ts')
-const withCwd = ChannelsSettingsSchema({ cwd: '/srv/im', channels: [] })
-assert.equal(withCwd.cwd, '/srv/im', 'the settings card value is stored on the section root')
-assert.deepEqual(withCwd.channels, [])
-const withoutCwd = ChannelsSettingsSchema({ channels: [] })
-assert.equal(withoutCwd.cwd, undefined, 'an untouched field stays unset (no bogus default directory)')
+// DSH 0.1.7 removed the plugin-registrable settings NAMESPACE
+// (`settings.register(ns, schema)`): the channel list and the plugin-wide
+// default working directory are now VOLATILE fields on this plugin's own Config,
+// projected into the form by the framework and written back without a remount.
+// The value the user stores for `channelsCwd` is therefore a plain string on the
+// Config root — there is no longer a section wrapper to resolve.
+const { Config } = await import('../src/config.ts')
+const parsed = Config({ callbackUrl: 'http://127.0.0.1:9999/reply', channelsCwd: '/srv/im', channels: [] })
+assert.equal(parsed.channelsCwd.get(), '/srv/im', 'the settings card value lands on the volatile channelsCwd reference')
+assert.deepEqual(parsed.channels.get(), [], 'an empty channel list resolves to []')
+const parsedWithoutCwd = Config({ callbackUrl: 'http://127.0.0.1:9999/reply' })
+assert.equal(parsedWithoutCwd.channelsCwd.get(), undefined, 'an untouched field stays unset (no bogus default directory)')
+
+// The client half must ask for the plugin's own profile ENTRY (not a namespace
+// it registered itself), and that id must match what the bundle patch inserts.
+const { ENTRY_ID, BUNDLE_NAME } = await import('../src/client/bundle-name.ts')
+assert.equal(ENTRY_ID, 'im-gateway', 'the configForms key is the profile entry id')
+const patchText = await (await import('node:fs/promises')).readFile(new URL('../cordis.patch.yml', import.meta.url), 'utf8')
+assert.ok(patchText.includes(`id: ${ENTRY_ID}`), 'cordis.patch.yml inserts a row with exactly that id')
 
 // The restart gate: only a channel whose OWN record changed may be restarted, so
 // saving the section-level default (or another channel) never bounces this one.
@@ -936,10 +949,27 @@ assert.ok(
 )
 // The key has to equal package.json's name verbatim: the Plugins page looks a
 // bundle's configuration up by `entry.options.key === pkg.name`.
-const { BUNDLE_NAME } = await import('../src/client/bundle-name.ts')
 const manifestName = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).name
 assert.equal(BUNDLE_NAME, manifestName, 'the registration key must be the package name the Plugins page dispatches on')
 assert.equal(BUNDLE_NAME, 'dsh-im-gateway')
+// DSH 0.1.7-alpha.1 deleted BOTH the client `settingsScope` service and the
+// host-side `settings.register(ns, schema)` namespace API. Cordis parks a fiber
+// with an unsatisfied `inject` in `pending` forever WITHOUT erroring, and the
+// client boot audit then fails the whole page with "Failed to load plugins" — so
+// a stale name here is not a cosmetic bug, it takes down the entire Web client.
+// Assert on the built bundle (what the browser actually executes).
+assert.ok(
+  !clientBundle.includes('settingsScope'),
+  'the client bundle must not reference the deleted settingsScope service',
+)
+assert.ok(
+  clientBundle.includes('configForms'),
+  'the client half must bind to ctx.configForms (the replacement for settingsScope)',
+)
+assert.ok(
+  clientBundle.includes(ENTRY_ID),
+  'the client bundle must key its form on the plugin profile entry id',
+)
 step('client half targets plugins.bundle.config, keyed by the package name OK')
 
 process.stderr.write('\n✔ All local smoke checks passed.\n')

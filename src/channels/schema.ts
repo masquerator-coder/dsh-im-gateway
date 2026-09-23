@@ -1,21 +1,25 @@
 /**
  * Multi-channel IM gateway configuration schema (HOST half only).
  *
- * A single settings namespace `im-channels` stores the wiring for every
- * channel. SECRET fields are declared with `role('secret')`: the framework
- * redacts them on every wire boundary (so they are never returned to the
- * client), yet the host still reads them back directly from the settings
- * scope — which is how the transports obtain apiKeys / passwords / tokens.
+ * One channel RECORD is stored per configured channel. SECRET fields are
+ * declared with `role('secret')`: the framework redacts them on every wire
+ * boundary (so they are never returned to the client), yet the host still reads
+ * them back from its own live Config — which is how the transports obtain
+ * apiKeys / passwords / tokens.
+ *
+ * HISTORY: this used to be a standalone `im-channels` settings NAMESPACE
+ * registered with `settings.register(ns, schema)`. DSH 0.1.7 removed that API
+ * and replaced it with volatile fields on the plugin's own Config, so the record
+ * schema below is now composed directly into `Config.channels` (see
+ * ../config.ts). `CHANNEL_TYPES` is still the single source of truth for the
+ * kinds the gateway can manage.
  *
  * DSH's vendored schemastery has NO `.optional()` — optional fields are
  * declared with `.required(false)`; `.required()` marks a field mandatory.
  */
 
 import z from '@deepseek-ai/schemastery'
-import type { ChannelType, ChannelsSettings } from './types.ts'
-
-/** Settings namespace owned by this plugin (host-side registration). */
-export const CHANNELS_NS = 'im-channels'
+import type { ChannelType } from './types.ts'
 
 /** The channel kinds the gateway can manage. */
 export const CHANNEL_TYPES: readonly ChannelType[] = [
@@ -24,16 +28,8 @@ export const CHANNEL_TYPES: readonly ChannelType[] = [
 
 const SECRET = (): z<any> => z.string().required(false).role('secret')
 
-/** schemastery schema for the `im-channels` namespace. */
-export const ChannelsSettingsSchema: z<ChannelsSettings> = z.object({
-  /**
-   * Plugin-wide default working directory for the Agent sessions of every
-   * channel that does not carry its own `cwd` below. Optional with no default:
-   * absent = "no plugin-wide choice", which leaves the legacy `Config.cwd` and
-   * then `~/.dsh/im-workspace` as the fallbacks (see ChannelManager).
-   */
-  cwd: z.string().required(false),
-  channels: z.array(z.object({
+/** schemastery schema for ONE configured channel record. */
+export const ChannelRecordSchema = z.object({
     id: z.string().required(),
     type: z.union([...CHANNEL_TYPES]).required(),
     name: z.string().required(),
@@ -90,7 +86,6 @@ export const ChannelsSettingsSchema: z<ChannelsSettings> = z.object({
      * for anything else before approval makes the gateway close the connection.
      */
     intents: z.string().required(false),
-  })).default([]),
 })
 
 export type { ChannelConfig, ChannelStatus, ChannelType, ChannelsSettings } from './types.ts'

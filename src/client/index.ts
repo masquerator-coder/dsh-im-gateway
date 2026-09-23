@@ -40,10 +40,15 @@
  * entry to be `active` and throws `Failed to load plugins` otherwise. So the
  * stale name did not degrade this panel; it took down the whole client boot.
  *
- * The replacement is `ctx.configForms.get<T>(namespace)` (provided by
+ * The replacement is `ctx.configForms.get<T>(entryId)` (provided by
  * `@deepseek-ai/dsh-client-ui-settings`). Its `ConfigForm` exposes
  * `getSnapshot()` / `subscribe()` / `set()` — the same three calls the panel
  * already made against the old scope — so the form body needed no rewrite.
+ *
+ * The same release ALSO removed the host-side `settings.register(ns, schema)`
+ * namespace API, so the key is no longer a self-chosen namespace: it is this
+ * plugin's own profile ENTRY id (`im-gateway`, declared in cordis.patch.yml),
+ * and the form's value is the plugin's resolved Config.
  */
 
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
@@ -57,11 +62,11 @@ import type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type {} from '@deepseek-ai/dsh-api-remotes'
 import { NS, zh, en } from './locales.ts'
-import { BUNDLE_NAME } from './bundle-name.ts'
+import { BUNDLE_NAME, ENTRY_ID } from './bundle-name.ts'
 import { ChannelsConfigEntry } from './ChannelsCard.tsx'
 import type { ChannelsForm } from './settings-form.ts'
 
-export { BUNDLE_NAME }
+export { BUNDLE_NAME, ENTRY_ID }
 export type { ChannelsForm } from './settings-form.ts'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -75,12 +80,12 @@ export const inject = ['slots', 'locale', 'configForms'] as any
 export function apply(ctx: any): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'im-channels: dictionaries')
 
-  // The shared form for THIS bundle's settings namespace, owned by the
-  // ui-settings provider (so this plugin never declares `remote.settings`).
-  // `get` is idempotent per namespace and the provider disposes every form
-  // when it unloads. `ctx` is untyped here, so the section type is applied by
-  // assertion rather than by the generic parameter.
-  const form = ctx.configForms.get(NS) as ChannelsForm
+  // The shared form for THIS plugin's config entry, owned by the ui-settings
+  // provider (so this plugin never declares `remote.settings`). `get` is
+  // idempotent per entry and the provider disposes every form when it unloads.
+  // `ctx` is untyped here, so the section type is applied by assertion rather
+  // than by the generic parameter.
+  const form = ctx.configForms.get(ENTRY_ID) as ChannelsForm
 
   const t = ctx.locale.bind(NS)
 

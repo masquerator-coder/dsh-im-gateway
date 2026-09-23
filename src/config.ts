@@ -1,4 +1,15 @@
 import Schema from '@deepseek-ai/schemastery'
+import type { Volatile } from '@deepseek-ai/cordis'
+import type { ChannelConfig } from './channels/types.ts'
+import { ChannelRecordSchema } from './channels/schema.ts'
+
+/**
+ * A channel record as handed back by a volatile reference: the config shape,
+ * but recursively readonly (a `Volatile` snapshot is frozen).
+ */
+export type ReadonlyChannelConfig = Readonly<Omit<ChannelConfig, 'allowlist'>> & {
+  readonly allowlist?: readonly string[]
+}
 
 /**
  * IM gateway configuration. Every tunable value flows through cordis.yml —
@@ -43,9 +54,57 @@ export interface Config {
   cwd: string
   /** Whether idle agents are disposed after their last reply (free resources). */
   disposeAfterReply: boolean
+
+  // ---- live multi-channel settings (VOLATILE) ----
+  // DSH 0.1.7 replaced the plugin-registrable `settings.register(ns, schema)`
+  // scope service with "profile-owned live Config + form projection": a plugin
+  // now declares its own editable fields inline on its Config schema and marks
+  // them `.volatile()`. The framework then projects exactly those fields into
+  // the Plugins page form and writes edits straight back into these references
+  // WITHOUT remounting the plugin (see `loader/volatile-update`). There is no
+  // longer any per-plugin settings namespace to register.
+  /**
+   * Plugin-wide default working directory. Used by every channel without its
+   * own `cwd`; a channel's own value always wins.
+   */
+  channelsCwd: Volatile<string | undefined>
+  /** Ordered list of configured channels. */
+  channels: Volatile<readonly ReadonlyChannelConfig[] | undefined>
 }
 
-export const Config: Schema<Config> = Schema.object({
+/**
+ * Accepted INPUT shape of this plugin's configuration.
+ *
+ * The non-volatile fields are optional with defaults; the two volatile fields
+ * carry the plain (unwrapped) value a user writes in the profile or the Plugins
+ * page form. Declaring this separately from {@link Config} is the DSH-native
+ * pattern (cf. `@deepseek-ai/dsh-agent-loop`): the schema is typed
+ * `Schema<ConfigInput, Config>` so the framework maps a plain input onto a
+ * resolved Config whose volatile fields are readable references.
+ */
+export interface ConfigInput {
+  host?: string
+  port?: number
+  inboundPath?: string
+  secret?: string
+  chatIdField?: string
+  textField?: string
+  senderField?: string
+  allowlist?: string[]
+  callbackUrl: string
+  callbackChatHeader?: string
+  callbackSecretHeader?: string
+  provider?: string
+  model?: string
+  maxTokens?: number
+  agentPreset?: string
+  cwd?: string
+  disposeAfterReply?: boolean
+  channelsCwd?: string
+  channels?: ReadonlyChannelConfig[]
+}
+
+export const Config: Schema<ConfigInput, Config> = Schema.object({
   host: Schema.string().default('127.0.0.1'),
   port: Schema.number().default(8799),
   inboundPath: Schema.string().default('/im'),
@@ -63,4 +122,6 @@ export const Config: Schema<Config> = Schema.object({
   agentPreset: Schema.string().default(''),
   cwd: Schema.string().default(''),
   disposeAfterReply: Schema.boolean().default(false),
-})
+  channelsCwd: Schema.string().volatile(),
+  channels: Schema.array(ChannelRecordSchema).volatile(),
+}) as Schema<ConfigInput, Config>

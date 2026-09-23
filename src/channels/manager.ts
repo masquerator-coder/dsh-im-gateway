@@ -1,6 +1,8 @@
-import type { Context } from '@deepseek-ai/cordis'
-import type { SettingsScope } from '@deepseek-ai/dsh-settings'
-import type { ChannelConfig, ChannelStatus, ChannelsSettings } from './types.ts'
+import type { Context, Volatile } from '@deepseek-ai/cordis'
+// Type-only: declares the `loader/volatile-update` event on cordis `Events`.
+import type {} from '@deepseek-ai/cordis-plugin-loader'
+import type { ChannelConfig, ChannelStatus } from './types.ts'
+import type { ReadonlyChannelConfig } from '../config.ts'
 import type { ImGateway } from '../gateway.ts'
 import type { ChatIo, InboundRoute, TransportStatus } from '../transports/types.ts'
 import type { InboundHttpServer } from '../inbound.ts'
@@ -13,7 +15,7 @@ import type { QQBotOptions } from '../transports/qqbot.ts'
 
 /** Mutable runtime handle for one channel. */
 export interface ChannelRuntime {
-  config: ChannelConfig
+  config: ReadonlyChannelConfig
   status: ChannelStatus
   detail?: string
   /**
@@ -79,7 +81,7 @@ export function resolveChannelCwd(channelCwd?: string, defaultCwd?: string): str
  * @param next - the freshly resolved record.
  * @returns true when the channel must be restarted to honour the change.
  */
-export function channelRecordChanged(prev: ChannelConfig, next: ChannelConfig): boolean {
+export function channelRecordChanged(prev: ReadonlyChannelConfig, next: ReadonlyChannelConfig): boolean {
   return JSON.stringify(prev) !== JSON.stringify(next)
 }
 
@@ -91,7 +93,8 @@ export function channelRecordChanged(prev: ChannelConfig, next: ChannelConfig): 
  */
 export class ChannelManager {
   private readonly runtimes = new Map<string, ChannelRuntime>()
-  private scope: SettingsScope<ChannelsSettings> | null = null
+  private channels: Volatile<readonly ReadonlyChannelConfig[] | undefined> | null = null
+  private cwd: Volatile<string | undefined> | null = null
   private detachSettings?: () => void
   private readonly listeners = new Set<StatusListener>()
   private disposed = false
@@ -102,12 +105,27 @@ export class ChannelManager {
     private readonly inbound: InboundHttpServer,
   ) {}
 
-  /** Bind to the registered `im-channels` scope and reconcile on every change. */
-  attach(scope: SettingsScope<ChannelsSettings>): void {
-    if (this.disposed || this.scope !== null) return
-    this.scope = scope
+  /**
+   * Bind to the plugin's own live channel config references and reconcile on
+   * every change.
+   *
+   * DSH 0.1.7 delivers edits to volatile Config fields by writing into these
+   * references IN PLACE and then emitting `loader/volatile-update` on the
+   * owning fiber — no remount, so the channel connections survive a settings
+   * save. That event is the direct replacement for the removed
+   * `SettingsScope.watch()`.
+   * @param channels - live reference to the configured channel list.
+   * @param cwd - live reference to the plugin-wide default working directory.
+   * @returns a disposer removing the change listener.
+   */
+  attach(channels: Volatile<readonly ReadonlyChannelConfig[] | undefined>, cwd: Volatile<string | undefined>): () => void {
+    if (this.disposed || this.channels !== null) return () => {}
+    this.channels = channels
+    this.cwd = cwd
     this.reconcile()
-    this.detachSettings = scope.watch((next) => { void this.onSection(next) })
+    const off = this.ctx.on('loader/volatile-update', () => { this.reconcile() })
+    this.detachSettings = () => { off() }
+    return this.detachSettings
   }
 
   subscribe(listener: StatusListener): () => void {
@@ -127,7 +145,7 @@ export class ChannelManager {
    * @returns the configured directory, or '' when the user set none.
    */
   defaultCwd(): string {
-    return this.scope?.get().cwd?.trim() ?? ''
+    return this.cwd?.get()?.trim() ?? ''
   }
 
   /** Status summaries, ordered like the settings list, for the status route. */
@@ -154,8 +172,8 @@ export class ChannelManager {
 
   /** Reconcile desired (enabled in the section) vs actual running channels. */
   private reconcile(): void {
-    if (this.scope === null) return
-    const desired = this.scope.get().channels
+    if (this.channels === null) return
+    const desired = this.channels.get() ?? []
     const desiredIds = new Set<string>()
     for (const channel of desired) {
       desiredIds.add(channel.id)
@@ -192,13 +210,8 @@ export class ChannelManager {
     this.emitStatus()
   }
 
-  private async onSection(_next: ChannelsSettings): Promise<void> {
-    if (this.disposed) return
-    this.reconcile()
-  }
-
   /** Start one channel's transport and keep its runtime handle. */
-  private async start(channel: ChannelConfig): Promise<void> {
+  private async start(channel: ReadonlyChannelConfig): Promise<void> {
     const runtime: ChannelRuntime = { config: channel, status: 'connecting' }
     this.runtimes.set(channel.id, runtime)
     this.emitStatus()
@@ -247,8 +260,8 @@ export class ChannelManager {
     }
     this.runtimes.delete(id)
     this.emitStatus()
-    if (this.scope) {
-      const cfg = this.scope.get().channels.find(c => c.id === id)
+    if (this.channels) {
+      const cfg = (this.channels.get() ?? []).find(c => c.id === id)
       if (cfg && cfg.enabled) void this.start(cfg)
     }
   }
@@ -258,7 +271,7 @@ export class ChannelManager {
    * transport from the runtime at reply time (avoids a construction cycle) and
    * sends the agent reply back through the same transport that received it.
    */
-  private async buildTransport(channel: ChannelConfig, runtime: ChannelRuntime): Promise<ChatIo> {
+  private async buildTransport(channel: ReadonlyChannelConfig, runtime: ChannelRuntime): Promise<ChatIo> {
     this.warnIfInsecureTarget(channel)
     // Every inbound message is routed into the shared gateway with the full
     // per-channel agent routing resolved HERE from the channel record (not from
@@ -309,7 +322,9 @@ export class ChannelManager {
           // Explicit allowlist: an unset/empty per-channel allowlist means
           // ALLOW ALL (never inherit the legacy global webhook allowlist, whose
           // sender-id semantics belong to the HTTP caller).
-          allowlist: channel.allowlist ?? [],
+          // A volatile snapshot is frozen (readonly arrays), so copy it: the
+          // gateway/transport may hold a mutable list.
+          allowlist: channel.allowlist === undefined ? [] : [...channel.allowlist],
           // A turn that fails must stop the panel from claiming this channel is
           // fine; a delivered reply clears the note again.
           onFault: (detail: string | undefined) => {
@@ -448,7 +463,7 @@ export class ChannelManager {
    * plaintext `http://` to a NON-loopback host (loopback http is fine — the
    * risk is a remote URL sniffing the secret on the wire).
    */
-  private warnIfInsecureTarget(channel: ChannelConfig): void {
+  private warnIfInsecureTarget(channel: ReadonlyChannelConfig): void {
     const record = channel as unknown as Record<string, unknown>
     for (const key of ['callbackUrl', 'baseUrl', 'serverUrl', 'botApiBase'] as const) {
       const value = record[key]

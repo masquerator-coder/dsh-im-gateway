@@ -1,6 +1,6 @@
 /**
- * The `im-channels` settings namespace and the client-side form face the panel
- * binds to.
+ * The plugin's own config entry and the client-side form face the panel binds
+ * to.
  *
  * WHY THIS MODULE EXISTS: two React modules need these types (`ChannelsCard`
  * and `ChannelsSection`) but neither may import the plugin entry
@@ -13,20 +13,29 @@
  * ./dsh-stubs.d.ts). Declaring the three members this bundle calls keeps a
  * standalone `tsc` honest about the shape without depending on the package.
  *
- * HISTORY: this replaced the `settingsScope` service, which DSH 0.1.7-alpha.1
- * deleted when it rewrote settings as a profile-owned live Config plus a form
- * projection. The old scope exposed `getSnapshot` / `subscribe` / `set`; so
- * does `ConfigForm`, so the panel body itself needed no rewrite.
+ * HISTORY: DSH 0.1.7-alpha.1 rewrote settings as "profile-owned live Config plus
+ * a form projection" and deleted BOTH the client `settingsScope` service and the
+ * host-side `settings.register(ns, schema)` namespace API. A plugin now declares
+ * its editable fields inline on its own Config schema, marked `.volatile()`, and
+ * the framework projects exactly those fields into the form. So this form is no
+ * longer keyed by a self-registered namespace name; it is keyed by the plugin's
+ * own profile ENTRY id, and its value is the plugin's resolved Config.
  */
 
 import type { ChannelConfig } from '../channels/types.ts'
 
-/** The `im-channels` settings namespace this bundle owns. */
+/**
+ * The volatile subset of this plugin's Config that the panel reads and writes.
+ *
+ * Mirrors `Config.channels` / `Config.channelsCwd` in ../config.ts: the host
+ * declares both `.volatile()` so the framework accepts form edits without
+ * remounting the plugin.
+ */
 export interface ChannelsSettings {
   /** Every configured channel, in display order. */
-  channels: ChannelConfig[]
+  channels?: ChannelConfig[]
   /** Plugin-wide default working directory (set on the card). */
-  cwd?: string
+  channelsCwd?: string
 }
 
 /**

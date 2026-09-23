@@ -25,3 +25,13 @@
         agentPreset: ''
         cwd: ''
         disposeAfterReply: false
+        # VOLATILE channel settings (DSH 0.1.7+). Both fields are edited from
+        # this plugin's own page on the Plugins page; the framework writes edits
+        # straight into the running references without remounting the plugin, so
+        # editing them never bounces a live channel connection.
+        #   channelsCwd — plugin-wide default working directory (a channel's own
+        #                 `cwd` always wins; empty = fall back to `cwd` above,
+        #                 then ~/.dsh/im-workspace).
+        #   channels    — the configured channels, in display order.
+        channelsCwd: ''
+        channels: []

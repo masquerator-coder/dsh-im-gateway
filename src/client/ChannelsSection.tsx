@@ -230,7 +230,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
   )
   const channels: ChannelConfig[] = snapshot?.value?.channels ?? []
   /** Host value of the plugin-wide default working directory (may be absent). */
-  const hostCwd: string = snapshot?.value?.cwd ?? ''
+  const hostCwd: string = snapshot?.value?.channelsCwd ?? ''
 
   const [activeId, setActiveId] = useState<string | undefined>(
     channels.length > 0 ? channels[0]!.id : undefined,
@@ -524,7 +524,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     setNotice('')
     setNoticeIsError(false)
     try {
-      await form.set('cwd', defaultCwd.trim())
+      await form.set('channelsCwd', defaultCwd.trim())
       setCwdDraft(null)
       setNotice(t('channels.saved'))
     } catch (error) {

@@ -4,9 +4,6 @@ import { Config } from './config.ts'
 import type { Config as ConfigType } from './config.ts'
 import { ImGateway } from './gateway.ts'
 import { InboundHttpServer } from './inbound.ts'
-import {
-  CHANNELS_NS, ChannelsSettingsSchema,
-} from './channels/schema.ts'
 import { ChannelManager } from './channels/manager.ts'
 import { STATUS_ROUTE_PATH } from './status-proto.ts'
 import { createStatusHandler, type RequestGate, type WebRouteService } from './status-route.ts'
@@ -25,7 +22,6 @@ declare module '@deepseek-ai/cordis' {
 export const name = 'dsh-im-gateway'
 export const inject = ['agents']
 export { Config }
-export { CHANNELS_NS, ChannelsSettingsSchema }
 
 export function apply(ctx: Context, config: ConfigType): void {
   const gateway = new ImGateway(ctx, {
@@ -42,12 +38,23 @@ export function apply(ctx: Context, config: ConfigType): void {
     ctx.logger[level](message)
   })
 
-  // Multi-channel IM management: register the durable settings namespace and
-  // run every enabled channel.
+  // Multi-channel IM management. DSH 0.1.7 has no plugin-registrable settings
+  // namespace: the channel list and the plugin-wide default working directory
+  // are VOLATILE fields on this plugin's own Config, so the framework projects
+  // them into the Plugins page form and writes edits straight back into these
+  // references without remounting the plugin. `attach` reconciles on
+  // `loader/volatile-update`, and `settings.configure` opts this instance out
+  // of auto-generated pages (it ships its own panel).
   const channelManager = new ChannelManager(ctx, gateway, inbound)
+  ctx.effect(
+    () => channelManager.attach(config.channels, config.channelsCwd),
+    'dsh-im-gateway.channels()',
+  )
   ctx.inject(['settings'], (settingsCtx) => {
-    const scope = settingsCtx.settings.register(CHANNELS_NS, ChannelsSettingsSchema)
-    channelManager.attach(scope)
+    settingsCtx.effect(
+      () => settingsCtx.settings.configure({ auto: false }, ctx.fiber),
+      'dsh-im-gateway.settings-policy()',
+    )
   })
 
   // Legacy single-channel path: keep the global webhook route alive exactly as
