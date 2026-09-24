@@ -37,8 +37,12 @@ async function main() {
       () => { nextCalled.v = true; return Promise.resolve('unavailable') },
     )
     assert.strictEqual(sent.length, 1, 'approval prompt sent')
-    assert.match(sent[0], /授权请求/, 'prompt mentions approval')
-    assert.match(sent[0], /write/, 'prompt carries tool name')
+    // `noUncheckedIndexedAccess` types `sent[0]` as `string | undefined`; the
+    // guard keeps the assertions below honest without a non-null assertion.
+    const prompt = sent[0]
+    assert.ok(prompt !== undefined, 'approval prompt captured')
+    assert.match(prompt, /授权请求/, 'prompt mentions approval')
+    assert.match(prompt, /write/, 'prompt carries tool name')
     // user replies N
     const consumed = bridge.consume('s1', 'N')
     assert.strictEqual(consumed.consumed, true, 'N consumed')
@@ -107,8 +111,10 @@ async function main() {
     ]
     const p = handler({ questions, signal: undefined }, () => Promise.resolve({ answers: [] }))
     assert.strictEqual(sent.length, 1)
-    assert.match(sent[0], /提问/)
-    assert.match(sent[0], /题号:选项/, 'multi-question protocol hint shown')
+    const prompt = sent[0]
+    assert.ok(prompt !== undefined, 'question prompt captured')
+    assert.match(prompt, /提问/)
+    assert.match(prompt, /题号:选项/, 'multi-question protocol hint shown')
     bridge.consume('s6', '1:1 2:1')
     const ans = await p
     assert.strictEqual(ans.answers.length, 2, 'both answered')

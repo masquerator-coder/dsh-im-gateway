@@ -374,9 +374,14 @@ export class ImGateway {
         runtime.onFault?.(detail)
         await this.notifyFailure(reply, sessionId, detail)
       })
-    this.tails.set(sessionId, run.finally(() => {
-      if (this.tails.get(sessionId) === run) this.tails.delete(sessionId)
-    }))
+    // The map must hold the SAME promise object the cleanup compares against.
+    // `run.finally(...)` returns a NEW promise, so storing it while testing
+    // `=== run` could never match and the entry was never removed: one promise
+    // (and its closure over message/reply) leaked per distinct session forever.
+    const settled = run.finally(() => {
+      if (this.tails.get(sessionId) === settled) this.tails.delete(sessionId)
+    })
+    this.tails.set(sessionId, settled)
     await run
   }
 
@@ -784,6 +789,10 @@ export class ImGateway {
   }
 
   private async disposeAgent(sessionId: SessionId): Promise<void> {
+    // A disposed session keeps no outbound route: drop its sender here so the
+    // map does not retain a closure per session for the life of the plugin
+    // (it is otherwise only cleared on close()).
+    this.senders.delete(String(sessionId))
     const handle = this.agents.get(sessionId)
     if (handle === undefined) return
     this.agents.delete(sessionId)

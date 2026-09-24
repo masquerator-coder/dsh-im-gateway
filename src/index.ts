@@ -69,10 +69,13 @@ export function apply(ctx: Context, config: ConfigType): void {
     onMessage: async (message) => {
       const { chatId, text, senderId } = message
       const sink = async (reply: string): Promise<void> => {
-        const headers: Record<string, string> = {
-          'content-type': 'application/json',
-          [config.callbackChatHeader]: chatId,
-        }
+        const headers: Record<string, string> = { 'content-type': 'application/json' }
+        // Only echo the chat id into a header when it is header-representable:
+        // `fetch` throws `TypeError: Cannot convert argument to a ByteString`
+        // for any code point above 0xFF, before the request is sent — a single
+        // non-ASCII chat id (a webhook may send anything) would otherwise make
+        // every reply for that chat undeliverable. The id still rides the body.
+        if (/^[\x20-\x7E]*$/.test(chatId)) headers[config.callbackChatHeader] = chatId
         if (config.secret !== '') headers[config.callbackSecretHeader] = config.secret
         const res = await fetch(config.callbackUrl, {
           method: 'POST',
@@ -113,8 +116,23 @@ export function apply(ctx: Context, config: ConfigType): void {
     const handler = createStatusHandler({
       list: () => channelManager.statusList(),
       // Resolved per request: the connection service mounts independently of
-      // this plugin, so an apply-time lookup could miss it.
-      reject: (req) => (webCtx.get('connection') as RequestGate | undefined)?.requestRejection?.(req),
+      // this plugin, so an apply-time lookup could miss it. When it is missing
+      // the request is REFUSED (401) rather than admitted: this route returns a
+      // live bind QR and `webServer` applies no authentication of its own, so
+      // "no gate available" must never mean "open".
+      reject: (req) => {
+        const gate = webCtx.get('connection') as RequestGate | undefined
+        if (gate === undefined) {
+          webCtx.logger.warn('[im-gateway] status route: connection service unavailable; refusing (failing closed)')
+          return 401
+        }
+        try {
+          return gate.requestRejection?.(req)
+        } catch (error) {
+          webCtx.logger.warn(`[im-gateway] status route trust check failed: ${String(error)}`)
+          return 401
+        }
+      },
       log: (message) => webCtx.logger.warn(message),
     })
     webCtx.effect(
@@ -125,6 +143,12 @@ export function apply(ctx: Context, config: ConfigType): void {
 
   ctx.effect(() => {
     let started = false
+    // The rejection MUST be handled on the promise itself, not only in the
+    // disposer: `ctx.effect` never observes this promise, so a failed bind
+    // (EADDRINUSE, EACCES) would otherwise surface as an unhandled rejection
+    // and take the whole DSH process down instead of just this plugin. A bind
+    // failure is reported and degraded past — the IM channels keep working,
+    // only the inbound webhook is unavailable.
     const boot = inbound.listen().then(() => {
       started = true
       const routes = inbound.listRoutes()
@@ -133,9 +157,14 @@ export function apply(ctx: Context, config: ConfigType): void {
           + ` routes=${routes.length ? routes.join(',') : config.inboundPath}`
           + (config.secret !== '' ? ' (secret-auth on)' : ''),
       )
+    }).catch((error: unknown) => {
+      ctx.logger.error(
+        `[im-gateway] inbound webhook FAILED to bind ${config.host}:${config.port}: ${String(error)}`
+          + ' — IM channels keep running, but the inbound webhook is unavailable',
+      )
     })
     return async () => {
-      await boot.catch(() => {})
+      await boot
       if (started) await inbound.close()
       await gateway.close()
       await channelManager.close()

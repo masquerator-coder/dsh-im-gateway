@@ -59,6 +59,45 @@ export function recipientOf(chatId: string): string {
   return slash >= 0 ? chatId.slice(slash + 1) : chatId
 }
 
+/**
+ * Convert an HTML mail body to readable plain text.
+ *
+ * Deliberately hand-rolled and dependency-free: this is a last-resort fallback
+ * for messages that ship no text/plain part, and the repo already vendors its
+ * own helpers rather than adding libraries (see scripts/check-install-scripts.mjs).
+ * Full HTML parsing is not the goal — the agent only needs the words, and the
+ * caller slices the result. `<script>`/`<style>` content is dropped so a mail's
+ * CSS does not reach the model.
+ *
+ * Exported for the smoke suite (`node --experimental-transform-types` cannot
+ * load `mailparser`'s ESM default interop reliably, but this is pure).
+ *
+ * @param html - raw HTML body.
+ * @returns the extracted text, with entities decoded and tags collapsed.
+ */
+export function htmlToText(html: string): string {
+  return html
+    // Drop non-content elements wholesale, including their inner text.
+    .replace(/<(script|style|head)[\s\S]*?<\/\1\s*>/gi, ' ')
+    // Block-level boundaries become newlines so paragraphs stay separate.
+    .replace(/<\/?(p|div|br|tr|li|h[1-6]|table|section|article|blockquote)\b[^>]*>/gi, '\n')
+    // Any remaining tag is structural noise.
+    .replace(/<[^>]*>/g, '')
+    // Decode the entities that actually show up in mail. `&amp;` is LAST so a
+    // literal `&amp;lt;` does not become `<`.
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#0*39;|&apos;/gi, "'")
+    .replace(/&amp;/gi, '&')
+    // Collapse the runs of blank lines the tag stripping leaves behind.
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n\s*\n\s*\n+/g, '\n\n')
+    .split('\n').map((line) => line.trim()).join('\n')
+    .trim()
+}
+
 /** Minimal adapter over nodemailer + imapflow, loaded lazily at runtime. */
 export class EmailTransport implements ChannelTransport {
   private transport: any = null
@@ -179,7 +218,15 @@ export class EmailTransport implements ChannelTransport {
         continue
       }
       const text = await this.extractText(message)
-      if (!text) continue
+      if (!text) {
+        // Do not fail silently: the cursor below advances past this UID, so the
+        // message is gone for good. Without a log line an operator sees mail
+        // "disappear" with nothing to explain it.
+        this.options.log?.(
+          `email skip: uid ${uid} from ${sender} yielded no readable body (no text/plain or HTML part)`,
+        )
+        continue
+      }
       this.options.onInbound({
         chatId: `${account}/${sender}`,
         text,
@@ -230,20 +277,27 @@ export class EmailTransport implements ChannelTransport {
       try {
         const { simpleParser } = await import('mailparser')
         const parsed = await simpleParser(message.source)
-        let body: string = (parsed.text as string) || ''
+        // Prefer the plain-text part; fall back to the HTML part. Many senders
+        // (marketing, notifications, and any client that only emits HTML) ship
+        // NO text/plain part at all, so reading `parsed.text` alone silently
+        // produced '' for a perfectly readable message — and the caller then
+        // skipped it while still advancing the UID cursor, so that mail was
+        // dropped permanently with nothing in the log to explain it.
+        const raw: string = (parsed.text as string)
+          || (typeof parsed.html === 'string' ? htmlToText(parsed.html) : '')
         // Normalize line endings, then strip quoted/forwarded lines (a line
         // starting with '>') one line at a time — a whole-line regex would
         // also eat reply lines that merely begin with '>' content the user
         // wrote, and would leave `\r` fragments behind on CRLF mail.
-        body = body.replace(/\r\n/g, '\n')
-        body = body.split('\n')
+        const body: string = raw.replace(/\r\n/g, '\n')
+          .split('\n')
           .filter((line) => !line.trimStart().startsWith('>'))
           .join('\n')
           .trim()
           .slice(0, 4000)
         return body
-      } catch {
-        /* fall through */
+      } catch (error) {
+        this.options.log?.(`email: body parse failed: ${String(error)}`)
       }
     }
     return ''

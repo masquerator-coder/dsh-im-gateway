@@ -45,13 +45,23 @@ const MARGIN_MODULES = 4
 export function qrSvgFor(payload: string): string {
   const text = (payload ?? '').trim()
   if (text === '') return ''
-  // Type number 0 = pick the smallest version that fits (the bind URL is ~90
-  // chars, which lands on version 6 / 41 modules).
-  const qr = qrcode(0, EC_LEVEL)
-  qr.addData(text)
-  qr.make()
-  // cellSize is nominal here: `scalable` emits a viewBox, so the box size drives
-  // the rendering size. The output is pure data-driven markup (the payload only
-  // selects modules, it is never interpolated), hence safe to inject as HTML.
-  return qr.createSvgTag({ cellSize: 4, margin: MARGIN_MODULES, scalable: true })
+  try {
+    // Type number 0 = pick the smallest version that fits (the bind URL is ~90
+    // chars, which lands on version 6 / 41 modules).
+    const qr = qrcode(0, EC_LEVEL)
+    qr.addData(text)
+    qr.make()
+    // cellSize is nominal here: `scalable` emits a viewBox, so the box size
+    // drives the rendering size. The output is pure data-driven markup (the
+    // payload only selects modules, it is never interpolated), hence safe to
+    // inject as HTML.
+    return qr.createSvgTag({ cellSize: 4, margin: MARGIN_MODULES, scalable: true })
+  } catch {
+    // MUST NOT THROW. This runs inside a React render (`useMemo` in the panel),
+    // so an exception here does not degrade the QR — it takes down the entire
+    // settings panel. `qrcode-generator` rejects a payload too long for its
+    // largest version, and the payload is gateway-supplied data that the panel
+    // does not control. `''` renders the "no QR yet" state instead of a crash.
+    return ''
+  }
 }

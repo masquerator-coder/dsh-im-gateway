@@ -212,7 +212,13 @@ export class WechatIlinkTransport implements ChannelTransport {
   private async saveState(): Promise<void> {
     try {
       await mkdir(this.stateDir, { recursive: true })
-      await writeFile(this.stateFile, JSON.stringify(this.state), 'utf8')
+      // 0o600: this file holds the ilink bot_token (plus the bound user and
+      // context token), which is a credential — anyone who can read it can act
+      // as this bot. The default mode under a typical umask is 0644, i.e.
+      // readable by every user on the machine. DSH's own credential store uses
+      // 0600 for the same reason. The mode only applies when the file is
+      // created, which is the case that matters here.
+      await writeFile(this.stateFile, JSON.stringify(this.state), { encoding: 'utf8', mode: 0o600 })
     } catch (error) {
       this.options.log?.(`wechat state persist failed: ${String(error)}`)
     }
@@ -350,7 +356,25 @@ export class WechatIlinkTransport implements ChannelTransport {
     const errcode = j.errcode ?? 0
     if (errcode === -14) {
       this.connected = false
+      // A dead session must CLEAR the credentials, not just the connected flag.
+      // `isBound()` is `token && scannedUser`, and `pollOnce` routes every round
+      // to `pollInbound` while it is true — so leaving the revoked token in
+      // place wedged the channel permanently: `pollInbound` bailed out at its
+      // own `isBound()` guard, the QR retry branch below was unreachable, and
+      // the panel kept a channel that could never receive anything until the
+      // user manually edited the config. Emptying them puts the channel back on
+      // the unbound path, where the poll loop re-requests a login QR and a
+      // rescan repopulates token/scannedUser (see `pollQrStatus`).
+      this.state.token = ''
+      this.state.scannedUser = ''
+      this.state.contextToken = ''
+      this.state.cursor = ''
       this.state.lastError = '微信连接断线：会话已失效，请重新扫码绑定'
+      this.qrKey = ''
+      this.qrWaiting = false
+      // Retry the QR immediately rather than waiting out the rate-limit window
+      // for the credential that just died.
+      this.lastQrAttempt = 0
       this.options.onState?.('error', this.state.lastError)
       await this.saveState().catch(() => {})
       return

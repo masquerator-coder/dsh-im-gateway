@@ -68,9 +68,18 @@ export class HttpTransport implements ChannelTransport {
 
   /** POST one reply back to the configured callback URL (ChatIo.sendText). */
   async sendText(chatId: string, text: string): Promise<void> {
-    const headers: Record<string, string> = {
-      'content-type': 'application/json',
-      [this.options.callbackChatHeader || 'x-im-chat-id']: chatId,
+    const headers: Record<string, string> = { 'content-type': 'application/json' }
+    // The chat id ALSO rides the body (below), so the header is a convenience
+    // for receivers that route on it. It may only be set when the value is
+    // representable in a header: undici/`fetch` throws
+    // `TypeError: Cannot convert argument to a ByteString` for any code point
+    // above 0xFF, and a chat id is attacker-adjacent data (a WeChat display
+    // name, a CMCC number, a webhook-supplied id). Setting it unconditionally
+    // turned one non-ASCII chat into a reply that could never be delivered —
+    // and the throw happened before the request was even sent.
+    const header = this.options.callbackChatHeader || 'x-im-chat-id'
+    if (/^[\x20-\x7E]*$/.test(chatId)) {
+      headers[header] = chatId
     }
     if (this.options.callbackSecret) {
       headers['x-im-secret'] = this.options.callbackSecret

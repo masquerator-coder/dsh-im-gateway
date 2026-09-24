@@ -20,7 +20,7 @@
  */
 
 import * as React from 'react'
-import { createElement as h, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react'
+import { createElement as h, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 
 import {
   type ChannelConfig, type ChannelType,
@@ -29,14 +29,7 @@ import type { ChannelsForm } from './settings-form.ts'
 import { writeField } from './write-field.ts'
 import { STATUS_ROUTE_PATH, type ChannelStatusPayload } from '../status-proto.ts'
 import { QR_SIZE_PX, qrSvgFor } from './qr.ts'
-
-/** One editable field of a channel, keyed by the schema field name. */
-interface Field {
-  key: string
-  labelKey: string
-  secret?: boolean
-  placeholder?: string
-}
+import { requiredMissing, type Field, type Template } from './required-fields.ts'
 
 /** Email providers: choosing one auto-fills host / IMAP / SMTP / TLS. */
 interface EmailProvider {
@@ -77,17 +70,6 @@ const SETUP_STEPS: Partial<Record<ChannelType, string[]>> = {
   qq: ['setup.qq.0', 'setup.qq.1', 'setup.qq.2', 'setup.qq.3', 'setup.qq.4'],
 }
 
-/** Non-secret fields that must be present before a channel can be saved. */
-const REQUIRED_BY_TYPE: Partial<Record<ChannelType, string[]>> = {
-  email: ['account'],
-  http: ['callbackUrl'],
-  feishu: ['appId'],
-  // The QQ robot cannot even fetch an access token without both; AppSecret is a
-  // secret field (required implicitly: an empty secret box on a new channel is
-  // reported as missing) and the AppID is required explicitly here.
-  qq: ['appId'],
-}
-
 /** Descriptions rendered under each advanced field key. */
 const ADVANCED_HINTS: Record<string, string> = {
   allowlist: '每行一个发送者 ID（邮箱/QQ/手机号/HTTP sender_id），留空 = 允许全部',
@@ -96,12 +78,6 @@ const ADVANCED_HINTS: Record<string, string> = {
   maxTokens: '单轮输出上限（0 = 不限制）',
   cwd: 'Agent 工作目录（留空 = 使用上面的全局默认工作目录）；改动会让该通道在新目录里开始新会话，旧会话仍留在原工作区',
   agentPreset: 'Agent 预设名（留空 = 默认）',
-}
-
-/** Per-type prefill template + field list (the "傻瓜式" defaults). */
-interface Template {
-  defaults: Record<string, unknown>
-  fields: Field[]
 }
 
 function emailFields(provider: EmailProvider): Field[] {
@@ -193,31 +169,12 @@ export interface ChannelsSectionProps {
 
 /**
  * Front-end required-field check before save. Returns the labelKey of the
- * first missing field, or null when the record is complete. A stored secret
- * counts as filled (the client cannot see its value after redaction).
+ * first missing field, or null when the record is complete.
+ *
+ * Extracted to `./required-fields.ts` (JSX-free) so `scripts/smoke.mts` can
+ * exercise it: an over-strict rule here does not crash, it silently makes
+ * already-configured channels unsavable, which needs a real test.
  */
-function requiredMissing(
-  type: ChannelType,
-  template: Template | undefined,
-  active: ChannelConfig | undefined,
-  draft: Record<string, string>,
-  provider: string,
-): string | null {
-  const rec = active as unknown as Record<string, unknown> | undefined
-  const missing: string[] = []
-  for (const f of template?.fields ?? []) {
-    if (f.secret) {
-      const stored = rec !== undefined && rec[f.key] !== undefined
-      if (!stored && !(draft[f.key] ?? '').trim()) missing.push(f.labelKey)
-      continue
-    }
-    const required = (REQUIRED_BY_TYPE[type] ?? []).includes(f.key)
-    if (required && !(draft[f.key] ?? '').trim()) missing.push(f.labelKey)
-  }
-  // A custom email provider needs an explicit server host (presets fill it).
-  if (type === 'email' && provider === 'custom' && !(draft.host ?? '').trim()) missing.push('field.host')
-  return missing.length > 0 ? missing[0]! : null
-}
 
 export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement {
   const { form, t } = props
@@ -245,6 +202,8 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
   const [noticeIsError, setNoticeIsError] = useState(false)
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [confirmingDelete, setConfirmingDelete] = useState(false)
+  /** Pending "disarm the delete button" timer; cleared on unmount. */
+  const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   /**
    * Draft for the plugin-wide default working directory. `null` = "no local
    * edit yet", so the box follows the host value (including a change made by
@@ -307,12 +266,26 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     }
   }, [])
 
+  // Clear the delete-confirm timer on unmount so it can never fire against a
+  // torn-down panel.
+  useEffect(() => () => {
+    if (confirmTimer.current !== null) {
+      clearTimeout(confirmTimer.current)
+      confirmTimer.current = null
+    }
+  }, [])
+
   // Fields for the current creation/selection.
   const currentType = (creating as ChannelType) ?? (active?.type as ChannelType)
   const template = TP[currentType]
-  const activeSecretSet = active
-    ? (template?.fields.some(f => f.secret && (active as unknown as Record<string, unknown>)[f.key] !== undefined))
-    : false
+  // Whether this form's secrets should be labelled as already configured. This
+  // is deliberately NOT a per-field presence test: the Host redacts secrets out
+  // of every wire layer, so a `rec[f.key] !== undefined` probe can never be true
+  // (see `requiredMissing` above) and the label never rendered. "Editing an
+  // existing channel" is the honest client-side signal: its stored secrets are
+  // retained unless the user overwrites them.
+  const activeSecretSet = active !== undefined && creating === null
+    && (template?.fields.some(f => f.secret) ?? false)
 
   // Effect: (re)backfill the form when selecting/saving a channel.
   useEffect(() => {
@@ -390,7 +363,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
 
       // Front-end required-field validation (per-type; custom email server host
       // is only required when the provider is 自定义).
-      const missing = requiredMissing(type, tp, active, draft, provider)
+      const missing = requiredMissing(type, tp, creating === null, draft, provider)
       if (missing !== null) {
         setNotice(t('channels.missingField') + ' ' + missing)
         setNoticeIsError(true)
@@ -472,7 +445,15 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
       setConfirmingDelete(true)
       setNotice(t('channels.confirmHint'))
       setNoticeIsError(true)
-      setTimeout(() => setConfirmingDelete(false), 3000)
+      // Tracked so it can be cleared on unmount: the panel lives inside the
+      // settings page and is torn down when the user navigates away, and an
+      // untracked timer would then call setState on an unmounted component
+      // (and would re-arm its own 3s window on every extra click).
+      if (confirmTimer.current !== null) clearTimeout(confirmTimer.current)
+      confirmTimer.current = setTimeout(() => {
+        confirmTimer.current = null
+        setConfirmingDelete(false)
+      }, 3000)
       return
     }
     setBusy(true)

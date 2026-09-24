@@ -1031,6 +1031,13 @@ export function apiFailure(status: number, json: any, text: string): QqApiFailur
   return {
     code: status,
     message: text.trim().slice(0, 160) || `HTTP ${status}`,
-    fatal: status === 401 || status === 403,
+    // A bare HTTP 401/403 is NOT treated as fatal. The token is cached and
+    // refreshed (see the 11244 retry in qqFetch), so this status is what a
+    // freshly-rotated or briefly-invalid access token looks like; declaring it
+    // fatal set `desiredConnected = false` and stopped the reconnect loop for
+    // good, so one transient auth blip killed the channel until the operator
+    // manually re-saved it. Only the platform's own configuration codes
+    // (FATAL_API_CODES) are genuinely non-retryable.
+    fatal: false,
   }
 }

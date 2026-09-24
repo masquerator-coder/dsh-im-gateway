@@ -93,6 +93,13 @@ export class SmsClient extends EventEmitter {
   private sawPong = false
   /** How long to wait for the `auth_ok` frame after the socket opens. */
   private readonly authTimeoutMs = 20000
+  /**
+   * How long the TCP+TLS+WS handshake itself may take. `authTimeoutMs` only
+   * arms AFTER `open` fires, so without this a server that accepted the TCP
+   * connection but never completed the upgrade left `connect()` pending
+   * forever: the transport reported 连接中 and the channel never recovered.
+   */
+  private readonly openTimeoutMs = 20000
   connected = false
 
   constructor(
@@ -131,12 +138,24 @@ export class SmsClient extends EventEmitter {
         settled = true
         resolve()
       }
+      // Bound the handshake: `open` may never arrive (a half-open TCP
+      // connection, a stalled TLS upgrade), and `authTimeoutMs` cannot help
+      // because it only arms inside the `open` handler. Declared at promise
+      // scope so every socket handler can clear it.
+      const openTimeout = setTimeout(() => {
+        if (settled) return
+        this.errLog(`websocket open timeout after ${this.openTimeoutMs}ms`)
+        try { this.ws?.terminate() } catch { /* already gone */ }
+        fail(new Error(`websocket open timeout after ${this.openTimeoutMs}ms`))
+      }, this.openTimeoutMs)
+      const clearOpenTimeout = (): void => { clearTimeout(openTimeout) }
       try {
         this.ws = new WebSocket(this.serverUrl, {
           rejectUnauthorized: true,
           headers: { 'X-API-Key': this.apiKey },
         })
         this.ws.on('open', () => {
+          clearOpenTimeout()
           trace('[sms] ws open')
           log('websocket open')
           this.connected = true
@@ -184,6 +203,7 @@ export class SmsClient extends EventEmitter {
           this.handleMessage(data.toString())
         })
         this.ws.on('close', (code, reason) => {
+          clearOpenTimeout()
           trace(`[sms] ws close code=${code} reason=${reason.toString()}`)
           log('websocket closed', { code, reason: reason.toString() })
           // A close before auth completes means the connection attempt failed
@@ -195,6 +215,7 @@ export class SmsClient extends EventEmitter {
           this.attemptReconnect()
         })
         this.ws.on('error', (error) => {
+          clearOpenTimeout()
           trace(`[sms] ws error ${error.message}`)
           this.errLog(`websocket error: ${error.message}`)
           this.emit('error', error)
@@ -202,6 +223,7 @@ export class SmsClient extends EventEmitter {
           this.ws?.close()
         })
       } catch (error) {
+        clearOpenTimeout()
         this.errLog(`connect failed: ${String(error)}`)
         this.emit('error', error)
         fail(error instanceof Error ? error : new Error(String(error)))
@@ -275,7 +297,16 @@ export class SmsClient extends EventEmitter {
           trace(`[sms] sendFrame ws.send ERROR ${error.message} id=${messageId}`)
           reject(error)
         } else {
+          // PROTOCOL LIMITATION, not an oversight: the 5G-message frame set
+          // (see the protocol header above) defines NO server acknowledgement
+          // for an outbound `send` — the server answers a bad frame with a
+          // bare `{type:"error"}` that carries no messageId, so it cannot be
+          // correlated back to this send. Resolving here therefore means "the
+          // bytes left this socket", NOT "the message was delivered". It is
+          // logged at warn level so an undelivered reply is at least visible
+          // in the host log instead of looking like a clean success.
           trace(`[sms] sendFrame ws.send OK id=${messageId} (socket-level only, no server ack)`)
+          this.emitLog?.('warn', `cmcc send id=${messageId} left the socket unconfirmed (protocol has no send ack)`)
           resolve(messageId)
         }
       })

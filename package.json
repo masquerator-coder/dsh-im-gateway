@@ -33,10 +33,13 @@
     "build": "node scripts/build.mjs && node scripts/check-install-scripts.mjs",
     "check:deps": "node scripts/check-install-scripts.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck:scripts": "tsc -p tsconfig.scripts.json --noEmit",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "smoke": "node --experimental-transform-types scripts/smoke.mts",
-    "qq-probe": "node --experimental-transform-types scripts/qq-probe.mts"
+    "interaction-verify": "node --experimental-transform-types scripts/interaction-verify.mts",
+    "qq-probe": "node --experimental-transform-types scripts/qq-probe.mts",
+    "verify": "npm run typecheck && npm run typecheck:scripts && npm run lint && npm run smoke && npm run interaction-verify"
   },
   "dsh": {
     "bundle": {

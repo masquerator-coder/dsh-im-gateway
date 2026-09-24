@@ -61,6 +61,14 @@
  *      panel said 已保存, cleared the create form, and dropped back to the
  *      "尚未配置任何通道" empty state — which reads as "the QR never appeared".
  *      Exercised for real (not string-matched) because the failure is silence.
+ *  16. Required-field rules when EDITING — `requiredMissing` must not demand a
+ *      secret while editing. The Host strips `role('secret')` fields out of
+ *      every wire layer, so the panel's old `rec[key] !== undefined` presence
+ *      probe could never be true and every already-configured channel failed
+ *      validation on a field the user could not fill without retyping a
+ *      credential they meant to keep. Also pins that the relaxation did NOT
+ *      disable validation wholesale (non-secret mandatory fields and a custom
+ *      email host are still enforced on edit).
  *
  * Real transports that need live services (email / feishu / wechat / qq / a
  * live CMCC gateway) are exercised by starting them in the plugin; this file
@@ -69,20 +77,39 @@
  * Run:  node --experimental-transform-types scripts/smoke.mts
  */
 
-import { createServer } from 'node:http'
+import { createServer, type Server, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from 'node:http'
 import assert from 'node:assert/strict'
+import type { InboundRoute } from '../src/transports/types.ts'
 
 // Unbuffered progress marker (stderr) so a kill/timeout still shows where we are.
-const step = (s) => { process.stderr.write(`[smoke] ${s}\n`) }
+const step = (s: string): void => { process.stderr.write(`[smoke] ${s}\n`) }
 
-const withTimeout = (p, ms, label) =>
+/**
+ * The bound port of a listening server.
+ *
+ * `server.address()` is `AddressInfo | string | null`, and this suite binds
+ * every fixture to port 0 with an explicit host, so the string/null cases are
+ * unreachable — but asserting that here keeps every call site free of the same
+ * non-null dance (and makes the assumption fail loudly if it ever breaks).
+ * @param server - a server that has already started listening.
+ * @returns its TCP port.
+ */
+const portOf = (server: Server): number => {
+  const address = server.address()
+  if (address === null || typeof address === 'string') {
+    throw new Error(`expected a TCP address for a listening server, got ${String(address)}`)
+  }
+  return address.port
+}
+
+const withTimeout = <T,>(p: Promise<T>, ms: number, label: string): Promise<T> =>
   Promise.race([
     p,
-    new Promise((_, rej) => setTimeout(() => rej(new Error(`${label} timed out`)), ms)),
+    new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`${label} timed out`)), ms)),
   ])
 
 /** Poll a predicate until it holds (or fail the smoke run). */
-const waitUntil = async (predicate, ms, label) => {
+const waitUntil = async (predicate: () => boolean, ms: number, label: string): Promise<void> => {
   const deadline = Date.now() + ms
   while (Date.now() < deadline) {
     if (predicate()) return
@@ -131,28 +158,77 @@ assert.equal(recipientOf('you@x.com/sender@foo.com'), 'sender@foo.com', 'compoun
 assert.equal(recipientOf('sender@foo.com'), 'sender@foo.com', 'plain chatId passes through')
 step('email recipientOf OK')
 
+// --- 1c. HTML-only mail must still produce a readable body ---
+// `extractText` read `parsed.text` alone. Plenty of senders ship NO text/plain
+// part, so those messages parsed to '' — and the caller skipped them while
+// still advancing the UID cursor, dropping the mail permanently and silently.
+// The HTML fallback is asserted against mailparser's OWN plaintext rendering of
+// the same message, so it cannot silently drift into producing something the
+// plain-text path would never have produced.
+const { htmlToText } = await import('../src/transports/email.ts')
+{
+  const { simpleParser } = await import('mailparser')
+  const htmlOnly = [
+    'From: sender@example.com',
+    'To: me@example.com',
+    'Subject: =?utf-8?B?5L2g5aW9?=',
+    'Content-Type: text/html; charset="utf-8"',
+    '',
+    '<html><head><style>body{color:red}</style></head><body>',
+    '<p>Hello <b>there</b></p>',
+    '<div>Line two &amp; more</div>',
+    '<script>alert(1)</script>',
+    '<p>3 &lt; 5</p>',
+    '<table><tr><td>cell</td></tr></table>',
+    '</body></html>',
+  ].join('\r\n')
+  const parsed = await simpleParser(htmlOnly)
+  assert.equal(parsed.text, 'Hello there\n\nLine two & more\n\n3 < 5\n\ncell',
+    'fixture sanity: mailparser derives plaintext from this HTML')
+  const viaFallback = htmlToText(String(parsed.html)).replace(/\n\n+/g, '\n\n')
+  assert.equal(
+    viaFallback.replace(/\n+/g, '\n'),
+    String(parsed.text).replace(/\n+/g, '\n'),
+    'the HTML fallback must recover the same words mailparser would have',
+  )
+  assert.ok(!/color:red/.test(viaFallback), 'CSS must not reach the model')
+  assert.ok(!/alert\(1\)/.test(viaFallback), 'script content must not reach the model')
+  assert.ok(!/<[a-z/]/i.test(viaFallback), 'no tags may survive into the prompt')
+}
+step('email HTML-only body falls back to readable text OK')
+
 // --- 2 + 3. HTTP route -> dispatch -> reply callback round-trip ---
 const { InboundHttpServer } = await import('../src/inbound.ts')
 const { HttpTransport } = await import('../src/transports/http.ts')
 
-const replies = []
-const callbackServer = createServer((req, res) => {
+/** One captured reply-callback request. */
+interface CapturedReply {
+  body: { chat_id?: string; text?: string; ts?: number }
+  headers: IncomingHttpHeaders
+}
+
+const replies: CapturedReply[] = []
+const callbackServer = createServer((req: IncomingMessage, res: ServerResponse) => {
   let body = ''
   req.on('data', (d) => (body += d))
   req.on('end', () => {
-    replies.push({ body: JSON.parse(body || '{}') })
+    replies.push({ body: JSON.parse(body || '{}'), headers: req.headers })
     res.writeHead(200, { 'content-type': 'application/json' })
     res.end('{}')
   })
 })
-await new Promise((r) => callbackServer.listen(0, '127.0.0.1', r))
-const callbackPort = callbackServer.address().port
+await new Promise<void>((r) => callbackServer.listen(0, '127.0.0.1', () => r()))
+const callbackPort = portOf(callbackServer)
 
 const inbound = new InboundHttpServer('127.0.0.1', 0)
 await inbound.listen()
-const inboundPort = inbound.address().port
+// The server was bound to an explicit host + port 0, so `address()` is non-null
+// once listening; a null here means the bind silently failed.
+const inboundAddress = inbound.address()
+if (inboundAddress === null) throw new Error('inbound server reported no address after listen()')
+const inboundPort = inboundAddress.port
 
-const received = []
+const received: InboundRoute[] = []
 const transport = new HttpTransport(inbound, {
   path: '/im',
   secret: 's3cr3t',
@@ -172,10 +248,12 @@ const r = await fetch(`http://127.0.0.1:${inboundPort}/im`, {
 })
 assert.equal(r.status, 202, `route should ack 202, got ${r.status}`)
 assert.equal(received.length, 1, 'inbound dispatch should fire once')
-assert.equal(received[0].chatId, 'c1')
-assert.equal(received[0].text, 'hello')
-assert.equal(received[0].senderId, 'u1')
-step('HTTP route parsed + dispatched message: ' + JSON.stringify(received[0]))
+const firstRoute = received[0]
+assert.ok(firstRoute !== undefined, 'the inbound route must be captured')
+assert.equal(firstRoute.chatId, 'c1')
+assert.equal(firstRoute.text, 'hello')
+assert.equal(firstRoute.senderId, 'u1')
+step('HTTP route parsed + dispatched message: ' + JSON.stringify(firstRoute))
 
 const bad = await fetch(`http://127.0.0.1:${inboundPort}/im`, {
   method: 'POST',
@@ -199,9 +277,27 @@ step('HTTP body-size guard (413) OK')
 await transport.sendText('c1', 'agent reply')
 await new Promise((r2) => setTimeout(r2, 200))
 assert.equal(replies.length, 1, 'reply callback should fire once')
-assert.equal(replies[0].body.text, 'agent reply')
-assert.equal(replies[0].body.chat_id, 'c1')
-step('HttpTransport reply callback OK: ' + JSON.stringify(replies[0].body))
+const firstReply = replies[0]
+assert.ok(firstReply !== undefined, 'the reply callback must be captured')
+assert.equal(firstReply.body.text, 'agent reply')
+assert.equal(firstReply.body.chat_id, 'c1')
+assert.equal(firstReply.headers['x-im-chat-id'], 'c1', 'an ASCII chat id still rides the configured header')
+step('HttpTransport reply callback OK: ' + JSON.stringify(firstReply.body))
+
+// A NON-ASCII chat id must not become an undeliverable reply. `fetch` (undici)
+// rejects any header value with a code point above 0xFF by throwing
+// `TypeError: Cannot convert argument to a ByteString` BEFORE the request is
+// sent, so echoing an unbounded chat id into a header meant one such chat could
+// never receive a reply at all. The id must still arrive via the JSON body.
+const nonAsciiChat = '用户-42'
+await transport.sendText(nonAsciiChat, '你好 reply')
+await new Promise((r2) => setTimeout(r2, 200))
+assert.equal(replies.length, 2, 'a non-ASCII chat id must still deliver a reply')
+const secondReply = replies[1]
+assert.ok(secondReply !== undefined, 'the non-ASCII reply must be captured')
+assert.equal(secondReply.body.chat_id, nonAsciiChat, 'the chat id must still ride the JSON body')
+assert.equal(secondReply.headers['x-im-chat-id'], undefined, 'a non-ASCII chat id must be omitted from headers, not crash the send')
+step('non-ASCII chat id still delivers (header omitted, body carries it) OK')
 
 await transport.stop()
 await inbound.close()
@@ -220,7 +316,11 @@ let cmccError = ''
 try {
   await withTimeout(cmcc.start(), 5000, 'cmcc connect')
 } catch (e) {
-  cmccError = String((e && e.message) || e)
+  // `catch` binds `unknown`; narrow instead of assuming the error shape. The
+  // `&& e.message` fallback preserves the original `(e && e.message) || e`
+  // semantics exactly: a thrown value with an empty `message` still falls
+  // through to `String(e)`.
+  cmccError = e instanceof Error && e.message ? e.message : String(e)
 }
 await cmcc.stop().catch(() => {})
 assert.ok(
@@ -254,7 +354,8 @@ let feishuError = ''
 try {
   await withTimeout(feishu.start(), 5000, 'feishu start')
 } catch (e) {
-  feishuError = String((e && e.message) || e)
+  // Same narrowing + empty-message fallback as the cmcc case above.
+  feishuError = e instanceof Error && e.message ? e.message : String(e)
 }
 assert.match(feishuError, /appId and appSecret/, 'missing credentials must fail before connecting')
 assert.equal(feishuState, 'error', 'missing credentials must report the error state')
@@ -268,19 +369,19 @@ step('Feishu missing-credential guard OK: ' + feishuError)
 // nothing can ever be paired. The transport is pointed at a local fake ilink
 // gateway so the handshake is exercised without touching Tencent.
 const { WechatIlinkTransport } = await import('../src/transports/wechat.ts')
-const ilinkHits = []
-const ilinkServer = createServer((req, res) => {
+const ilinkHits: string[] = []
+const ilinkServer = createServer((req: IncomingMessage, res: ServerResponse) => {
   ilinkHits.push(req.url ?? '')
   res.writeHead(200, { 'content-type': 'application/json' })
   res.end(req.url?.startsWith('/ilink/bot/get_bot_qrcode')
     ? JSON.stringify({ qrcode: 'q-smoke', qrcode_img_content: 'https://example.invalid/qr/q-smoke', ret: 0 })
     : JSON.stringify({ status: 'waiting' })) // never "confirmed": no state file is written
 })
-await new Promise((ready) => ilinkServer.listen(0, '127.0.0.1', ready))
-const ilinkPort = ilinkServer.address().port
+await new Promise<void>((ready) => ilinkServer.listen(0, '127.0.0.1', () => ready()))
+const ilinkPort = portOf(ilinkServer)
 
 let wechatQr = ''
-const wechatDetails = []
+const wechatDetails: string[] = []
 const wechat = new WechatIlinkTransport({
   channelId: 'smoke-wechat-unbound',
   baseUrl: `http://127.0.0.1:${ilinkPort}`,
@@ -299,8 +400,10 @@ assert.ok(
   wechatDetails.some(d => /尚未绑定微信/.test(d)),
   'status must say the token alone is not enough, got: ' + JSON.stringify(wechatDetails),
 )
+const lastWechatDetail = wechatDetails[wechatDetails.length - 1]
+assert.ok(lastWechatDetail !== undefined, 'a live WeChat status detail must have been pushed')
 assert.match(
-  wechatDetails[wechatDetails.length - 1],
+  lastWechatDetail,
   /请扫码绑定微信/,
   'the live status must state the next action, got: ' + JSON.stringify(wechatDetails),
 )
@@ -312,12 +415,12 @@ step('WeChat token-only channel keeps requesting the login QR OK')
 
 // A QR fetch that fails must be visible and retried, not silently swallowed:
 // an inert panel is indistinguishable from "no QR appeared".
-const badIlink = createServer((_req, res) => {
+const badIlink = createServer((_req: IncomingMessage, res: ServerResponse) => {
   res.writeHead(200, { 'content-type': 'application/json' })
   res.end(JSON.stringify({ qrcode: 'q-no-image', ret: 0 })) // no qrcode_img_content
 })
-await new Promise((ready) => badIlink.listen(0, '127.0.0.1', ready))
-const badPort = badIlink.address().port
+await new Promise<void>((ready) => badIlink.listen(0, '127.0.0.1', () => ready()))
+const badPort = portOf(badIlink)
 
 for (const [label, baseUrl] of [['unusable response', `http://127.0.0.1:${badPort}`], ['unreachable gateway', 'http://127.0.0.1:1']]) {
   let detail = ''
@@ -328,6 +431,9 @@ for (const [label, baseUrl] of [['unusable response', `http://127.0.0.1:${badPor
     onState: (_status, d) => { if (d !== undefined) detail = d },
   })
   await broken.start()
+  // `detail` is only assigned from a non-undefined callback arg, but the
+  // compiler cannot see that; the guard documents the assumption.
+  assert.ok(detail !== '', `${label}: a failure detail must be reported`)
   assert.match(detail, /获取二维码失败/, `${label}: failure must be surfaced, got: ${detail}`)
   assert.equal(broken.isConnected(), false, `${label}: must not claim to be connected`)
   await broken.stop()
@@ -431,12 +537,19 @@ const statusRows = [
   { id: 'ch-e', type: 'email', name: '邮箱', status: 'idle' },
 ]
 const projected = channelStatusPayload(statusRows).channels
-assert.equal(projected[0].bound, false, 'an unbound channel must report bound: false')
-assert.equal(projected[0].qr, statusRows[0].qr, 'the bind URL must survive projection')
-assert.equal(projected[1].bound, true, 'a bound channel must report bound: true')
-assert.equal(projected[1].qr, undefined, 'a bound channel carries no QR')
+const unboundRow = projected[0]
+const boundRow = projected[1]
+assert.ok(unboundRow !== undefined && boundRow !== undefined, 'both projected rows must exist')
+assert.equal(unboundRow.bound, false, 'an unbound channel must report bound: false')
+const unboundSource = statusRows[0]
+assert.ok(unboundSource !== undefined, 'the unbound fixture row must exist')
+assert.equal(unboundRow.qr, unboundSource.qr, 'the bind URL must survive projection')
+assert.equal(boundRow.bound, true, 'a bound channel must report bound: true')
+assert.equal(boundRow.qr, undefined, 'a bound channel carries no QR')
+const thirdRow = projected[2]
+assert.ok(thirdRow !== undefined, 'the third projected row must exist')
 assert.deepEqual(
-  projected[2],
+  thirdRow,
   { id: 'ch-e', type: 'email', name: '邮箱', status: 'idle' },
   'absent optionals must be dropped, not serialized as undefined',
 )
@@ -446,8 +559,8 @@ const statusServer = createServer(createStatusHandler({
   list: () => statusRows,
   reject: () => (gate === 0 ? undefined : gate),
 }))
-await new Promise((ready) => statusServer.listen(0, '127.0.0.1', ready))
-const statusBase = `http://127.0.0.1:${statusServer.address().port}/`
+await new Promise<void>((ready) => statusServer.listen(0, '127.0.0.1', () => ready()))
+const statusBase = `http://127.0.0.1:${portOf(statusServer)}/`
 
 const statusOk = await fetch(statusBase)
 assert.equal(statusOk.status, 200)
@@ -469,6 +582,36 @@ assert.equal(statusHead.status, 200)
 assert.equal(await statusHead.text(), '', 'HEAD must not carry a body')
 
 statusServer.close()
+
+// FAIL CLOSED when the trust gate itself is unavailable. The panel's route is
+// registered straight on `webServer`, which authenticates nothing, and its body
+// carries a LIVE bind QR — credential-equivalent, since whoever reads it can
+// complete the bind. `deps.reject?.()` treated a missing gate as "nothing to
+// check" and served the payload unauthenticated; `src/index.ts` resolves that
+// gate per request because the connection service can mount late, so the
+// absent case is a real startup race, not a hypothetical.
+const noGateServer = createServer(createStatusHandler({ list: () => statusRows }))
+await new Promise<void>((ready) => noGateServer.listen(0, '127.0.0.1', () => ready()))
+const noGateBase = `http://127.0.0.1:${portOf(noGateServer)}/`
+const noGate = await fetch(noGateBase)
+assert.equal(noGate.status, 401, 'a missing trust gate must REFUSE (fail closed), never serve the QR')
+const noGateBody = await noGate.text()
+assert.equal(noGateBody, 'unauthorized')
+assert.ok(!noGateBody.includes('qrcode'), 'no bind URL may leak when the gate is unavailable')
+noGateServer.close()
+
+// A THROWING gate must also refuse: a trust check that cannot run is not a pass.
+const throwingServer = createServer(createStatusHandler({
+  list: () => statusRows,
+  reject: () => { throw new Error('trust service exploded') },
+}))
+await new Promise<void>((ready) => throwingServer.listen(0, '127.0.0.1', () => ready()))
+const throwingBase = `http://127.0.0.1:${portOf(throwingServer)}/`
+const throwing = await fetch(throwingBase)
+assert.equal(throwing.status, 401, 'a failing trust check must refuse')
+assert.ok(!(await throwing.text()).includes('qrcode'), 'no bind URL may leak when the trust check fails')
+throwingServer.close()
+
 step('channel-status route (payload + auth gate + method guard) OK')
 
 // --- 10. bound WeChat channel: liveness reporting + inbound extraction ---
@@ -501,7 +644,7 @@ await writeStateFile(
 )
 
 let boundGatewayUp = false
-const boundServer = createServer((req, res) => {
+const boundServer = createServer((req: IncomingMessage, res: ServerResponse) => {
   res.writeHead(boundGatewayUp ? 200 : 500, { 'content-type': 'application/json' })
   if (!boundGatewayUp) {
     res.end('{"errcode":-1,"errmsg":"gateway down"}')
@@ -516,8 +659,8 @@ const boundServer = createServer((req, res) => {
     ],
   }))
 })
-await new Promise((ready) => boundServer.listen(0, '127.0.0.1', ready))
-const boundPort = boundServer.address().port
+await new Promise<void>((ready) => boundServer.listen(0, '127.0.0.1', () => ready()))
+const boundPort = portOf(boundServer)
 
 const boundInbound: Array<{ chatId: string; text: string; senderId?: string }> = []
 const boundStates: Array<[string, string | undefined]> = []
@@ -547,8 +690,10 @@ step('bound WeChat channel reports a failing link instead of staying "connected"
 boundGatewayUp = true
 await waitUntil(() => boundInbound.length > 0, 5000, 'an inbound text frame must be dispatched')
 assert.equal(boundInbound.length, 1, `only the bound user's text frame may be dispatched, got ${JSON.stringify(boundInbound)}`)
-assert.equal(boundInbound[0].chatId, 'user@im.wechat')
-assert.equal(boundInbound[0].text, '你好')
+const firstBoundInbound = boundInbound[0]
+assert.ok(firstBoundInbound !== undefined, 'the bound user text frame must be captured')
+assert.equal(firstBoundInbound.chatId, 'user@im.wechat')
+assert.equal(firstBoundInbound.text, '你好')
 assert.ok(
   boundStates.some(([status]) => status === 'connected'),
   'a successful round trip must report connected again',
@@ -562,6 +707,86 @@ await bound.stop()
 boundServer.close()
 step('bound WeChat inbound extraction + recovery OK')
 
+// --- 10b. a revoked WeChat session must re-arm the QR bind, not wedge ---
+// `errcode: -14` means the ilink session is dead. The transport used to clear
+// only its `connected` flag, leaving token + scannedUser in place — and since
+// `isBound()` is `token && scannedUser`, `pollOnce` kept routing every round to
+// `pollInbound`, which returned early at its own `isBound()` guard. The QR
+// retry branch was therefore unreachable and the channel stayed permanently
+// dead until the user manually edited the config: no QR, no messages, and a
+// panel that could only say "connection lost". Credentials must be dropped so
+// the normal unbound path takes over again.
+const deadStateDir = await mkdtemp(joinPath(tmpdir(), 'dsh-im-gateway-smoke-dead-'))
+const deadChannelId = 'smoke-wechat-dead'
+const deadStateKey = Buffer.from(deadChannelId).toString('hex').slice(0, 40)
+await writeStateFile(
+  joinPath(deadStateDir, `${deadStateKey}.json`),
+  JSON.stringify({
+    token: 'smoke-revoked-token',
+    baseUrl: '',
+    botId: 'bot@im.bot',
+    scannedUser: 'user@im.wechat',
+    contextToken: 'ctx-dead',
+    cursor: 'cursor-dead',
+    lastError: '',
+  }),
+  'utf8',
+)
+
+const deadHits: string[] = []
+const deadServer = createServer((req: IncomingMessage, res: ServerResponse) => {
+  deadHits.push(req.url ?? '')
+  res.writeHead(200, { 'content-type': 'application/json' })
+  // getupdates answers the revocation; every other endpoint is the QR handshake.
+  res.end((req.url ?? '').startsWith('/ilink/bot/getupdates')
+    ? JSON.stringify({ errcode: -14, errmsg: 'session expired' })
+    : JSON.stringify({ qrcode: 'q-rebind', qrcode_img_content: 'https://example.invalid/qr/q-rebind', ret: 0 }))
+})
+await new Promise<void>((ready) => deadServer.listen(0, '127.0.0.1', () => ready()))
+const deadPort = portOf(deadServer)
+
+let deadQr = ''
+const deadStates: Array<[string, string | undefined]> = []
+const dead = new WechatIlinkTransport({
+  channelId: deadChannelId,
+  baseUrl: `http://127.0.0.1:${deadPort}`,
+  stateDir: deadStateDir,
+  pollIntervalMs: 20,
+  onInbound: () => {},
+  onQr: (url) => { deadQr = url },
+  onState: (status, detail) => { deadStates.push([status, detail]) },
+})
+await dead.start()
+assert.equal(dead.isBound(), true, 'the channel starts out bound')
+
+// The revocation must be reported, not swallowed.
+await waitUntil(
+  () => deadStates.some(([, detail]) => /会话已失效/.test(String(detail))),
+  5000,
+  'a revoked session must be reported to the panel',
+)
+assert.equal(dead.isBound(), false, 'a revoked session must drop the dead bind (token + scannedUser)')
+assert.equal(dead.isConnected(), false, 'a revoked session must not report connected')
+
+// Crucially the SAME poll loop must now be able to re-bind without a restart.
+await waitUntil(() => deadQr !== '', 5000, 'the poll loop must re-request a login QR after revocation')
+assert.equal(deadQr, 'https://example.invalid/qr/q-rebind', 'the fresh QR must reach the UI')
+assert.ok(
+  deadHits.some(u => u.startsWith('/ilink/bot/get_bot_qrcode')),
+  'the QR endpoint must be hit again after revocation, hits: ' + JSON.stringify(deadHits.slice(0, 6)),
+)
+// A revoked channel must also refuse to send rather than pretend to deliver.
+await assert.rejects(() => dead.sendText('user@im.wechat', 'hi'), /not bound/, 'a revoked channel must refuse to send')
+
+const deadPersisted = JSON.parse(
+  await (await import('node:fs/promises')).readFile(joinPath(deadStateDir, `${deadStateKey}.json`), 'utf8'),
+)
+assert.equal(deadPersisted.token, '', 'the revoked token must be cleared from persisted state')
+assert.equal(deadPersisted.scannedUser, '', 'the revoked bind must be cleared from persisted state')
+await dead.stop()
+deadServer.close()
+step('a revoked WeChat session re-arms the QR bind instead of wedging OK')
+
 // --- 11. QQ transport: handshake, intents, close codes, sends ---
 // The QQ channel has no QR: everything hangs off AppID/AppSecret → access token
 // → /gateway → WebSocket IDENTIFY. Every one of those steps failed silently (or
@@ -574,8 +799,40 @@ const {
 } = await import('../src/transports/qqbot.ts')
 const { WebSocketServer } = await import('ws')
 
+/**
+ * Declared shape of the fake QQ Open Platform's mutable state.
+ *
+ * The JSON bodies here are deliberately NOT the shapes the transport expects:
+ * the token endpoint answers either `{ access_token, expires_in }` or the
+ * failure form `{ code, message }`, and the send endpoint answers either
+ * `{ id, timestamp }` or `{ err_code, message }`. Annotating the state at its
+ * declaration is what lets each scenario overwrite `tokenBody` /
+ * `sendResponder` with the other variant, instead of casting at every use.
+ */
+interface FakeQqPlatformState {
+  tokenRequests: number
+  gatewayRequests: number
+  wsConnections: number
+  wsHeaders: any[]
+  identify: any[]
+  resumes: any[]
+  heartbeats: number
+  sends: Array<{ url: string; body: any }>
+  sockets: any[]
+  tokenStatus: number
+  /** Either the success body or the `{ code, message }` failure body. */
+  tokenBody: { access_token?: string; expires_in?: string; code?: number; message?: string }
+  gatewayStatus: number
+  gatewayBody: any
+  heartbeatInterval: number
+  ackHeartbeats: boolean
+  onIdentify: (ws: any) => void
+  /** Returns the raw JSON body the send endpoint should answer with. */
+  sendResponder: (body: any) => { status: number; body: any }
+}
+
 async function startFakeQqPlatform() {
-  const state = {
+  const state: FakeQqPlatformState = {
     tokenRequests: 0,
     gatewayRequests: 0,
     wsConnections: 0,
@@ -597,7 +854,7 @@ async function startFakeQqPlatform() {
     },
     sendResponder: (_body: any) => ({ status: 200, body: { id: 'sent-1', timestamp: '2026-09-17T00:00:00+08:00' } }),
   }
-  const http = createServer((req, res) => {
+  const http = createServer((req: IncomingMessage, res: ServerResponse) => {
     let raw = ''
     req.on('data', (chunk) => { raw += chunk })
     req.on('end', () => {
@@ -626,8 +883,8 @@ async function startFakeQqPlatform() {
       res.end('{}')
     })
   })
-  await new Promise((ready) => http.listen(0, '127.0.0.1', ready))
-  const port = http.address().port
+  await new Promise<void>((ready) => http.listen(0, '127.0.0.1', () => ready()))
+  const port = portOf(http)
   const wss = new WebSocketServer({ server: http, path: '/ws' })
   wss.on('connection', (ws, req) => {
     state.wsConnections++
@@ -739,12 +996,15 @@ step('QQ token failure surfaces the platform code (100016) OK')
   await qq.sendText('user-openid-1', '第一条回复')
   await qq.sendText('user-openid-1', '第二条回复')
   assert.equal(platform.state.sends.length, 2, 'two replies -> two POSTs')
-  assert.equal(platform.state.sends[0].url, '/v2/users/user-openid-1/messages')
-  assert.equal(platform.state.sends[0].body.msg_id, 'msg-inbound-1')
-  assert.equal(platform.state.sends[0].body.msg_type, 0)
-  assert.equal(platform.state.sends[0].body.msg_seq, 1, 'first reply of a msg_id is msg_seq 1')
+  const firstSend = platform.state.sends[0]
+  const secondSend = platform.state.sends[1]
+  assert.ok(firstSend !== undefined && secondSend !== undefined, 'both replies must have been posted')
+  assert.equal(firstSend.url, '/v2/users/user-openid-1/messages')
+  assert.equal(firstSend.body.msg_id, 'msg-inbound-1')
+  assert.equal(firstSend.body.msg_type, 0)
+  assert.equal(firstSend.body.msg_seq, 1, 'first reply of a msg_id is msg_seq 1')
   assert.equal(
-    platform.state.sends[1].body.msg_seq,
+    secondSend.body.msg_seq,
     2,
     'the same msg_id must use a NEW msg_seq (a repeat is rejected as a duplicate)',
   )
@@ -762,6 +1022,7 @@ step('QQ token failure surfaces the platform code (100016) OK')
     : { status: 200, body: { id: 'sent-active', timestamp: 'now' } })
   await qq.sendText('user-openid-1', '超时之后的回复')
   const last = platform.state.sends[platform.state.sends.length - 1]
+  assert.ok(last !== undefined, 'the expired-passive fallback must have posted a message')
   assert.equal(last.body.msg_id, undefined, 'the expired passive reply must retry as an active message')
   step('QQ inbound dispatch + passive reply numbering + send-error surfacing OK')
 
@@ -879,7 +1140,9 @@ assert.equal(chunks.length, 3, `2500 chars must split into 3 chunks, got ${chunk
 assert.ok(chunks.every(c => c.length <= 900), 'no chunk may exceed the conservative send size')
 const overflow = chunkText('b'.repeat(9000))
 assert.equal(overflow.length, 5, 'at most 5 passive replies per inbound message')
-assert.match(overflow[4], /已截断/, 'the overflow must be marked, never dropped silently')
+const overflowLast = overflow[4]
+assert.ok(overflowLast !== undefined, 'the 5th chunk must exist')
+assert.match(overflowLast, /已截断/, 'the overflow must be marked, never dropped silently')
 assert.deepEqual(chunkText('   '), [], 'blank replies produce nothing to send')
 
 assert.deepEqual(
@@ -888,8 +1151,20 @@ assert.deepEqual(
   'a body err_code on HTTP 200 is a failure',
 )
 assert.equal(apiFailure(200, { id: 'msg-1' }, ''), null, 'a successful body is not a failure')
-assert.equal(apiFailure(401, { code: 11253, message: 'no permission' }, '').fatal, true, 'a permission code is fatal')
-assert.equal(apiFailure(500, null, 'boom').code, 500, 'an unparseable failure falls back to the HTTP status')
+const permissionFailure = apiFailure(401, { code: 11253, message: 'no permission' }, '')
+assert.ok(permissionFailure !== null, 'a body code on HTTP 401 is a failure')
+assert.equal(permissionFailure.fatal, true, 'a permission code is fatal')
+// A BARE HTTP 401/403 — no platform body code — is a retryable auth blip, not a
+// fatal misconfiguration. Marking it fatal set `desiredConnected = false` and
+// stopped the reconnect loop for good, so one transient token rejection killed
+// the channel until an operator manually re-saved it.
+const bare401 = apiFailure(401, null, '')
+const bare403 = apiFailure(403, null, '')
+assert.ok(bare401 !== null && bare403 !== null, 'a bare HTTP failure is still a failure')
+assert.equal(bare401.fatal, false, 'a bare HTTP 401 must stay retryable')
+assert.equal(bare403.fatal, false, 'a bare HTTP 403 must stay retryable')
+assert.equal(apiFailure(401, null, '{"message":"Unauthorized"}')?.code, 401, 'the HTTP status is still surfaced')
+assert.equal(apiFailure(500, null, 'boom')?.code, 500, 'an unparseable failure falls back to the HTTP status')
 assert.ok(new QqApiError('x', 1) instanceof Error)
 assert.ok(new QqFatalError('y') instanceof QqFatalError)
 step('QQ intent/close-code/chunk/api helpers OK')
@@ -1012,6 +1287,62 @@ await assert.rejects(
   'a transport failure must propagate unchanged (not be masked as a refusal)',
 )
 step('client write path surfaces a refused save OK')
+
+// --- 16. editing an existing channel must not demand its stored secrets ---
+// The Host strips `role('secret')` fields out of EVERY wire layer it sends the
+// browser (`redactSecrets` returns undefined for the node, then drops the key;
+// and `value`/`base`/`user` are all redacted). The panel used to test
+// `rec[f.key] !== undefined` to decide "secret already stored", which can
+// therefore NEVER be true: editing any already-configured channel failed
+// front-end validation with 缺少必填项 on a field the user could not fill
+// without retyping a credential they only meant to keep. This is a silent
+// failure — no crash, just a permanently unsavable form — so it gets a real
+// behavioural test rather than a string match.
+const { requiredMissing } = await import('../src/client/required-fields.ts')
+
+/** A field list shaped like a real secret-bearing template (QQ). */
+const qqTemplate = {
+  defaults: {},
+  fields: [
+    { key: 'appId', labelKey: 'field.appId' },
+    { key: 'appSecret', labelKey: 'field.appSecret', secret: true },
+  ],
+}
+
+// Creating: the secret IS required (nothing is stored yet).
+assert.equal(
+  requiredMissing('qq', qqTemplate, false, { appId: '123' }, 'custom'),
+  'field.appSecret',
+  'a NEW channel must still require its secret',
+)
+// Creating with the secret filled: complete.
+assert.equal(
+  requiredMissing('qq', qqTemplate, false, { appId: '123', appSecret: 's3cret' }, 'custom'),
+  null,
+  'a new channel with every field filled must validate',
+)
+// EDITING with the secret box left blank: must NOT be reported missing — the
+// blank means "keep the stored value", and its presence is unknowable here.
+assert.equal(
+  requiredMissing('qq', qqTemplate, true, { appId: '123', appSecret: '' }, 'custom'),
+  null,
+  'editing must accept a blank secret box (blank = keep the stored credential)',
+)
+// Non-secret required fields are still enforced on EDIT: the relaxation must
+// not have disabled validation wholesale.
+assert.equal(
+  requiredMissing('qq', qqTemplate, true, { appId: '', appSecret: '' }, 'custom'),
+  'field.appId',
+  'editing must still require non-secret mandatory fields',
+)
+// A custom email server still needs an explicit host while editing.
+assert.equal(
+  requiredMissing('email', { defaults: {}, fields: [{ key: 'account', labelKey: 'field.account' }] },
+    true, { account: 'a@b.c' }, 'custom'),
+  'field.host',
+  'editing must still require a host for a custom email provider',
+)
+step('editing an existing channel keeps its stored secret optional OK')
 
 process.stderr.write('\n✔ All local smoke checks passed.\n')
 process.exit(0)

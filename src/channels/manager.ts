@@ -417,6 +417,13 @@ export class ChannelManager {
           model: base.model,
           disposeAfterReply: base.disposeAfterReply,
           onInbound: routeInbound,
+          // Feishu reports its OWN liveness (SDK `onReady` / `onReconnecting` /
+          // `onError`) and the transport calls `onState` in six places — but the
+          // option was never passed, so every one of those calls was a no-op and
+          // a feishu channel's panel status could never leave its initial value:
+          // a dead bot looked exactly like a healthy idle one. Every other kind
+          // already wires this.
+          onState: setState,
           log: (m: string) => this.ctx.logger.info(`[im-gateway] ${channel.id}: ${m}`),
         }
         return new FeishuTransport(options) as ChatIo

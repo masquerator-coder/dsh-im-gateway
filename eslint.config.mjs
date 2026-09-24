@@ -1,8 +1,14 @@
 // dsh-im-gateway — ESLint flat config (ESLint 9/10 + typescript-eslint).
 //
-// Host half (`src/*.ts`) + browser half (`src/client/*.tsx`) are both typechecked
-// by typescript-eslint. Build output and vendored lockfiles never linted.
+// Host half (`src/*.ts`), browser half (`src/client/*.tsx`) and the verification
+// suite (`scripts/*.mts`) are all typechecked by typescript-eslint. Build output
+// and vendored lockfiles are never linted.
 // `pnpm lint` runs this; `pnpm lint:fix` auto-fixes what it safely can.
+//
+// `scripts/**` joined the lint scope together with `tsconfig.scripts.json`: the
+// suite is the only automated check this repo has, so the checks have to cover
+// the suite itself. The test doubles there intentionally mirror untyped
+// third-party JSON, which is why `no-explicit-any` stays a warning.
 //
 // Note: this plugin deliberately uses `any` on DSH runtime faces that have no
 // published types (see src/client/dsh-stubs.d.ts). `@typescript-eslint/
@@ -19,7 +25,6 @@ export default tseslint.config(
       '**/node_modules/**',
       'lib/**',
       '**/*.map',
-      'scripts/**',
       'design/**',
       'video/**',
       'dsh-cmcc-newmsg/**',

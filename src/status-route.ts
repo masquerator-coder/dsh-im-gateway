@@ -38,8 +38,11 @@ export interface StatusRouteDeps {
   /** Live rows, read fresh on every request (never cached). */
   list: () => readonly StatusSnapshotLike[]
   /**
-   * Browser-auth gate. Absent when the host has no web carrier mounted; when
-   * present, an unauthenticated request is refused exactly like `/api` is.
+   * Browser-auth gate. This route is registered directly on `webServer`, which
+   * applies NO authentication of its own, so the gate is what stands between an
+   * unauthenticated caller and a live bind QR. It returns the refusal status, or
+   * `undefined` to admit. A throw (service not mounted yet) is treated as a
+   * refusal — see the handler.
    */
   reject?: (req: IncomingMessage) => 401 | 403 | undefined
   log?: (message: string) => void
@@ -72,7 +75,26 @@ export function channelStatusPayload(rows: readonly StatusSnapshotLike[]): Chann
  */
 export function createStatusHandler(deps: StatusRouteDeps): WebRouteHandler {
   return (req, res) => {
-    const rejection = deps.reject?.(req)
+    // FAIL CLOSED. This route answers with a live WeChat/QQ bind QR, which is a
+    // credential-equivalent secret: anyone who can read it can complete a bind.
+    // `webServer.register` applies no authentication, so this gate is the only
+    // thing protecting it — yet `deps.reject?.()` treated a MISSING gate as
+    // "nothing to check" and served the payload to any caller. `src/index.ts`
+    // resolves the gate per request (`webCtx.get('connection')`) precisely
+    // because the service can mount late, so the absent case is reachable on a
+    // real startup race. Refuse instead of degrading to open.
+    let rejection: 401 | 403 | undefined
+    if (deps.reject === undefined) {
+      deps.log?.('[im-gateway] status route refused: connection trust service unavailable (failing closed)')
+      rejection = 401
+    } else {
+      try {
+        rejection = deps.reject(req)
+      } catch (error) {
+        deps.log?.(`[im-gateway] status route refused: trust check failed: ${String(error)}`)
+        rejection = 401
+      }
+    }
     if (rejection !== undefined) {
       writeText(res, rejection, rejection === 401 ? 'unauthorized' : 'forbidden')
       return
