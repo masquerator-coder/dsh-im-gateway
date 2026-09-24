@@ -69,6 +69,14 @@
  *      credential they meant to keep. Also pins that the relaxation did NOT
  *      disable validation wholesale (non-secret mandatory fields and a custom
  *      email host are still enforced on edit).
+ *  17. Directory browser — the host route behind the panel's 浏览… button, and
+ *      the client helpers that drive it. The listing has to come from the host
+ *      (a page cannot read the filesystem, and the directory that matters is on
+ *      the AGENT's machine), so the route is a filesystem surface: it must fail
+ *      CLOSED on the trust gate, report an UNREADABLE directory as an error
+ *      rather than as an empty one, and stop "up" at a real root. Exercised
+ *      against real temp directories, because every one of those failures is
+ *      silent in production.
  *
  * Real transports that need live services (email / feishu / wechat / qq / a
  * live CMCC gateway) are exercised by starting them in the plugin; this file
@@ -1219,6 +1227,7 @@ step('plugin-wide default cwd precedence OK')
 // client bundle — the only artifact the browser actually loads — because the
 // failure mode is silence, not an error.
 const { readFileSync } = await import('node:fs')
+const { existsSync, readdirSync } = await import('node:fs')
 const clientBundle = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
 assert.ok(
   clientBundle.includes('plugins.bundle.config'),
@@ -1343,6 +1352,366 @@ assert.equal(
   'editing must still require a host for a custom email provider',
 )
 step('editing an existing channel keeps its stored secret optional OK')
+
+// --- 17. directory browser (the panel's 浏览… button) ---
+// The panel cannot enumerate directories itself: `<input webkitdirectory>` only
+// yields the FILES a user picked, and the File System Access API is
+// Chromium-only with a gesture per root. What the user is choosing is also the
+// directory on the machine the AGENT runs on — the host process, which is not
+// necessarily the browser's machine — so the listing has to come from a host
+// route. That makes it a filesystem surface, and the ways it can be WRONG are
+// all silent, which is why this is exercised for real.
+const { BROWSE_ROUTE_PATH } = await import('../src/status-proto.ts')
+assert.equal(BROWSE_ROUTE_PATH, '/im-gateway/browse', 'the browse route path is part of the contract')
+
+const { createBrowseHandler } = await import('../src/status-route.ts')
+const { browseDirectory, defaultBrowseDeps, parentOf, browseRoots, validateDirectory, describeFsError } =
+  await import('../src/browse-route.ts')
+const {
+  browseUrl, normalizeBrowsePayload, fetchDirectory, breadcrumbs, directoryProblem,
+} = await import('../src/client/browse-client.ts')
+
+// 17a. Pure path rules: where "up" stops, and what a root is.
+{
+  const isWin = process.platform === 'win32'
+  // At a real root there must be NO parent offered: a naive `dirname` chain
+  // makes "up" an endless no-op button on POSIX ('/' -> '/') and Windows
+  // ('C:\\' -> 'C:\\'), so the panel would look broken rather than finished.
+  assert.equal(parentOf(isWin ? 'C:\\' : '/'), null, 'a filesystem root has no parent to walk to')
+  // A bare drive spec ('C:') is drive-RELATIVE on Windows, not the drive root:
+  // `dirname` cannot walk above it either, so it too must report no parent
+  // rather than sending the panel to '.' (the host process's own cwd).
+  if (isWin) {
+    assert.equal(parentOf('C:'), null, 'a bare drive spec has no walkable parent (never ".")')
+    assert.equal(parentOf('C:\\work'), 'C:\\', 'a normal Windows directory offers its drive root')
+  } else {
+    assert.equal(parentOf('/work/im'), '/work', 'a normal directory offers its parent')
+    assert.equal(parentOf('/'), null)
+  }
+}
+step('browse path rules (root has no parent) OK')
+
+// 17b. Breadcrumbs are derived from the HOST's string, never from node:path.
+// `node:path` is unavailable in the browser, and its separator differs from the
+// host's, so the trail must be built by text alone.
+{
+  assert.deepEqual(breadcrumbs(''), [], 'no path -> no trail')
+  assert.deepEqual(breadcrumbs('/a/b'), ['/', '/a', '/a/b'], 'POSIX trail is root-first')
+  if (process.platform === 'win32') {
+    assert.deepEqual(breadcrumbs('C:\\a\\b'), ['C:\\', 'C:\\a', 'C:\\a\\b'], 'Windows trail keeps the drive root')
+  }
+  assert.deepEqual(breadcrumbs('C:/a'), ['C:\\', 'C:\\a'], 'forward slashes still name one trail, not two')
+}
+step('browse breadcrumbs (host-string derived) OK')
+
+// 17c. Real directory listing against real temp directories.
+const { mkdir: mkdirBrowse, writeFile: writeFileBrowse, rm: rmBrowse } =
+  await import('node:fs/promises')
+const browseTmp = await mkdtemp(joinPath(tmpdir(), 'dsh-im-gateway-browse-'))
+const deps = {
+  ...defaultBrowseDeps(),
+  // Pin the shortcuts so the assertions do not depend on the machine's HOME.
+  home: browseTmp,
+  cwd: '',
+  imWorkspace: joinPath(browseTmp, 'im-workspace'),
+  processCwd: browseTmp,
+}
+await mkdirBrowse(joinPath(browseTmp, 'zeta'), { recursive: true })
+await mkdirBrowse(joinPath(browseTmp, 'alpha'), { recursive: true })
+await mkdirBrowse(joinPath(browseTmp, 'nested', 'deep'), { recursive: true })
+// A FILE must never be offered: the field is a working DIRECTORY.
+await writeFileBrowse(joinPath(browseTmp, 'a-file.txt'), 'x')
+
+const listed = await browseDirectory(browseTmp, deps)
+assert.equal(listed.path, browseTmp, 'the listing echoes the resolved absolute path')
+assert.equal(listed.error, undefined, 'a readable directory reports no error (absent, like every other optional)')
+assert.deepEqual(
+  listed.entries.map(e => e.name),
+  ['alpha', 'nested', 'zeta'],
+  'directories are listed name-sorted, files excluded',
+)
+assert.ok(listed.entries.every(e => e.readable), 'every readable directory is offered')
+assert.ok(
+  listed.entries.every(e => e.path === joinPath(browseTmp, e.name)),
+  'each entry carries the absolute path the host will store',
+)
+
+// The parent is offered so the panel can walk up without retyping.
+const deep = await browseDirectory(joinPath(browseTmp, 'nested', 'deep'), deps)
+assert.equal(deep.parent, joinPath(browseTmp, 'nested'), 'a nested directory offers its parent')
+assert.equal(deep.entries.length, 0, 'an empty directory lists nothing')
+
+// An EMPTY directory and an UNREADABLE one must not look the same. Reporting a
+// missing directory as an empty listing is indistinguishable from "your files
+// are gone", which is the worst possible rendering of a typo.
+const missing = await browseDirectory(joinPath(browseTmp, 'nope'), deps)
+assert.equal(missing.entries.length, 0)
+assert.ok(missing.error !== '', 'a missing directory must report an error, not an empty listing')
+assert.equal(missing.path, joinPath(browseTmp, 'nope'), 'the failed path is echoed so the panel can show it')
+
+// A path that is a FILE rather than a directory: the user pasted a file path.
+const asFile = await browseDirectory(joinPath(browseTmp, 'a-file.txt'), deps)
+const asFileError = String(asFile.error ?? '')
+assert.ok(asFileError !== '', 'a file path must be reported as an error, not listed as empty')
+assert.match(asFileError, /不是目录/, 'the panel must be able to say the path is not a directory, got: ' + asFileError)
+
+// Traversal syntax is resolved BEFORE listing, so it can never steer the walk.
+const traversed = await browseDirectory(joinPath(browseTmp, 'nested', '..', 'alpha'), deps)
+assert.equal(traversed.path, joinPath(browseTmp, 'alpha'), '..-segments resolve to a real, normalized path')
+assert.equal(traversed.error, undefined)
+
+// The roots-only view: no path asked for, and NO error (an error here would
+// paint the picker's very first frame as a failure).
+const rootsView = await browseDirectory('', deps)
+assert.equal(rootsView.error, undefined, 'the opening view is not an error')
+assert.equal(rootsView.path, '', 'the opening view names no path')
+assert.deepEqual(rootsView.entries, [], 'the opening view lists nothing until a path is chosen')
+assert.deepEqual(
+  rootsView.roots.map(r => r.id),
+  ['home', 'imWorkspace'],
+  'shortcuts are reported up front, with duplicates collapsed',
+)
+step('browse route lists real directories (files excluded, failures reported) OK')
+
+// 17d. Shortcut de-duplication: the plugin cwd frequently EQUALS home, and a
+// duplicated shortcut is a second button that does nothing new.
+{
+  const duplicated = browseRoots({ ...deps, home: browseTmp, cwd: browseTmp, imWorkspace: browseTmp })
+  assert.equal(duplicated.length, 1, 'the same directory must not appear as three shortcuts')
+  const cased = browseRoots({ ...deps, home: browseTmp, cwd: browseTmp.toUpperCase(), imWorkspace: '' })
+  if (process.platform === 'win32') {
+    assert.equal(cased.length, 1, 'Windows paths that differ only in case are one directory')
+  }
+  assert.deepEqual(browseRoots({ ...deps, home: '', cwd: '', imWorkspace: '' }), [],
+    'with nothing resolvable there are simply no shortcuts')
+}
+step('browse shortcuts de-duplicated OK')
+
+// 17e. Saving a bad directory must be refused while the user is still looking
+// at the box: a saved typo silently starts every chat in a NEW, wrong
+// workspace, and that is invisible at save time.
+{
+  assert.equal(await validateDirectory('', deps), 'ok', 'empty means "use the fallbacks", not an error')
+  assert.equal(await validateDirectory(browseTmp, deps), 'ok', 'a real directory is accepted')
+  const relative = await validateDirectory('relative/dir', deps)
+  assert.match(String(relative), /绝对路径/, 'a relative path must be refused (it would resolve against the host cwd)')
+  const bad = await validateDirectory(joinPath(browseTmp, 'nope'), deps)
+  assert.ok(bad !== 'ok', 'a non-existent directory must be refused')
+  assert.equal(describeFsError({ code: 'EACCES' }, 'X'), '没有权限读取：X', 'permission errors are named')
+  assert.equal(describeFsError({ code: 'ENOENT' }, 'X'), '目录不存在：X', 'a missing directory is named')
+  assert.ok(
+    !describeFsError(new Error("ENOENT: no such file or directory, scandir 'C:\\x'"), 'X').includes('scandir'),
+    'the raw Node error text must not leak into the panel',
+  )
+}
+step('browse validates a typed path before it can be saved OK')
+
+// 17f. Client helpers: URL shape, untrusted-payload narrowing, staleness guard.
+{
+  assert.equal(browseUrl(''), BROWSE_ROUTE_PATH, 'no path -> the roots-only view')
+  assert.equal(browseUrl('C:\\work\\im'), `${BROWSE_ROUTE_PATH}?path=C%3A%5Cwork%5Cim`, 'the path is URI-encoded')
+  assert.ok(browseUrl('/a b').endsWith('path=%2Fa%20b'), 'spaces must not break the query')
+
+  const narrowed = normalizeBrowsePayload({
+    path: '/x',
+    parent: '/',
+    entries: [
+      { name: 'ok', path: '/x/ok', readable: true },
+      { name: 'no-path' },        // dropped: no path
+      null,                        // dropped: not an object
+      { name: 'assumed', path: '/x/a' }, // readable defaults to true
+    ],
+    roots: [{ id: 'home', path: '/home' }, { path: '/no-id' }],
+  })
+  assert.deepEqual(narrowed.entries.map(e => e.name), ['ok', 'assumed'], 'malformed entries are dropped, not trusted')
+  assert.equal(narrowed.entries[1]?.readable, true, 'a missing `readable` is treated as readable')
+  assert.deepEqual(narrowed.roots.map(r => r.id), ['home'], 'a shortcut without an id is dropped')
+
+  const garbage = normalizeBrowsePayload('not an object')
+  assert.deepEqual(
+    { path: garbage.path, parent: garbage.parent, n: garbage.entries.length, e: garbage.error },
+    { path: '', parent: null, n: 0, e: '' },
+    'a non-object body degrades to an empty result instead of crashing the picker',
+  )
+
+  // A transport failure must come back as a RESULT with an error, never a
+  // rejection: the picker renders one failure state and has no catch of its own.
+  const refused = await fetchDirectory('/x', async () => ({ ok: false, status: 401, json: async () => ({}) }))
+  assert.ok(refused.error !== '', 'an unauthenticated listing is an error result')
+  assert.match(refused.error, /权限/, 'a 401 must name the auth problem, got: ' + refused.error)
+  assert.equal(refused.path, '/x', 'the failed path is preserved for display')
+
+  const unreachable = await fetchDirectory('/y', async () => { throw new Error('offline') })
+  assert.match(unreachable.error, /offline/, 'a thrown transport error becomes a result, not a rejection')
+
+  const okFetch = await fetchDirectory('/z', async () => ({
+    ok: true, status: 200, json: async () => ({ path: '/z', parent: '/', entries: [], roots: [] }),
+  }))
+  assert.equal(okFetch.path, '/z', 'a successful listing passes through')
+}
+step('browse client helpers (URL, narrowing, failure-as-result) OK')
+
+// 17g. `directoryProblem` must never block a save it cannot vouch for: an
+// unverified path (typed, never browsed) is not an error, but a path the host
+// just refused IS.
+{
+  const failed = { path: '/x', parent: null, entries: [], roots: [], error: '目录不存在：/x' }
+  assert.equal(directoryProblem('/x', failed), '目录不存在：/x', 'a path the host refused must be surfaced')
+  assert.equal(directoryProblem('', failed), '', 'empty is never an error')
+  assert.equal(directoryProblem('/typed', failed), '', 'an unverified path must not be blocked')
+  assert.equal(directoryProblem('/x', { ...failed, error: '' }), '', 'a healthy listing raises nothing')
+}
+step('browse save-guard only blocks what was actually verified OK')
+
+// 17h. The route end-to-end: gate, method guard, and real listing.
+{
+  let gate: 0 | 401 | 403 = 0
+  const browseServer = createServer(createBrowseHandler({
+    browse: deps,
+    reject: () => (gate === 0 ? undefined : gate),
+  }))
+  await new Promise<void>((ready) => browseServer.listen(0, '127.0.0.1', () => ready()))
+  const base = `http://127.0.0.1:${portOf(browseServer)}`
+
+  const ok = await fetch(`${base}${browseUrl(browseTmp)}`)
+  assert.equal(ok.status, 200)
+  assert.equal(ok.headers.get('cache-control'), 'no-store', 'a cached listing would show a stale tree')
+  const body = await ok.json() as { entries: Array<{ name: string }>; error?: string; parent?: string | null }
+  assert.deepEqual(body.entries.map(e => e.name), ['alpha', 'nested', 'zeta'], 'the route serves the real listing')
+  assert.ok(!('error' in body), 'a healthy listing must not ride the wire with an error key at all')
+
+  // A failing path is still HTTP 200 (the request SUCCEEDED; the directory did
+  // not), carrying the reason — so the panel has one shape to render.
+  const failedList = await fetch(`${base}${browseUrl(joinPath(browseTmp, 'nope'))}`)
+  assert.equal(failedList.status, 200, 'an unreadable directory is a reported outcome, not a transport error')
+  const failedBody = await failedList.json() as { error?: string; entries: unknown[] }
+  assert.ok(String(failedBody.error ?? '') !== '', 'the failure reason must ride the body')
+  assert.deepEqual(failedBody.entries, [], 'a failed listing carries no entries')
+
+  // FAIL CLOSED: this endpoint enumerates the host's filesystem and
+  // `webServer.register` authenticates nothing, so an unauthenticated caller
+  // must be refused — and the refusal must not leak a single directory name.
+  gate = 401
+  const denied = await fetch(`${base}${browseUrl(browseTmp)}`)
+  assert.equal(denied.status, 401, 'an unauthenticated listing must be refused')
+  const deniedText = await denied.text()
+  assert.equal(deniedText, 'unauthorized')
+  assert.ok(!deniedText.includes('alpha'), 'no directory name may leak on a refusal')
+  gate = 0
+
+  // A MISSING gate is a startup race, not a pass.
+  const noGateServer = createServer(createBrowseHandler({ browse: deps }))
+  await new Promise<void>((ready) => noGateServer.listen(0, '127.0.0.1', () => ready()))
+  const noGate = await fetch(`http://127.0.0.1:${portOf(noGateServer)}${browseUrl(browseTmp)}`)
+  assert.equal(noGate.status, 401, 'a missing trust gate must REFUSE (fail closed)')
+  assert.ok(!(await noGate.text()).includes('alpha'), 'no directory name may leak when the gate is unavailable')
+  noGateServer.close()
+
+  const posted = await fetch(`${base}${browseUrl(browseTmp)}`, { method: 'POST' })
+  assert.equal(posted.status, 405, 'the route is read-only')
+  assert.equal(posted.headers.get('allow'), 'GET')
+
+  const headed = await fetch(`${base}${browseUrl(browseTmp)}`, { method: 'HEAD' })
+  assert.equal(headed.status, 200)
+  assert.equal(await headed.text(), '', 'HEAD must not carry a body')
+
+  // A missing path is the roots view, not a 400: the panel's first paint must
+  // be usable.
+  const opening = await fetch(`${base}${BROWSE_ROUTE_PATH}`)
+  assert.equal(opening.status, 200)
+  const openingBody = await opening.json() as { path: string; roots: unknown[] }
+  assert.equal(openingBody.path, '', 'no path -> the roots view')
+  assert.ok(openingBody.roots.length > 0, 'the opening view offers shortcuts')
+
+  // A repeated `?path=` arrives as an array: the FIRST value wins, because
+  // joining them would invent a path nobody asked for.
+  const repeated = await fetch(`${base}${BROWSE_ROUTE_PATH}?path=${encodeURIComponent(browseTmp)}&path=${encodeURIComponent('/nope')}`)
+  const repeatedBody = await repeated.json() as { path: string }
+  assert.equal(repeatedBody.path, browseTmp, 'a repeated path parameter must not be concatenated')
+
+  browseServer.close()
+}
+step('browse route (gate fails closed, method guard, roots view) OK')
+
+// --- 18. the client half must not paint literal colours ---
+// The panel is drawn with INLINE styles (it cannot import the host's CSS
+// modules), so a hard-coded `#1f1f1f` / `rgba(128,128,128,…)` is not a neutral
+// choice: it renders identically on both themes. The directory dialog shipped
+// with invented token names (`--dsw-alias-bg-elevated`) plus dark literals as
+// fallbacks, so on the LIGHT theme the undefined variables fell through to those
+// fallbacks and painted a dark card with dark text — unreadable, and invisible
+// to every other check, because an undefined `var()` is not an error: it is
+// simply "use the fallback".
+//
+// Asserted on the BUILT bundle (the artifact the browser actually executes).
+{
+  const themeDir = process.env.DSH_THEME_DIR
+    ?? 'D:/Apps/deepseek-harness/packages/client/ui-theme/src/styles'
+  const clientBundleText = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+
+  // Every theme token the bundle references...
+  const referenced = new Set(
+    [...clientBundleText.matchAll(/--dsw-alias-[a-z0-9-]+/g)].map(m => m[0]),
+  )
+  assert.ok(referenced.size > 0, 'the panel must style itself through theme tokens')
+
+  // ...must NOT carry a literal fallback: that fallback is precisely what hides
+  // a misspelled token name on the theme the literal does not match.
+  const withFallback = [...clientBundleText.matchAll(/var\((--dsw-alias-[a-z0-9-]+)\s*,/g)]
+    .map(m => m[1]!)
+  assert.deepEqual(
+    [...new Set(withFallback)], [],
+    'an --dsw-alias-* reference must not carry a literal fallback (it masks a wrong token name)',
+  )
+
+  // Cross-check the names against the host theme when its sources are present.
+  // On a bare install the artifact is absent and the checks above still hold;
+  // this is the stronger version and needs the DSH checkout.
+  if (existsSync(themeDir)) {
+    const css = readdirSync(themeDir)
+      .filter(name => name.endsWith('.css'))
+      .map(name => readFileSync(joinPath(themeDir, name), 'utf8'))
+      .join('\n')
+    const defined = new Set([...css.matchAll(/(--dsw-alias-[a-z0-9-]+)\s*:/g)].map(m => m[1]!))
+    const unknown = [...referenced].filter(token => !defined.has(token))
+    assert.deepEqual(
+      unknown, [],
+      `tokens that do not exist in the DSH theme (they would silently fall back): ${unknown.join(', ')}`,
+    )
+  }
+
+  // No bare colour literals in OUR OWN panel sources. Scoped to the plugin's
+  // `.tsx`/`.ts` rather than the built bundle, because the bundle also contains
+  // vendored third-party code — `qrcode-generator` legitimately emits
+  // `#000000`/`#ffffff` for the QR modules, which is a SCANNING requirement, not
+  // a theming choice. Sweeping the bundle would either fail on that or force a
+  // loophole wide enough to hide a real literal.
+  //
+  // The QR tile's own white background is the one deliberate exception in our
+  // code: a QR printed on a dark surface does not scan. It is asserted
+  // separately below so the exception cannot quietly grow.
+  const ourSources = readdirSync(new URL('../src/client/', import.meta.url))
+    .filter(name => name.endsWith('.ts') || name.endsWith('.tsx'))
+    .map(name => readFileSync(new URL(`../src/client/${name}`, import.meta.url), 'utf8'))
+    .join('\n')
+  // Strip block comments first: the prose in these files quotes the offending
+  // literals on purpose (explaining why they were removed).
+  const ourCode = ourSources.replace(/\/\*[\s\S]*?\*\//g, '')
+  const literalColours = [...ourCode.matchAll(/#[0-9a-fA-F]{3,8}\b|rgba?\([^)]*\)/g)]
+    .map(m => m[0])
+    .filter(token => token.toLowerCase() !== '#fff')
+  assert.deepEqual(
+    literalColours, [],
+    `panel colours must come from theme tokens, found literals: ${literalColours.join(', ')}`,
+  )
+  assert.ok(
+    ourCode.includes('#fff'),
+    'the QR tile must keep its literal white background (a dark-surface QR does not scan)',
+  )
+}
+step('client half paints only real theme tokens (no literal colours) OK')
+
+await rmBrowse(browseTmp, { recursive: true, force: true })
 
 process.stderr.write('\n✔ All local smoke checks passed.\n')
 process.exit(0)

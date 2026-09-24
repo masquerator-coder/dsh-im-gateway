@@ -30,6 +30,7 @@ import { writeField } from './write-field.ts'
 import { STATUS_ROUTE_PATH, type ChannelStatusPayload } from '../status-proto.ts'
 import { QR_SIZE_PX, qrSvgFor } from './qr.ts'
 import { requiredMissing, type Field, type Template } from './required-fields.ts'
+import { DirectoryBrowser } from './DirectoryBrowser.tsx'
 
 /** Email providers: choosing one auto-fills host / IMAP / SMTP / TLS. */
 interface EmailProvider {
@@ -211,6 +212,14 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
    */
   const [cwdDraft, setCwdDraft] = useState<string | null>(null)
 
+  /**
+   * Which box the open picker is filling: the section-level default, or the
+   * selected channel's own advanced `cwd`. `null` = picker closed. Tracking the
+   * TARGET rather than sharing one "open" flag is what keeps a pick for the
+   * per-channel field from overwriting the plugin-wide default.
+   */
+  const [browsing, setBrowsing] = useState<'global' | 'channel' | null>(null)
+
   // Live status map: channelId -> { status, detail, qr, bound } (pulled from the
   // host route registered by the node half — see src/status-route.ts).
   const [status, setStatus] = useState<
@@ -333,12 +342,17 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
     setNoticeIsError(false)
     setAdvancedOpen(false)
     setConfirmingDelete(false)
+    // Same reason as `select`: the target channel changed under the picker.
+    setBrowsing(null)
   }, [TP, t])
 
   const select = useCallback((id: string) => {
     setActiveId(id)
     setCreating(null)
     setConfirmingDelete(false)
+    // A picker left open would keep pointing at the PREVIOUS channel's draft,
+    // so a pick could write a path into a channel the user is no longer editing.
+    setBrowsing(null)
   }, [])
 
   /** Fields for the current type (email switches with provider selection). */
@@ -553,6 +567,17 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
             onChange: (e: React.ChangeEvent<HTMLInputElement>) => setCwdDraft(e.target.value),
             style: inputStyle,
           }),
+          // Browse the HOST's filesystem instead of typing an absolute path
+          // blind — a typo here silently starts every chat in a new, wrong
+          // workspace. The listing comes from the plugin's own same-origin
+          // route, so it works when DSH runs on another machine (where a native
+          // OS dialog would browse the wrong one).
+          h('button', {
+            type: 'button',
+            disabled: busy,
+            onClick: () => setBrowsing('global'),
+            style: { ...ghostStyle, padding: '8px 14px', whiteSpace: 'nowrap' },
+          }, t('browse.open')),
           h('button', {
             type: 'button',
             disabled: busy,
@@ -560,12 +585,25 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
             style: { ...ghostStyle, padding: '8px 14px', whiteSpace: 'nowrap' },
           }, t('channels.save')),
         ),
-        h('span', { style: { fontSize: '11px', opacity: 0.55 } }, t('global.cwdHint')),
+        h('span', { style: hintStyle }, t('global.cwdHint')),
       ),
+      // The picker renders INSIDE the section-level box (as an overlay), so it
+      // is torn down with the panel instead of leaking a stray dialog.
+      browsing === 'global'
+        ? h(DirectoryBrowser, {
+            initialPath: defaultCwd,
+            onPick: (path: string) => {
+              setCwdDraft(path)
+              setBrowsing(null)
+            },
+            onClose: () => setBrowsing(null),
+            t,
+          })
+        : null,
     ),
     h('div', { style: { display: 'flex', gap: '20px' } },
       // LEFT: channel list / pickers.
-      h('div', { style: { width: '220px', flex: '0 0 auto', borderRight: '1px solid rgba(128,128,128,0.25)', paddingRight: '12px' } },
+      h('div', { style: { width: '220px', flex: '0 0 auto', borderRight: '0.5px solid var(--dsw-alias-border-l3)', paddingRight: '12px' } },
         h('div', { style: { fontSize: '13px', fontWeight: 600, marginBottom: '8px' } }, t('channels.add')),
         h('div', { style: { display: 'grid', gap: '6px' } },
           (['wechat', 'qq', 'email', 'cmcc', 'feishu', 'http'] as ChannelType[]).map(type =>
@@ -588,12 +626,16 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
                 onClick: () => select(ch.id),
                 style: {
                   padding: '7px 10px', borderRadius: '8px', cursor: 'pointer', fontSize: '13px',
-                  border: resolvedActiveId === ch.id ? '1px solid #4f8cff' : '1px solid rgba(128,128,128,0.25)',
-                  background: resolvedActiveId === ch.id ? 'rgba(79,140,255,0.08)' : 'transparent',
+                  border: resolvedActiveId === ch.id
+                    ? '0.5px solid var(--dsw-alias-button-primary-fill)'
+                    : '0.5px solid var(--dsw-alias-border-l3)',
+                  background: resolvedActiveId === ch.id
+                    ? 'var(--dsw-alias-interactive-bg-hover)'
+                    : 'transparent',
                 },
               },
                 h('div', { style: { fontWeight: 600 } }, ch.name),
-                h('div', { style: { fontSize: '11px', opacity: 0.65 } },
+                h('div', { style: { ...hintStyle, fontSize: '11px' } },
                   typeLabel(ch.type) + ' · ' + statusLabel(statusOf(ch)) + (ch.enabled ? '' : ' · ' + t('channels.disabled'))),
               ),
             ),
@@ -602,7 +644,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
       ),
       // RIGHT: form for the selected channel.
       h('div', { style: { flex: '1 1 auto', minWidth: '0' } },
-        notice !== '' ? h('div', { style: { color: noticeIsError ? '#ff7a7a' : '#57d18a', fontSize: '12px', marginBottom: '8px' } }, notice) : null,
+        notice !== '' ? h('div', { style: { ...(noticeIsError ? dangerStyle : successStyle), fontSize: '12px', marginBottom: '8px' } }, notice) : null,
         creating !== null || active
           ? h('div', { style: { display: 'grid', gap: '12px' } },
               // Status line
@@ -636,21 +678,21 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
                       h('div', {
                         style: {
                           width: QR_SIZE_PX + 'px', height: QR_SIZE_PX + 'px', borderRadius: '8px',
-                          border: '1px solid rgba(128,128,128,0.35)', background: '#fff',
+                          border: '0.5px solid var(--dsw-alias-border-l3)', background: '#fff',
                           overflow: 'hidden', lineHeight: 0,
                         },
                         // Data-driven SVG generated by the QR encoder: the payload
                         // selects modules, it is never interpolated into markup.
                         dangerouslySetInnerHTML: { __html: activeQrSvg },
                       }),
-                      h('a', { href: activeQr, target: '_blank', rel: 'noreferrer', style: { color: '#4f8cff' } }, t('channels.openQr')),
+                      h('a', { href: activeQr, target: '_blank', rel: 'noreferrer', style: linkStyle }, t('channels.openQr')),
                     )
                   // Nothing encoded: either the channel is already bound (nothing
                   // to scan — say so, or a finished pairing reads as a broken
                   // panel), a bind URL exists but could not be encoded, or the
                   // host has not reported one yet.
                   : activeQr
-                    ? h('a', { href: activeQr, target: '_blank', rel: 'noreferrer', style: { color: '#4f8cff' } }, t('channels.openQr'))
+                    ? h('a', { href: activeQr, target: '_blank', rel: 'noreferrer', style: linkStyle }, t('channels.openQr'))
                     : activeBound
                       ? h('span', { style: { opacity: 0.75 } }, t('channels.bound'))
                       : h('span', { style: { opacity: 0.75 } }, t('channels.qrHint')) ) : null,
@@ -697,7 +739,7 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
               ),
               // Advanced agent-routing options (allowlist / provider / model /
               // maxTokens / cwd / agentPreset), disclosed on demand.
-              h('div', { style: { borderTop: '1px solid rgba(128,128,128,0.18)', paddingTop: '8px' } },
+              h('div', { style: { borderTop: '0.5px solid var(--dsw-alias-border-l3)', paddingTop: '8px' } },
                 h('button', {
                   type: 'button',
                   onClick: () => setAdvancedOpen(!advancedOpen),
@@ -714,21 +756,55 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
                           onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) =>
                             setDraft(prev => ({ ...prev, allowlist: e.target.value })),
                         })
-                      : h('input', {
-                          style: inputStyle,
-                          value: draft[key] ?? '',
-                          onChange: (e: React.ChangeEvent<HTMLInputElement>) =>
-                            setDraft(prev => ({ ...prev, [key]: e.target.value })),
-                        }),
-                    h('span', { style: { fontSize: '11px', opacity: 0.55 } }, ADVANCED_HINTS[key] ?? ''),
+                      // The per-channel working directory gets the same picker as
+                      // the section-level default: it is the same kind of value,
+                      // typed into the same kind of box, with the same failure
+                      // mode (a typo silently starting a new conversation in the
+                      // wrong directory).
+                      : key === 'cwd'
+                        ? h('div', { style: { display: 'flex', gap: '8px' } },
+                            h('input', {
+                              style: inputStyle,
+                              value: draft[key] ?? '',
+                              onChange: (e: React.ChangeEvent<HTMLInputElement>) =>
+                                setDraft(prev => ({ ...prev, [key]: e.target.value })),
+                            }),
+                            h('button', {
+                              type: 'button',
+                              onClick: () => setBrowsing('channel'),
+                              style: { ...ghostStyle, padding: '8px 14px', fontSize: '12px', whiteSpace: 'nowrap' },
+                            }, t('browse.open')),
+                          )
+                        : h('input', {
+                            style: inputStyle,
+                            value: draft[key] ?? '',
+                            onChange: (e: React.ChangeEvent<HTMLInputElement>) =>
+                              setDraft(prev => ({ ...prev, [key]: e.target.value })),
+                          }),
+                    h('span', { style: hintStyle }, ADVANCED_HINTS[key] ?? ''),
                   )),
                 ) : null,
               ),
               h('div', { style: { display: 'flex', gap: '10px', marginTop: '4px' } },
                 h('button', { type: 'button', onClick: () => void save(), disabled: busy, style: primaryStyle }, t('channels.save')),
                 active ? h('button', { type: 'button', onClick: () => void remove(active.id), disabled: busy,
-                  style: { ...ghostStyle, color: '#ff7a7a' } }, confirmingDelete ? t('channels.confirmDelete') : t('channels.delete')) : null,
+                  style: { ...ghostStyle, ...dangerStyle } }, confirmingDelete ? t('channels.confirmDelete') : t('channels.delete')) : null,
               ),
+              // Picker for THIS channel's own `cwd` (the advanced fold above).
+              // Rendered here, in the right column, so it overlays the form it
+              // belongs to; a pick writes into the local draft and still needs
+              // the normal 保存 to reach the host.
+              browsing === 'channel'
+                ? h(DirectoryBrowser, {
+                    initialPath: draft.cwd ?? '',
+                    onPick: (path: string) => {
+                      setDraft(prev => ({ ...prev, cwd: path }))
+                      setBrowsing(null)
+                    },
+                    onClose: () => setBrowsing(null),
+                    t,
+                  })
+                : null,
             )
           : h('p', { style: { opacity: 0.7, fontSize: '14px' } }, t('channels.empty')),
       ),
@@ -736,36 +812,62 @@ export function ChannelsSection(props: ChannelsSectionProps): React.ReactElement
   )
 }
 
+/* --- Styles. ---
+ *
+ * THEME CONTRACT: every colour here resolves through a DSH `--dsw-alias-*`
+ * token, with no literal fallback. The panel is drawn with inline styles (it
+ * cannot import the host's CSS modules), so a hard-coded `rgba(128,128,128,…)`
+ * or `#4f8cff` is not a neutral choice — it renders the same grey/violet on
+ * both themes, and the "selected row" and accent affordances stop matching the
+ * rest of the app. The token names come from the host's own primitives
+ * (`ui-primitives/Button.module.css`, `Modal.module.css`,
+ * `ui-directory-picker-browse/DirectoryBrowser.module.css`):
+ * surfaces are `bg-layer-N`, hairlines are `border-l1..l4`, text is
+ * `label-primary` / `label-secondary` / `label-tertiary` / `label-caption`,
+ * and the accent is `button-primary-fill` with `label-primary-foreground` on top.
+ */
+
 const listButtonStyle: React.CSSProperties = {
   display: 'flex', alignItems: 'center',
-  border: '1px solid rgba(128,128,128,0.3)', borderRadius: '8px', background: 'transparent',
-  color: 'inherit', padding: '8px 10px', fontSize: '13px', cursor: 'pointer', textAlign: 'left',
+  border: '0.5px solid var(--dsw-alias-border-l3)', borderRadius: '8px', background: 'transparent',
+  color: 'var(--dsw-alias-label-primary)', padding: '8px 10px', fontSize: '13px', cursor: 'pointer', textAlign: 'left',
 }
-const labelStyle: React.CSSProperties = { fontSize: '12px', opacity: 0.75 }
+const labelStyle: React.CSSProperties = { fontSize: '12px', color: 'var(--dsw-alias-label-secondary)' }
 const setupCalloutStyle: React.CSSProperties = {
   padding: '10px 12px',
   borderRadius: '10px',
-  border: '1px solid rgba(128,128,128,0.28)',
-  background: 'rgba(79,140,255,0.06)',
+  border: '0.5px solid var(--dsw-alias-border-l3)',
+  background: 'var(--dsw-alias-bg-layer-1)',
 }
 /** Section-level row (the plugin-wide default working directory). */
 const defaultCwdStyle: React.CSSProperties = {
   padding: '10px 12px',
   borderRadius: '10px',
-  border: '1px solid rgba(128,128,128,0.28)',
-  background: 'rgba(128,128,128,0.06)',
+  border: '0.5px solid var(--dsw-alias-border-l3)',
+  background: 'var(--dsw-alias-bg-layer-1)',
 }
 const inputStyle: React.CSSProperties = {
   width: '100%', boxSizing: 'border-box', padding: '8px 10px', borderRadius: '8px',
-  border: '1px solid rgba(128,128,128,0.35)', background: 'transparent', color: 'inherit', fontSize: '13px',
+  border: '0.5px solid var(--dsw-alias-border-l4)', background: 'transparent',
+  color: 'var(--dsw-alias-label-primary)', fontSize: '13px',
 }
 const primaryStyle: React.CSSProperties = {
-  padding: '8px 18px', borderRadius: '8px', border: 'none', background: '#4f8cff', color: '#fff',
+  padding: '8px 18px', borderRadius: '8px', border: 'none',
+  background: 'var(--dsw-alias-button-primary-fill)',
+  color: 'var(--dsw-alias-label-primary-foreground)',
   fontSize: '13px', cursor: 'pointer', fontWeight: 600,
 }
 const ghostStyle: React.CSSProperties = {
-  padding: '8px 18px', borderRadius: '8px', border: '1px solid rgba(128,128,128,0.35)',
-  background: 'transparent', fontSize: '13px', cursor: 'pointer',
+  padding: '8px 18px', borderRadius: '8px', border: '0.5px solid var(--dsw-alias-border-l4)',
+  background: 'transparent', color: 'var(--dsw-alias-label-primary)', fontSize: '13px', cursor: 'pointer',
 }
+/** Muted helper text under a field. */
+const hintStyle: React.CSSProperties = { fontSize: '11px', color: 'var(--dsw-alias-label-tertiary)' }
+/** Destructive affordance (delete / confirm delete). */
+const dangerStyle: React.CSSProperties = { color: 'var(--dsw-alias-state-error-primary)' }
+/** Success notice. */
+const successStyle: React.CSSProperties = { color: 'var(--dsw-alias-state-success-primary)' }
+/** Link-styled affordance (open QR). */
+const linkStyle: React.CSSProperties = { color: 'var(--dsw-alias-button-info-fill)' }
 
 export { EMAIL_PROVIDERS }

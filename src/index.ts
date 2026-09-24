@@ -1,12 +1,14 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-settings'
+import type { IncomingMessage } from 'node:http'
 import { Config } from './config.ts'
 import type { Config as ConfigType } from './config.ts'
 import { ImGateway } from './gateway.ts'
 import { InboundHttpServer } from './inbound.ts'
 import { ChannelManager } from './channels/manager.ts'
-import { STATUS_ROUTE_PATH } from './status-proto.ts'
-import { createStatusHandler, type RequestGate, type WebRouteService } from './status-route.ts'
+import { STATUS_ROUTE_PATH, BROWSE_ROUTE_PATH } from './status-proto.ts'
+import { createStatusHandler, createBrowseHandler, type RequestGate, type WebRouteService } from './status-route.ts'
+import { defaultBrowseDeps } from './browse-route.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -113,31 +115,54 @@ export function apply(ctx: Context, config: ConfigType): void {
   // browser-auth check that guards `/api`: an unauthenticated local request must
   // not be able to read a live bind QR.
   ctx.inject(['webServer'], (webCtx: Context) => {
+    // Resolved per request: the connection service mounts independently of this
+    // plugin, so an apply-time lookup could miss it. When it is missing the
+    // request is REFUSED (401) rather than admitted — both routes below answer
+    // with material a local unauthenticated caller must not read (a live bind
+    // QR; the host's directory tree) and `webServer` applies no authentication
+    // of its own, so "no gate available" must never mean "open".
+    const reject = (req: IncomingMessage): 401 | 403 | undefined => {
+      const gate = webCtx.get('connection') as RequestGate | undefined
+      if (gate === undefined) {
+        webCtx.logger.warn('[im-gateway] web route: connection service unavailable; refusing (failing closed)')
+        return 401
+      }
+      try {
+        return gate.requestRejection?.(req)
+      } catch (error) {
+        webCtx.logger.warn(`[im-gateway] web route trust check failed: ${String(error)}`)
+        return 401
+      }
+    }
+    const log = (message: string): void => webCtx.logger.warn(message)
+
     const handler = createStatusHandler({
       list: () => channelManager.statusList(),
-      // Resolved per request: the connection service mounts independently of
-      // this plugin, so an apply-time lookup could miss it. When it is missing
-      // the request is REFUSED (401) rather than admitted: this route returns a
-      // live bind QR and `webServer` applies no authentication of its own, so
-      // "no gate available" must never mean "open".
-      reject: (req) => {
-        const gate = webCtx.get('connection') as RequestGate | undefined
-        if (gate === undefined) {
-          webCtx.logger.warn('[im-gateway] status route: connection service unavailable; refusing (failing closed)')
-          return 401
-        }
-        try {
-          return gate.requestRejection?.(req)
-        } catch (error) {
-          webCtx.logger.warn(`[im-gateway] status route trust check failed: ${String(error)}`)
-          return 401
-        }
-      },
-      log: (message) => webCtx.logger.warn(message),
+      reject,
+      log,
     })
     webCtx.effect(
       () => webCtx.webServer.register({ kind: 'exact', path: STATUS_ROUTE_PATH, handler }),
       'dsh-im-gateway.status-route()',
+    )
+
+    // Directory browser backend for the settings panel's 浏览… button. The
+    // panel cannot enumerate directories itself (a page has no filesystem
+    // access), and it must list the directory tree of the machine the AGENT
+    // runs on — which is the host process, possibly not the browser's machine.
+    // The shortcuts come from THIS plugin's own configuration, so the picker
+    // starts where the user's channels actually run.
+    const browseHandler = createBrowseHandler({
+      // `cwd` is the plugin-level fallback from cordis.yml; `imWorkspace` is
+      // derived by `defaultBrowseDeps()` exactly like the gateway's own
+      // `~/.dsh/im-workspace` fallback.
+      browse: { ...defaultBrowseDeps(), cwd: config.cwd },
+      reject,
+      log,
+    })
+    webCtx.effect(
+      () => webCtx.webServer.register({ kind: 'exact', path: BROWSE_ROUTE_PATH, handler: browseHandler }),
+      'dsh-im-gateway.browse-route()',
     )
   })
 

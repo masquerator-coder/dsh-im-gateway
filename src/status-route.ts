@@ -9,6 +9,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { ChannelStatusPayload, ChannelStatusRow } from './status-proto.ts'
+import { browseDirectory, type BrowseDeps } from './browse-route.ts'
 
 /** Handler shape DSH's web route service expects. */
 export type WebRouteHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
@@ -48,6 +49,18 @@ export interface StatusRouteDeps {
   log?: (message: string) => void
 }
 
+export interface BrowseRouteDeps {
+  /**
+   * Directory source. Injectable so `scripts/smoke.mts` can exercise the route
+   * against real temp directories (and against failures) without depending on
+   * the machine the suite happens to run on.
+   */
+  browse: BrowseDeps
+  /** Browser-auth gate; same fail-closed contract as {@link StatusRouteDeps.reject}. */
+  reject?: (req: IncomingMessage) => 401 | 403 | undefined
+  log?: (message: string) => void
+}
+
 /**
  * Project internal snapshots onto the wire rows, dropping absent optionals so
  * they never ride the wire as `undefined` (JSON has no such value).
@@ -75,35 +88,7 @@ export function channelStatusPayload(rows: readonly StatusSnapshotLike[]): Chann
  */
 export function createStatusHandler(deps: StatusRouteDeps): WebRouteHandler {
   return (req, res) => {
-    // FAIL CLOSED. This route answers with a live WeChat/QQ bind QR, which is a
-    // credential-equivalent secret: anyone who can read it can complete a bind.
-    // `webServer.register` applies no authentication, so this gate is the only
-    // thing protecting it — yet `deps.reject?.()` treated a MISSING gate as
-    // "nothing to check" and served the payload to any caller. `src/index.ts`
-    // resolves the gate per request (`webCtx.get('connection')`) precisely
-    // because the service can mount late, so the absent case is reachable on a
-    // real startup race. Refuse instead of degrading to open.
-    let rejection: 401 | 403 | undefined
-    if (deps.reject === undefined) {
-      deps.log?.('[im-gateway] status route refused: connection trust service unavailable (failing closed)')
-      rejection = 401
-    } else {
-      try {
-        rejection = deps.reject(req)
-      } catch (error) {
-        deps.log?.(`[im-gateway] status route refused: trust check failed: ${String(error)}`)
-        rejection = 401
-      }
-    }
-    if (rejection !== undefined) {
-      writeText(res, rejection, rejection === 401 ? 'unauthorized' : 'forbidden')
-      return
-    }
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
-      res.writeHead(405, { allow: 'GET', 'content-type': 'text/plain; charset=utf-8' })
-      res.end('method not allowed')
-      return
-    }
+    if (!admit(req, res, deps.reject, deps.log, 'status route')) return
     try {
       const body = JSON.stringify(channelStatusPayload(deps.list()))
       // no-store: the QR payload rotates and a cached body would strand the
@@ -121,4 +106,110 @@ export function createStatusHandler(deps: StatusRouteDeps): WebRouteHandler {
 function writeText(res: ServerResponse, status: number, body: string): void {
   res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8' })
   res.end(body)
+}
+
+/**
+ * Apply the shared admission rules to a plugin-owned web route: browser-auth
+ * gate, then the GET/HEAD method guard. Writes the refusal itself.
+ *
+ * WHY THIS IS SHARED RATHER THAN DUPLICATED: both routes hang off
+ * `webServer.register`, which applies NO authentication of its own, and both
+ * answer with material a local unauthenticated caller must not read (a live
+ * bind QR; the host's directory tree). The gate resolution is per REQUEST
+ * because the connection service mounts independently of this plugin, so the
+ * "gate not available yet" case is a real startup race — and it must REFUSE,
+ * never degrade to open. A second hand-rolled copy of that rule is exactly how
+ * one route ends up admitting what the other refuses.
+ *
+ * @param req - incoming request.
+ * @param res - response (written to on refusal).
+ * @param reject - trust gate, or `undefined` when the service is unavailable.
+ * @param log - optional warning sink.
+ * @param label - route name used in the warning message.
+ * @returns true when the caller may proceed; false when a refusal was written.
+ */
+function admit(
+  req: IncomingMessage,
+  res: ServerResponse,
+  reject: StatusRouteDeps['reject'],
+  log: StatusRouteDeps['log'],
+  label: string,
+): boolean {
+  let rejection: 401 | 403 | undefined
+  if (reject === undefined) {
+    log?.(`[im-gateway] ${label} refused: connection trust service unavailable (failing closed)`)
+    rejection = 401
+  } else {
+    try {
+      rejection = reject(req)
+    } catch (error) {
+      log?.(`[im-gateway] ${label} refused: trust check failed: ${String(error)}`)
+      rejection = 401
+    }
+  }
+  if (rejection !== undefined) {
+    writeText(res, rejection, rejection === 401 ? 'unauthorized' : 'forbidden')
+    return false
+  }
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    res.writeHead(405, { allow: 'GET', 'content-type': 'text/plain; charset=utf-8' })
+    res.end('method not allowed')
+    return false
+  }
+  return true
+}
+
+/**
+ * Build the directory-browsing route handler (the settings panel's picker).
+ * @param deps - directory source, trust gate, and a log sink.
+ * @returns a handler that owns the full response lifecycle.
+ */
+export function createBrowseHandler(deps: BrowseRouteDeps): WebRouteHandler {
+  return async (req, res) => {
+    // Same fail-closed admission as the status route: this endpoint enumerates
+    // the HOST's filesystem, so an unauthenticated local caller must not reach
+    // it (`webServer` authenticates nothing by itself).
+    if (!admit(req, res, deps.reject, deps.log, 'browse route')) return
+    try {
+      const requested = pathFromRequest(req)
+      const payload = await browseDirectory(requested, deps.browse)
+      writeJson(res, 200, payload, req.method === 'HEAD')
+    } catch (error) {
+      // `browseDirectory` already converts filesystem failures into a payload
+      // `error`; anything reaching here is a bug in the projection itself, and
+      // it must be visible rather than a 200 with a misleadingly empty listing.
+      deps.log?.(`[im-gateway] browse route failed: ${String(error)}`)
+      writeJson(res, 500, { path: '', parent: null, entries: [], roots: [], error: 'browse unavailable' },
+        req.method === 'HEAD')
+    }
+  }
+}
+
+/**
+ * Read the requested directory from the query string.
+ *
+ * `path` is the only parameter; a repeated `?path=a&path=b` arrives as an array
+ * and the first value wins (never a concatenation, which would invent a path
+ * that was never asked for).
+ * @param req - incoming request.
+ * @returns the raw path string (empty when absent).
+ */
+function pathFromRequest(req: IncomingMessage): string {
+  const url = new URL(req.url ?? '/', 'http://localhost')
+  const value = url.searchParams.get('path')
+  return value ?? ''
+}
+
+/**
+ * Write a JSON response body.
+ * @param res - response to write.
+ * @param status - HTTP status code.
+ * @param body - JSON-serializable body.
+ * @param head - true for a HEAD request (headers only, no body).
+ */
+function writeJson(res: ServerResponse, status: number, body: unknown, head: boolean): void {
+  // no-store on both outcomes: a cached listing would show the user a stale
+  // tree after they created the directory they were looking for.
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+  res.end(head ? undefined : JSON.stringify(body))
 }

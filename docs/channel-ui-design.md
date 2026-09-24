@@ -66,6 +66,7 @@ ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
 ## 3. UI 结构（已实现）
 「插件」页 → 已安装分组 → **`dsh-im-gateway`** 卡片 → 打开该组合包页面，配置区（描述与行列表之间）即：
 - 配置区顶部（两列之上）为**全局默认工作目录**（section 级字段 `im-channels.cwd`）：未单独设置 `cwd` 的通道都用它，通道自己的设置优先；留空则退回 `cordis.yml` 的 `cwd`，再退回 `~/.dsh/im-workspace`。宿主在**每条入站消息到达时**解析，因此保存它不会重启任何通道。因为 DSH 会话的 cwd 在创建时即固定（resume 只还原持久化会话头，`workspaceRegistry.attachSession()` 还会拒绝把 cwd 不一致的会话挂到工作区上），**改工作目录会让该聊天在下一轮消息时于新目录里开始新会话**，旧会话仍留在原工作区（网页端可打开）；从未配置过工作目录的聊天 session id 保持不变。
+  - 该输入框旁有 **浏览…** 按钮（section 级与通道级 `cwd` 各一个），打开面板内目录选择器：面包屑 + 子目录列表 + 上级 / 刷新 + 常用位置快捷方式（用户目录 / 插件 `cwd` / `~/.dsh/im-workspace`）。选中即回填输入框，仍需点「保存」才写入宿主。
 - 工作目录参与会话身份：`sessionIdForChat(chatId, channel, cwd)` → 有显式配置时用 `sha1("<channel>:<chatId>@<cwd>")`，否则保持历史的 `sha1("<channel>:<chatId>")`（老会话不被重置）。
 - 卡片标题下的一句话简介来自 `summary` 视图（`card.description`）；卡片标题本身是**包名** `dsh-im-gateway`，由「插件」页绘制，本插件不再自绘卡壳。
 - 左列："新建通道"六类按钮（微信 / QQ / email / 5G消息 / 飞书 / 通用HTTP），下方"已配置"通道列表（名称 + 类型 + 实时状态）。
@@ -97,3 +98,11 @@ ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
 - node half 用 `ctx.webServer.register` 注册同源路由 **`GET /im-gateway/status`**（`src/status-route.ts`），守卫复用 `/api` 的浏览器鉴权检查、`cache-control: no-store`、只读（非 GET/HEAD 返回 405 + `Allow: GET`），payload 形状由 `src/status-proto.ts` 固定（含 `qr` 与 `bound`）。
 - client 每 3s 轮询该路由，文档隐藏时暂停、恢复可见时立即拉一次；QR 由本地 `qrcode-generator` 编码成 SVG（网关返回的是 HTML 页面 URL，不是图片）。
 - 之所以不用 `ctx.remote`：见 §2 的已确认结论（树外插件无法发布 Remote namespace）。
+
+### 6.1 目录浏览路由（`浏览…` 按钮的后端）
+
+- node half 再注册一条同源只读路由 **`GET /im-gateway/browse?path=<abs>`**（`src/status-route.ts` 的 `createBrowseHandler`，纯逻辑在 `src/browse-route.ts`），与状态路由并列。两路由共用同一套准入规则（`admit()`）：**守卫缺失或抛异常一律 401（fail closed）**、非 GET/HEAD 一律 405 + `Allow: GET`、`cache-control: no-store`。
+- **为什么必须由宿主列目录**：用户要选的是 **Agent 真正运行的那台机器**上的目录 = 宿主进程，未必是浏览器所在机器。`<input webkitdirectory>` 只能拿到用户选中的**文件**（拿不到目录树），File System Access API 仅 Chromium 且每个根目录都要一次用户手势，原生对话框在 DSH 远程部署时浏览的是**浏览器**那台机器——三者都不成立。
+- 语义（`src/status-proto.ts` 的 `BrowsePayload`）：只列**目录**（按 name 排序，各带绝对路径）；根目录 `parent: null`（否则「上级」在根上是永远无效的按钮）；`..` 先 `resolve` 再列（路径穿越无法操纵读取）；**失败是有内容的正常结果**——HTTP 200 + `error` + `entries: []`（把「目录不存在 / 不是目录 / 无权限」渲染成空列表，等于告诉用户"目录是空的"，是 typo 最糟的呈现）；列得出来但进不去的目录仍然显示（`readable: false`，置灰不可点），隐藏它会让存在的目录看起来不存在。
+- client 侧纯逻辑在 `src/client/browse-client.ts`（URL 构造、不可信 payload 收窄、面包屑、保存前校验），UI 在 `src/client/DirectoryBrowser.tsx`。面包屑**按字符串**推导而非用 `node:path`：浏览器里没有 `node:path`，且宿主与页面的分隔符可能不同，宿主返回的字符串才是唯一权威。
+- `scripts/smoke.mts` 第 17 项在**真实临时目录**上验证：文件不被列出、失败被报出而非吞成空列表、根无 parent、快捷方式去重（Windows 大小写不敏感）、守卫 fail closed 且拒绝时不泄漏任何目录名、method guard、roots 视图、`?path=` 重复时取首值。
