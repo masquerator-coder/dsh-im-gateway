@@ -3,9 +3,16 @@
 # not be auto-installed from the npm registry (they are not all published
 # there). Only the local devDependencies (esbuild + types) are installed.
 packages: []
+# Install-time scripts, reviewed and allowed:
+#   esbuild    — `node install.js` fetches the platform binary the build needs.
+#   protobufjs — transitive via @larksuiteoapi/node-sdk; `node scripts/postinstall`
+#                only prints a version-scheme warning.
+# Left as the literal string "set this to true or false", these were not
+# booleans, so pnpm ignored both and every install exited non-zero with
+# ERR_PNPM_IGNORED_BUILDS even though the install itself succeeded.
 allowBuilds:
-  esbuild: set this to true or false
-  protobufjs: set this to true or false
+  esbuild: true
+  protobufjs: true
 autoInstallPeers: false
 minimumReleaseAgeExclude:
   - '@deepseek-ai/cordis-plugin-group@1.0.4'
