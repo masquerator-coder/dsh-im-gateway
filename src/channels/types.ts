@@ -38,6 +38,14 @@ export interface ChannelConfig {
   model?: string
   cwd?: string
   agentPreset?: string
+  /**
+   * Permission preset pinned into sessions created for this channel (e.g.
+   * `workspace-write`, `danger-full-access`). Absent/empty = let the framework
+   * seed the deployment default on `session/created`; the gateway must NOT
+   * re-apply a preset unconditionally, or it overwrites both that seeded value
+   * and any later user switch.
+   */
+  permissionPreset?: string
   disposeAfterReply?: boolean
   /** Positive output-token cap for turns on this channel (0/absent = runtime default). */
   maxTokens?: number

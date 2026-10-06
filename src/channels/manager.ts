@@ -318,6 +318,10 @@ export class ChannelManager {
           cwd,
           sessionWorkspace: cwd,
           agentPreset: channel.agentPreset || undefined,
+          // Permission preset for sessions on this channel. Left undefined when
+          // the channel names none, so the framework's own `session/created`
+          // seed applies instead of this gateway forcing a value.
+          permissionPreset: channel.permissionPreset || undefined,
           disposeAfterReply: channel.disposeAfterReply,
           // Explicit allowlist: an unset/empty per-channel allowlist means
           // ALLOW ALL (never inherit the legacy global webhook allowlist, whose

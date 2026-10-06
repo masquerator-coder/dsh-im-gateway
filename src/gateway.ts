@@ -72,6 +72,17 @@ export interface MessageRuntime {
   sessionWorkspace?: string
   /** Optional agent preset label. */
   agentPreset?: string
+  /**
+   * Permission preset to pin into a session this gateway creates (e.g.
+   * `workspace-write`, `danger-full-access`).
+   *
+   * Precedence is channel → gateway default → framework seed. When this is
+   * absent the gateway applies NOTHING and lets `permission-presets` seed the
+   * deployment default from its own `session/created` hook. Re-applying the
+   * default here unconditionally would clobber that seed and silently discard
+   * every later user switch.
+   */
+  permissionPreset?: string
   /** Optional human-readable session title shown in the web UI. */
   title?: string
   /** Whether to dispose the agent right after its reply is delivered. */
@@ -119,6 +130,12 @@ export interface AgentRouting {
   maxTokens?: number
   cwd?: string
   agentPreset?: string
+  /**
+   * Gateway-wide permission preset for sessions this gateway creates. A
+   * channel's own `permissionPreset` wins. Absent = defer to the framework's
+   * `session/created` seed (never overwrite it).
+   */
+  permissionPreset?: string
   title?: string
   /** Default channel/bot identity used when a runtime doesn't supply one. */
   channel?: string
@@ -579,15 +596,27 @@ export class ImGateway {
       }
     }
 
-    // Pinning the effective permission preset and a stable title mirrors the
-    // webhook/session-controller session bootstrap and gives the reply/UI a
-    // recognizable surface.
+    // Pin an EXPLICIT permission preset only.
+    //
+    // `permission-presets` already seeds every new session from its own
+    // `session/created` hook, and that seed is deliberately narrow: it writes
+    // the deployment default only when the preset/sandbox/approval knobs are
+    // ALL still unset, and otherwise preserves whatever the session already
+    // carries. Repeatedly forcing `defaultPreset` here — which is what this
+    // gateway used to do — overwrote that seeded value on every agent creation,
+    // so a per-channel choice could never take effect and any manual switch was
+    // silently reverted on the next inbound message. Applying a preset is
+    // therefore reserved for one that was explicitly configured
+    // (channel → gateway default).
+    const permissionName = runtime.permissionPreset || this.defaults.permissionPreset || ''
     const permission = this.ctx.get('permissionPresets')
-    if (permission !== undefined) {
+    if (permission !== undefined && permissionName !== '') {
       try {
-        permission.set(handle.agent.session, permission.defaultPreset)
+        permission.set(handle.agent.session, permissionName)
       } catch (error: unknown) {
-        this.ctx.logger.warn(`[im-gateway] permission preset for ${sessionId}: ${errorChain(error)}`)
+        this.ctx.logger.warn(
+          `[im-gateway] permission preset "${permissionName}" for ${sessionId}: ${errorChain(error)}`,
+        )
       }
     }
     const title = runtime.title || this.defaults.title || `IM ${sessionId}`

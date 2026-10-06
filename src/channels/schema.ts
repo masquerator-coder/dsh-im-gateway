@@ -41,6 +41,7 @@ export const ChannelRecordSchema = z.object({
     model: z.string().required(false),
     cwd: z.string().required(false),
     agentPreset: z.string().required(false),
+    permissionPreset: z.string().required(false),
     disposeAfterReply: z.boolean().required(false),
     maxTokens: z.number().required(false),
     allowlist: z.array(z.string()).required(false),

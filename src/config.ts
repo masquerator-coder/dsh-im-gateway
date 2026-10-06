@@ -50,6 +50,13 @@ export interface Config {
   maxTokens: number
   /** Optional agent preset applied to created agents. */
   agentPreset: string
+  /**
+   * Optional permission preset for sessions this gateway creates (e.g.
+   * `workspace-write`, `danger-full-access`). A channel's own
+   * `permissionPreset` wins. Empty = apply nothing and defer to the framework's
+   * `session/created` seed.
+   */
+  permissionPreset: string
   /** Optional working directory for the agent session. */
   cwd: string
   /** Whether idle agents are disposed after their last reply (free resources). */
@@ -98,6 +105,7 @@ export interface ConfigInput {
   model?: string
   maxTokens?: number
   agentPreset?: string
+  permissionPreset?: string
   cwd?: string
   disposeAfterReply?: boolean
   channelsCwd?: string
@@ -120,6 +128,7 @@ export const Config: Schema<ConfigInput, Config> = Schema.object({
   model: Schema.string().default(''),
   maxTokens: Schema.number().default(0),
   agentPreset: Schema.string().default(''),
+  permissionPreset: Schema.string().default(''),
   cwd: Schema.string().default(''),
   disposeAfterReply: Schema.boolean().default(false),
   channelsCwd: Schema.string().volatile(),

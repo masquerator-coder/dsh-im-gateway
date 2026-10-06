@@ -31,6 +31,7 @@ export function apply(ctx: Context, config: ConfigType): void {
     model: config.model,
     cwd: config.cwd,
     agentPreset: config.agentPreset,
+    permissionPreset: config.permissionPreset,
     allowlist: config.allowlist,
   })
 
@@ -99,6 +100,7 @@ export function apply(ctx: Context, config: ConfigType): void {
         maxTokens: config.maxTokens,
         cwd: config.cwd || undefined,
         agentPreset: config.agentPreset || undefined,
+        permissionPreset: config.permissionPreset || undefined,
         disposeAfterReply: config.disposeAfterReply,
         channel: 'http',
       }).catch((error: unknown) => {
