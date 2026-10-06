@@ -88,7 +88,7 @@
 import { createServer, type Server, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from 'node:http'
 import assert from 'node:assert/strict'
 import type { InboundRoute } from '../src/transports/types.ts'
-import { registerPermCommand, PERM_COMMAND } from '../src/permission-command.ts'
+import { ImCommands, SessionCursors, parseImCommand } from '../src/im-commands.ts'
 
 // Unbuffered progress marker (stderr) so a kill/timeout still shows where we are.
 const step = (s: string): void => { process.stderr.write(`[smoke] ${s}\n`) }
@@ -1711,15 +1711,16 @@ step('browse route (gate fails closed, method guard, roots view) OK')
   )
 }
 step('client half paints only real theme tokens (no literal colours) OK')
-
 /**
- * `/perm` — the only surface that can switch a session's permission preset at
- * runtime. The gateway no longer forces `defaultPreset` onto created agents, so
- * this command is what makes a per-session choice reachable at all; assert the
- * whole contract, including the cases that must fail closed.
+ * IM slash commands — `/perm`, `/new`, `/cwd`, `/help`.
+ *
+ * These are reached through the gateway's own router, NOT through DSH's command
+ * registry: an IM message never touches `commands.execute()`, so the router is
+ * the only thing that makes a command work from a chat. The assertions below
+ * cover the routing contract (not-a-command must pass through untouched) and the
+ * session-cursor arithmetic that `/new` and `/cwd` rely on.
  */
 {
-  // A minimal fake of the two host services, so this runs without a live DSH.
   const makePresets = (names: readonly string[], current: string) => {
     const applied: string[] = []
     return {
@@ -1735,8 +1736,6 @@ step('client half paints only real theme tokens (no literal colours) OK')
       },
     }
   }
-
-  /** Capture whatever a fake `commands.register` receives. */
   const makeCommands = () => {
     const registered: { name: string; handler: (i: unknown) => unknown }[] = []
     return {
@@ -1749,88 +1748,136 @@ step('client half paints only real theme tokens (no literal colours) OK')
       },
     }
   }
+  const silent = { debug: () => {}, info: () => {}, warn: () => {} }
 
-  const invoke = (handler: (i: unknown) => unknown, rawInput: string) =>
-    handler({ agent: { session: { id: 's-1' } }, rawInput, signal: new AbortController().signal }) as
-      { kind: string; text?: string }
+  // ---- grammar ----
+  assert.deepEqual(parseImCommand('/new'), { name: 'new', rawInput: '' })
+  assert.deepEqual(parseImCommand('/cwd  D:\\x'), { name: 'cwd', rawInput: '  D:\\x' })
+  assert.equal(parseImCommand('/Upper'), undefined, 'the name grammar is lowercase-only')
+  assert.equal(parseImCommand('hello'), undefined, 'plain text is not a command')
+  // `/newsletter` is syntactically a command named `newsletter`; whether it gets
+  // CONSUMED is a routing decision (asserted below). Keeping the two layers
+  // separate is what lets an unknown slash-word still reach the model.
+  assert.deepEqual(parseImCommand('/newsletter'), { name: 'newsletter', rawInput: '' })
+  assert.equal(parseImCommand('/path/to/file'), undefined, 'a slash-path is not a command')
 
-  // 1. No `commands` service -> no-op, not a crash. A profile without that
-  //    bundle must still load the gateway.
-  const absent = registerPermCommand({
-    get: () => undefined,
-    logger: { debug: () => {}, info: () => {}, warn: () => {} },
-    effect: () => () => {},
-  } as never)
-  assert.equal(absent, undefined, 'without a commands service /perm must register nothing')
-
-  // 2. Bare `/perm` lists presets and marks the current one.
+  // ---- routing ----
   {
     const presets = makePresets(['workspace-write', 'danger-full-access'], 'workspace-write')
-    const commands = makeCommands()
-    const ctx = {
-      get: (name: string) => name === 'permissionPresets' ? presets.service : commands.service,
-      logger: { debug: () => {}, info: () => {}, warn: () => {} },
-      effect: (fn: () => unknown) => { fn(); return () => {} },
-    } as never
-    registerPermCommand(ctx)
-    const definition = commands.registered[0]
-    assert.equal(definition.name, PERM_COMMAND)
-    assert.equal(PERM_COMMAND, 'perm', 'the command name is lowercase and slash-free')
+    const ctx = { get: (n: string) => n === 'permissionPresets' ? presets.service : undefined, logger: silent } as never
+    const cursors = new SessionCursors()
+    const commands = new ImCommands(ctx, cursors, () => 'C:\\default')
+    const fakeAgent = { session: { id: 's-1' } } as never
+    // NOTE: an explicit `undefined` must mean "no live agent", so this cannot
+    // use a default parameter (which would substitute the fake agent instead).
+    const run = (text: string, agent: unknown) =>
+      commands.run('cmcc:chat-1', text, agent as never)
+    const runWithAgent = (text: string) => run(text, fakeAgent)
 
-    const listed = invoke(definition.handler, '')
-    assert.equal(listed.kind, 'success')
-    assert.ok(listed.text?.includes('workspace-write'), 'the listing names the presets')
-    assert.ok(listed.text?.includes('* workspace-write'), 'the current preset is marked')
-    assert.ok(listed.text?.includes('danger-full-access'), 'every alternative is listed')
+    // A NON-command must pass through, so real text is never swallowed.
+    assert.equal(runWithAgent('你好').kind, 'pass', 'ordinary text is not a command')
+    assert.equal(runWithAgent('/newsletter').kind, 'pass', 'an unknown slash-word reaches the model')
+    assert.equal(runWithAgent('/path/to/file').kind, 'pass', 'a slash-path reaches the model')
+    assert.equal(runWithAgent('/unknown').kind, 'pass', 'an unknown command name is not eaten')
+
+    // /help
+    const help = runWithAgent('/help')
+    assert.equal(help.kind, 'handled')
+    assert.ok((help as { text: string }).text.includes('/perm'), '/help lists /perm')
+    assert.ok((help as { text: string }).text.includes('不会进入模型上下文'), '/help states the context rule')
+
+    // /perm — list, switch, reject.
+    const listed = runWithAgent('/perm') as { text: string }
+    assert.ok(listed.text.includes('* workspace-write'), 'the current preset is marked')
     assert.equal(presets.applied.length, 0, 'listing must not switch anything')
+    const switched = runWithAgent('/perm danger-full-access')
+    assert.equal(switched.ok, true)
+    assert.deepEqual(presets.applied, ['danger-full-access'], 'the switch reaches the service')
 
-    // 3. A known preset switches, and reaches the real service.
-    const switched = invoke(definition.handler, '  danger-full-access  ')
-    assert.equal(switched.kind, 'success')
-    assert.deepEqual(presets.applied, ['danger-full-access'], 'surrounding whitespace is tolerated')
-
-    // 4. An unknown preset fails closed and is NOT passed to set() (which throws).
     presets.applied.length = 0
-    const rejected = invoke(definition.handler, 'nope')
-    assert.equal(rejected.kind, 'error')
-    assert.ok(rejected.text?.includes('nope'), 'the rejected name is echoed')
-    assert.ok(rejected.text?.includes('workspace-write'), 'the alternatives are offered')
+    const rejected = runWithAgent('/perm nope') as { ok: boolean; text: string }
+    assert.equal(rejected.ok, false)
+    assert.ok(rejected.text.includes('nope'), 'the rejected name is echoed')
     assert.deepEqual(presets.applied, [], 'an unknown preset must never reach set()')
 
-    // 5. An empty catalog is an error, not a misleading success.
-    const empty = makePresets([], 'custom')
-    const emptyCtx = {
-      get: (name: string) => name === 'permissionPresets' ? empty.service : makeCommands().service,
-      logger: { debug: () => {}, info: () => {}, warn: () => {} },
-      effect: (fn: () => unknown) => { fn(); return () => {} },
-    } as never
-    const emptyCommands = makeCommands()
-    ;(emptyCtx as { get: (n: string) => unknown }).get =
-      (name: string) => name === 'permissionPresets' ? empty.service : emptyCommands.service
-    registerPermCommand(emptyCtx)
-    const emptyResult = invoke(emptyCommands.registered[0].handler, '')
-    assert.equal(emptyResult.kind, 'error', 'an empty preset catalog fails closed')
+    // /perm with no live agent: listing is fine, switching is refused clearly.
+    const noAgent = run('/perm', undefined) as { ok: boolean; text: string }
+    assert.equal(noAgent.ok, true, 'listing needs no live agent')
+    const noAgentSwitch = run('/perm workspace-write', undefined) as { ok: boolean }
+    assert.equal(noAgentSwitch.ok, false, 'switching needs a live agent')
+  }
 
-    // 6. A throwing set() surfaces as an error result rather than escaping.
-    const throwing = {
-      names: ['workspace-write'],
-      current: () => 'workspace-write',
-      set: () => { throw new Error('writer-held') },
-      resolve: () => ({ sandbox: 's', approval: 'a' }),
-    }
-    const throwingCommands = makeCommands()
-    const throwingCtx = {
-      get: (name: string) => name === 'permissionPresets' ? throwing : throwingCommands.service,
-      logger: { debug: () => {}, info: () => {}, warn: () => {} },
-      effect: (fn: () => unknown) => { fn(); return () => {} },
-    } as never
-    registerPermCommand(throwingCtx)
-    const threw = invoke(throwingCommands.registered[0].handler, 'workspace-write')
-    assert.equal(threw.kind, 'error')
-    assert.ok(threw.text?.includes('writer-held'), 'the underlying failure is reported')
+  // ---- /new rotates the session key, and the key is what changes ----
+  {
+    const ctx = { get: () => undefined, logger: silent } as never
+    const cursors = new SessionCursors()
+    const commands = new ImCommands(ctx, cursors, () => 'C:\\default')
+    const key = 'cmcc:chat-9'
+
+    assert.equal(cursors.get(key).generation, 0, 'a chat starts on the original session')
+    const first = commands.run(key, '/new', undefined)
+    assert.equal(first.kind, 'handled')
+    assert.equal(cursors.get(key).generation, 1, '/new advances the generation')
+    assert.ok((first as { text: string }).text.includes('重启后'), '/new discloses the restart behaviour')
+
+    commands.run(key, '/new', undefined)
+    assert.equal(cursors.get(key).generation, 2, '/new is repeatable')
+
+    // A different chat is untouched: the cursor is per-chat.
+    assert.equal(cursors.get('cmcc:other').generation, 0, 'cursors are isolated per chat')
+  }
+
+  // ---- /cwd ----
+  {
+    const ctx = { get: () => undefined, logger: silent } as never
+    const cursors = new SessionCursors()
+    const commands = new ImCommands(ctx, cursors, () => 'C:\\default')
+    const key = 'cmcc:chat-cwd'
+    const run = (t: string) => commands.run(key, t, undefined) as { ok: boolean; text: string }
+
+    // No argument reports the effective directory and its origin.
+    const shown = run('/cwd')
+    assert.ok(shown.text.includes('C:\\default'), 'the default is reported')
+    assert.ok(shown.text.includes('默认值'), 'the origin of the value is stated')
+    assert.equal(cursors.get(key).generation, 0, 'inspecting must not rotate the session')
+
+    // A relative path is refused rather than guessed.
+    const relative = run('/cwd foo')
+    assert.equal(relative.ok, false, 'a relative path is refused')
+    assert.ok(relative.text.includes('绝对路径'), 'the refusal explains what is wanted')
+    assert.equal(cursors.get(key).cwd, undefined, 'a refused path changes nothing')
+
+    // An absolute path sets the directory AND rotates the session.
+    const absolute = run('/cwd D:\\项目\\foo')
+    assert.equal(absolute.ok, true)
+    assert.equal(cursors.get(key).cwd, 'D:\\项目\\foo', 'the directory is recorded')
+    assert.equal(cursors.get(key).generation, 1, '/cwd starts a new session by necessity')
+    assert.ok(absolute.text.includes('无法迁移'), 'the reply explains why a new session is needed')
+
+    // A UNC path is accepted too (a Windows network share is absolute).
+    assert.equal(run('/cwd \\\\server\\share').ok, true, 'a UNC path is absolute')
+    // ...and a POSIX path, for a non-Windows host.
+    assert.equal(run('/cwd /srv/work').ok, true, 'a POSIX path is absolute')
+  }
+
+  // ---- Web-side registration degrades without the commands service ----
+  {
+    const ctx = { get: () => undefined, logger: silent, effect: () => () => {} } as never
+    const commands = new ImCommands(ctx, new SessionCursors(), () => 'C:\\default')
+    assert.equal(commands.registerWithHost(), undefined, 'no commands service registers nothing')
+
+    const registry = makeCommands()
+    const ctx2 = { get: () => registry.service, logger: silent, effect: (fn: () => unknown) => { fn(); return () => {} } } as never
+    const commands2 = new ImCommands(ctx2, new SessionCursors(), () => 'C:\\default')
+    commands2.registerWithHost()
+    assert.deepEqual(
+      registry.registered.map(r => r.name).sort(),
+      ['cwd', 'help', 'new', 'perm'],
+      'the Web composer lists the same command names',
+    )
   }
 }
-step('/perm command (list, switch, fail-closed cases) OK')
+step('IM slash commands (/perm, /new, /cwd, routing + cursor arithmetic) OK')
 
 await rmBrowse(browseTmp, { recursive: true, force: true })
 

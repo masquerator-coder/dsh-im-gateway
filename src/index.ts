@@ -9,7 +9,7 @@ import { ChannelManager } from './channels/manager.ts'
 import { STATUS_ROUTE_PATH, BROWSE_ROUTE_PATH } from './status-proto.ts'
 import { createStatusHandler, createBrowseHandler, type RequestGate, type WebRouteService } from './status-route.ts'
 import { defaultBrowseDeps } from './browse-route.ts'
-import { registerPermCommand } from './permission-command.ts'
+import type {} from './im-commands.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -61,10 +61,10 @@ export function apply(ctx: Context, config: ConfigType): void {
     )
   })
 
-  // `/perm` — show or switch the calling session's permission preset. Registered
-  // globally, but its handler acts on the exact invoking agent, so the switch is
-  // per-session. Absent the `commands` bundle this is a no-op.
-  registerPermCommand(ctx)
+  // Slash commands. The IM router (inside the gateway, ahead of the model) is
+// what makes them work from a chat; this registration is what makes the Web
+// composer list the same names. Absent the `commands` bundle this is a no-op.
+  gateway.commands.registerWithHost()
 
   // Legacy single-channel path: keep the global webhook route alive exactly as
   // before, forwarding to the gateway with the legacy callback as the reply

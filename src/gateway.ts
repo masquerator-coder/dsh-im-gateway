@@ -9,6 +9,7 @@ import type {} from '@deepseek-ai/dsh-agent-default-model'
 import { createUserMessage, errorChain, type MessageSource } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
+import { ImCommands, SessionCursors, type ImCommandOutcome } from './im-commands.ts'
 import { sessionIdForChat } from './session.ts'
 import { InteractionBridge } from './interaction.ts'
 import { SourceMetadata } from './source-meta.ts'
@@ -314,6 +315,13 @@ export class ImGateway {
   private readonly sources = new SourceMetadata()
   /** IM-only bridge for DSH approval / user-question seams. */
   readonly interactions: InteractionBridge
+  /**
+   * Per-chat session cursors backing `/new` and `/cwd`. In-memory: a restart
+   * returns every chat to its original session, which those commands say.
+   */
+  private readonly cursors = new SessionCursors()
+  /** Slash-command router: consumes IM commands before they become prompts. */
+  readonly commands: ImCommands
 
   constructor(
     private readonly ctx: Context,
@@ -326,6 +334,7 @@ export class ImGateway {
       this.onSessionEvent(_session, event)
     }, { global: true })
     this.interactions = new InteractionBridge(ctx)
+    this.commands = new ImCommands(ctx, this.cursors, () => this.defaults.cwd ?? defaultWorkspaceDir())
   }
 
   /**
@@ -366,12 +375,31 @@ export class ImGateway {
     // An explicitly configured working directory is folded in as well: a session
     // cannot be moved between workspaces, so a chat pointed at another directory
     // continues as a NEW conversation there instead of silently resuming into
-    // the old one.
-    const sessionId = SessionId(sessionIdForChat(message.chatId, keyChannel ?? '', runtime.sessionWorkspace ?? ''))
+    // the old one. `/cwd` sets that directory per chat and `/new` bumps the
+    // generation — both change this key, which is how a chat is moved onto a
+    // different session without ever mutating a live one.
+    const chatKey = `${keyChannel ?? ''}:${message.chatId}`
+    const cursor = this.cursors.get(chatKey)
+    const effectiveCwd = cursor.cwd ?? runtime.sessionWorkspace ?? ''
+    const sessionId = SessionId(sessionIdForChat(
+      message.chatId,
+      keyChannel ?? '',
+      effectiveCwd,
+      cursor.generation === 0 ? 'im' : `im-g${cursor.generation}`,
+    ))
     trace(`[gw] inbound session=${sessionId} chat=${message.chatId} head=${JSON.stringify(message.text.slice(0, 40))}`)
     // Keep the outbound sender hot for this session so an in-flight approval /
     // question prompt can be pushed down the same channel that drives it.
     this.registerSender(String(sessionId), reply)
+    // Slash commands are handled HERE, before anything becomes a prompt: the
+    // reply goes straight back to the chat and the model never sees the line.
+    // (An unrecognised `/name` returns `pass`, so real text beginning with a
+    // slash still reaches the agent.)
+    const routed = this.commands.run(chatKey, message.text, this.ctx.agents.get(sessionId))
+    if (routed.kind === 'handled') {
+      await this.deliverCommandReply(reply, routed, sessionId)
+      return
+    }
     // If this inbound text answers an outstanding IM-side approval/question,
     // settle it and do NOT feed the text to the agent as a normal message.
     if (this.interactions.consume(String(sessionId), message.text).consumed) {
@@ -814,6 +842,26 @@ export class ImGateway {
     } catch (error: unknown) {
       trace(`[gw] fault notice NOT delivered session=${sessionId} err=${String(error)}`)
       this.ctx.logger.warn(`[im-gateway] fault notice for ${sessionId} not delivered: ${errorChain(error)}`)
+    }
+  }
+
+  /**
+   * Send one slash-command result straight back to the chat.
+   *
+   * The reply never becomes a prompt: this path returns before `process()`, so
+   * neither the command line nor this text joins the model's surface. Delivery
+   * is best-effort for the same reason `notifyFailure` is — a channel that
+   * cannot send has already been logged by the sink.
+   */
+  private async deliverCommandReply(reply: ReplySink, outcome: ImCommandOutcome, sessionId: SessionId): Promise<void> {
+    const text = outcome.kind === 'handled' ? outcome.text : ''
+    const body = outcome.kind === 'handled' && !outcome.ok ? `⚠️ ${text}` : text
+    try {
+      await reply(body)
+      trace(`[gw] command reply delivered session=${sessionId}`)
+    } catch (error: unknown) {
+      trace(`[gw] command reply NOT delivered session=${sessionId} err=${String(error)}`)
+      this.ctx.logger.warn(`[im-gateway] command reply for ${sessionId} not delivered: ${errorChain(error)}`)
     }
   }
 
