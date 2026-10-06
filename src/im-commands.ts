@@ -162,8 +162,9 @@ function catalogOf(presets: PermissionPresetLike): {
 function helpText(): string {
   return [
     '可用命令：',
-    '  /perm [preset]     查看或切换本会话的权限预设',
-    '  /new              开启新会话（当前会话保留，不回删）',
+    '  /status           查看本聊天的会话、工作目录与权限',
+    '  /perm [preset]    查看或切换本会话的权限预设',
+    '  /new              开启新会话（当前会话保留，不删除）',
     '  /cwd [path]       查看或切换工作目录（在新目录开新会话）',
     '  /help             显示这份帮助',
     '',
@@ -172,11 +173,30 @@ function helpText(): string {
 }
 
 /**
+ * Facts about the chat's CURRENT session, supplied by the gateway.
+ *
+ * These are computed by the caller (the gateway) because they are exactly the
+ * values that decided which session the message was routed to — recomputing
+ * them here could disagree with the routing decision, which is precisely what
+ * `/status` must not do.
+ */
+export interface ImCommandContext {
+  /** The session id this message was routed to. */
+  readonly sessionId: string
+  /** The effective working directory for this chat ('' when none configured). */
+  readonly effectiveCwd: string
+  /** Whether that directory came from `/cwd` rather than configuration. */
+  readonly cwdFromCommand: boolean
+  /** The live agent for this session, when one exists. */
+  readonly liveAgent: Agent | undefined
+}
+
+/**
  * Bridge from an IM command line to the session cursor.
  *
  * `/perm` needs a live agent (it changes a session's permission); `/new` and
  * `/cwd` change the cursor that decides which session the NEXT message uses, so
- * they work even if no agent is live.
+ * they work even if no agent is live. `/status` needs neither.
  */
 export class ImCommands {
   /** Injected so tests can supply a fixed reply set without a live DSH. */
@@ -191,20 +211,22 @@ export class ImCommands {
    *
    * @param chatKey - stable per-chat key (channel + external chat id).
    * @param text - the raw inbound text.
-   * @param liveAgent - the agent currently serving this chat's session, if any.
+   * @param context - the routed session's facts (id, cwd, live agent).
    * @returns `handled` with a reply, or `pass` when the text is not a command.
    */
-  run(chatKey: string, text: string, liveAgent: Agent | undefined): ImCommandOutcome {
+  run(chatKey: string, text: string, context: ImCommandContext): ImCommandOutcome {
     const parsed = parseImCommand(text)
     if (parsed === undefined) return { kind: 'pass' }
 
     switch (parsed.name) {
       case 'help':
         return { kind: 'handled', ok: true, text: helpText() }
+      case 'status':
+        return this.runStatus(chatKey, context)
       case 'perm':
-        return this.runPerm(parsed.rawInput, liveAgent)
+        return this.runPerm(parsed.rawInput, context.liveAgent)
       case 'new':
-        return this.runNew(chatKey)
+        return this.runNew(chatKey, context)
       case 'cwd':
         return this.runCwd(chatKey, parsed.rawInput)
       default:
@@ -213,6 +235,41 @@ export class ImCommands {
         // eating it would lose user text. Pass it through to the model.
         return { kind: 'pass' }
     }
+  }
+
+  /**
+   * `/status` — the one command that makes every OTHER one verifiable.
+   *
+   * It reports the session id the gateway actually routed to, so "did `/new`
+   * work?" is answerable from the chat instead of by inspecting logs. Every
+   * fact here is read from the caller-supplied context, never recomputed.
+   */
+  private runStatus(chatKey: string, context: ImCommandContext): ImCommandOutcome {
+    const cursor = this.cursors.get(chatKey)
+    const lines = [
+      `会话 ID：${context.sessionId}`,
+      `会话代次：${cursor.generation}${cursor.generation === 0 ? '（初始会话）' : '（由 /new 或 /cwd 产生）'}`,
+      `工作目录：${context.effectiveCwd || '(未设置)'}`,
+      `目录来源：${context.cwdFromCommand ? '/cwd 设置' : (context.effectiveCwd === '' ? '无' : '配置默认值')}`,
+      `Agent 状态：${context.liveAgent === undefined ? '未启动（下一条消息会创建）' : '运行中'}`,
+    ]
+
+    const presets = this.ctx.get('permissionPresets') as PermissionPresetLike | undefined
+    if (presets === undefined) {
+      lines.push('权限预设：不可用（未加载 permission-presets）')
+    } else if (context.liveAgent === undefined) {
+      lines.push('权限预设：未知（本会话尚无 agent）')
+    } else {
+      const session = (context.liveAgent as Agent & { session: Session }).session
+      try {
+        lines.push(`权限预设：${presets.current(session)}`)
+      } catch {
+        lines.push('权限预设：读取失败')
+      }
+    }
+
+    lines.push('', '提示：重启 DSH 后会话代次与 /cwd 设置会重置。')
+    return { kind: 'handled', ok: true, text: lines.join('\n') }
   }
 
   /** `/perm` — inspect or switch the current session's permission preset. */
@@ -280,7 +337,7 @@ export class ImCommands {
   }
 
   /** `/new` — rotate to a fresh session for this chat. */
-  private runNew(chatKey: string): ImCommandOutcome {
+  private runNew(chatKey: string, context: ImCommandContext): ImCommandOutcome {
     const current = this.cursors.get(chatKey)
     const next: ChatSessionState = { generation: current.generation + 1, ...(current.cwd === undefined ? {} : { cwd: current.cwd }) }
     this.cursors.set(chatKey, next)
@@ -290,6 +347,7 @@ export class ImCommands {
       ok: true,
       text: [
         `已开启新会话（第 ${next.generation} 次）。下一条消息将在全新会话中进行。`,
+        `切换前会话：${context.sessionId}`,
         '之前的会话记录仍保留，未被删除。',
         '注意：服务重启后此计数会重置，本聊天将回到最初的会话。',
       ].join('\n') + where,
@@ -380,6 +438,14 @@ export class ImCommands {
         name: 'help',
         description: 'List the IM gateway commands.',
         handler: () => ({ kind: 'success', text: helpText() }),
+      }),
+      commands.register({
+        name: 'status',
+        description: 'Show this chat\'s session id, working directory and permission.',
+        handler: () => ({
+          kind: 'success',
+          text: 'IM 会话状态由聊天窗口的 /status 驱动（需要聊天上下文的会话信息）。',
+        }),
       }),
     ]
     return this.ctx.effect(

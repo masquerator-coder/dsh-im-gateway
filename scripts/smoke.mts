@@ -1770,8 +1770,14 @@ step('client half paints only real theme tokens (no literal colours) OK')
     const fakeAgent = { session: { id: 's-1' } } as never
     // NOTE: an explicit `undefined` must mean "no live agent", so this cannot
     // use a default parameter (which would substitute the fake agent instead).
+    const ctxFor = (agent: unknown, cwd = '', fromCommand = false) => ({
+      sessionId: 'im-abc123',
+      effectiveCwd: cwd,
+      cwdFromCommand: fromCommand,
+      liveAgent: agent as never,
+    })
     const run = (text: string, agent: unknown) =>
-      commands.run('cmcc:chat-1', text, agent as never)
+      commands.run('cmcc:chat-1', text, ctxFor(agent))
     const runWithAgent = (text: string) => run(text, fakeAgent)
 
     // A NON-command must pass through, so real text is never swallowed.
@@ -1813,14 +1819,16 @@ step('client half paints only real theme tokens (no literal colours) OK')
     const cursors = new SessionCursors()
     const commands = new ImCommands(ctx, cursors, () => 'C:\\default')
     const key = 'cmcc:chat-9'
+    const noAgent = { sessionId: 'im-orig', effectiveCwd: '', cwdFromCommand: false, liveAgent: undefined }
 
     assert.equal(cursors.get(key).generation, 0, 'a chat starts on the original session')
-    const first = commands.run(key, '/new', undefined)
+    const first = commands.run(key, '/new', noAgent)
     assert.equal(first.kind, 'handled')
     assert.equal(cursors.get(key).generation, 1, '/new advances the generation')
     assert.ok((first as { text: string }).text.includes('重启后'), '/new discloses the restart behaviour')
+    assert.ok((first as { text: string }).text.includes('im-orig'), '/new names the session being left')
 
-    commands.run(key, '/new', undefined)
+    commands.run(key, '/new', noAgent)
     assert.equal(cursors.get(key).generation, 2, '/new is repeatable')
 
     // A different chat is untouched: the cursor is per-chat.
@@ -1833,7 +1841,8 @@ step('client half paints only real theme tokens (no literal colours) OK')
     const cursors = new SessionCursors()
     const commands = new ImCommands(ctx, cursors, () => 'C:\\default')
     const key = 'cmcc:chat-cwd'
-    const run = (t: string) => commands.run(key, t, undefined) as { ok: boolean; text: string }
+    const noAgent = { sessionId: 'im-cwd', effectiveCwd: '', cwdFromCommand: false, liveAgent: undefined }
+    const run = (t: string) => commands.run(key, t, noAgent) as { ok: boolean; text: string }
 
     // No argument reports the effective directory and its origin.
     const shown = run('/cwd')
@@ -1860,6 +1869,45 @@ step('client half paints only real theme tokens (no literal colours) OK')
     assert.equal(run('/cwd /srv/work').ok, true, 'a POSIX path is absolute')
   }
 
+  // ---- /status reports exactly what was routed ----
+  {
+    const presets = makePresets(['workspace-write', 'danger-full-access'], 'workspace-write')
+    const ctx = { get: (n: string) => n === 'permissionPresets' ? presets.service : undefined, logger: silent } as never
+    const cursors = new SessionCursors()
+    const commands = new ImCommands(ctx, cursors, () => 'C:\\default')
+    const key = 'cmcc:chat-status'
+    const fakeAgent = { session: { id: 's-1' } } as never
+
+    // The reported id must be the ROUTED one, not one recomputed here: /status
+    // exists so that "did /new work?" is answerable from the chat.
+    const bare = commands.run(key, '/status', {
+      sessionId: 'im-routed-42', effectiveCwd: '', cwdFromCommand: false, liveAgent: undefined,
+    }) as { ok: boolean; text: string }
+    assert.equal(bare.ok, true)
+    assert.ok(bare.text.includes('im-routed-42'), 'the routed session id is reported')
+    assert.ok(bare.text.includes('初始会话'), 'generation 0 is labelled as the original')
+    assert.ok(bare.text.includes('未设置'), 'an absent directory is stated, not blank')
+    assert.ok(bare.text.includes('未启动'), 'the absent agent is stated')
+    assert.ok(bare.text.includes('重启'), '/status repeats the restart caveat')
+
+    // After /new the generation, and therefore the report, must change.
+    commands.run(key, '/new', { sessionId: 'im-routed-42', effectiveCwd: '', cwdFromCommand: false, liveAgent: undefined })
+    const afterNew = commands.run(key, '/status', {
+      sessionId: 'im-routed-99', effectiveCwd: '', cwdFromCommand: false, liveAgent: undefined,
+    }) as { text: string }
+    assert.ok(afterNew.text.includes('im-routed-99'), '/status follows the rotation')
+    assert.ok(afterNew.text.includes('会话代次：1'), 'the generation is reported after /new')
+
+    // With a live agent the permission preset is included.
+    const withAgent = commands.run(key, '/status', {
+      sessionId: 'im-routed-99', effectiveCwd: 'D:\\proj', cwdFromCommand: true, liveAgent: fakeAgent,
+    }) as { text: string }
+    assert.ok(withAgent.text.includes('workspace-write'), 'the live permission preset is shown')
+    assert.ok(withAgent.text.includes('D:\\proj'), 'the effective directory is shown')
+    assert.ok(withAgent.text.includes('/cwd 设置'), 'the directory origin is attributed to /cwd')
+    assert.ok(withAgent.text.includes('运行中'), 'a live agent is reported as running')
+  }
+
   // ---- Web-side registration degrades without the commands service ----
   {
     const ctx = { get: () => undefined, logger: silent, effect: () => () => {} } as never
@@ -1872,12 +1920,12 @@ step('client half paints only real theme tokens (no literal colours) OK')
     commands2.registerWithHost()
     assert.deepEqual(
       registry.registered.map(r => r.name).sort(),
-      ['cwd', 'help', 'new', 'perm'],
+      ['cwd', 'help', 'new', 'perm', 'status'],
       'the Web composer lists the same command names',
     )
   }
 }
-step('IM slash commands (/perm, /new, /cwd, routing + cursor arithmetic) OK')
+step('IM slash commands (/status, /perm, /new, /cwd, routing + cursor arithmetic) OK')
 
 await rmBrowse(browseTmp, { recursive: true, force: true })
 

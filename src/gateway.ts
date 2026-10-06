@@ -395,7 +395,12 @@ export class ImGateway {
     // reply goes straight back to the chat and the model never sees the line.
     // (An unrecognised `/name` returns `pass`, so real text beginning with a
     // slash still reaches the agent.)
-    const routed = this.commands.run(chatKey, message.text, this.ctx.agents.get(sessionId))
+    const routed = this.commands.run(chatKey, message.text, {
+      sessionId: String(sessionId),
+      effectiveCwd: cursor.cwd ?? runtime.sessionWorkspace ?? '',
+      cwdFromCommand: cursor.cwd !== undefined,
+      liveAgent: this.ctx.agents.get(sessionId),
+    })
     if (routed.kind === 'handled') {
       await this.deliverCommandReply(reply, routed, sessionId)
       return
