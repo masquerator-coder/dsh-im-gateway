@@ -88,6 +88,7 @@
 import { createServer, type Server, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from 'node:http'
 import assert from 'node:assert/strict'
 import type { InboundRoute } from '../src/transports/types.ts'
+import { registerPermCommand, PERM_COMMAND } from '../src/permission-command.ts'
 
 // Unbuffered progress marker (stderr) so a kill/timeout still shows where we are.
 const step = (s: string): void => { process.stderr.write(`[smoke] ${s}\n`) }
@@ -1710,6 +1711,126 @@ step('browse route (gate fails closed, method guard, roots view) OK')
   )
 }
 step('client half paints only real theme tokens (no literal colours) OK')
+
+/**
+ * `/perm` — the only surface that can switch a session's permission preset at
+ * runtime. The gateway no longer forces `defaultPreset` onto created agents, so
+ * this command is what makes a per-session choice reachable at all; assert the
+ * whole contract, including the cases that must fail closed.
+ */
+{
+  // A minimal fake of the two host services, so this runs without a live DSH.
+  const makePresets = (names: readonly string[], current: string) => {
+    const applied: string[] = []
+    return {
+      applied,
+      service: {
+        names,
+        current: () => current,
+        set: (_session: unknown, name: string) => {
+          if (!names.includes(name)) throw new Error(`unknown preset "${name}"`)
+          applied.push(name)
+        },
+        resolve: (name: string) => ({ sandbox: `sandbox-${name}`, approval: `approval-${name}` }),
+      },
+    }
+  }
+
+  /** Capture whatever a fake `commands.register` receives. */
+  const makeCommands = () => {
+    const registered: { name: string; handler: (i: unknown) => unknown }[] = []
+    return {
+      registered,
+      service: {
+        register: (definition: { name: string; handler: (i: unknown) => unknown }) => {
+          registered.push(definition)
+          return () => { registered.length = 0 }
+        },
+      },
+    }
+  }
+
+  const invoke = (handler: (i: unknown) => unknown, rawInput: string) =>
+    handler({ agent: { session: { id: 's-1' } }, rawInput, signal: new AbortController().signal }) as
+      { kind: string; text?: string }
+
+  // 1. No `commands` service -> no-op, not a crash. A profile without that
+  //    bundle must still load the gateway.
+  const absent = registerPermCommand({
+    get: () => undefined,
+    logger: { debug: () => {}, info: () => {}, warn: () => {} },
+    effect: () => () => {},
+  } as never)
+  assert.equal(absent, undefined, 'without a commands service /perm must register nothing')
+
+  // 2. Bare `/perm` lists presets and marks the current one.
+  {
+    const presets = makePresets(['workspace-write', 'danger-full-access'], 'workspace-write')
+    const commands = makeCommands()
+    const ctx = {
+      get: (name: string) => name === 'permissionPresets' ? presets.service : commands.service,
+      logger: { debug: () => {}, info: () => {}, warn: () => {} },
+      effect: (fn: () => unknown) => { fn(); return () => {} },
+    } as never
+    registerPermCommand(ctx)
+    const definition = commands.registered[0]
+    assert.equal(definition.name, PERM_COMMAND)
+    assert.equal(PERM_COMMAND, 'perm', 'the command name is lowercase and slash-free')
+
+    const listed = invoke(definition.handler, '')
+    assert.equal(listed.kind, 'success')
+    assert.ok(listed.text?.includes('workspace-write'), 'the listing names the presets')
+    assert.ok(listed.text?.includes('* workspace-write'), 'the current preset is marked')
+    assert.ok(listed.text?.includes('danger-full-access'), 'every alternative is listed')
+    assert.equal(presets.applied.length, 0, 'listing must not switch anything')
+
+    // 3. A known preset switches, and reaches the real service.
+    const switched = invoke(definition.handler, '  danger-full-access  ')
+    assert.equal(switched.kind, 'success')
+    assert.deepEqual(presets.applied, ['danger-full-access'], 'surrounding whitespace is tolerated')
+
+    // 4. An unknown preset fails closed and is NOT passed to set() (which throws).
+    presets.applied.length = 0
+    const rejected = invoke(definition.handler, 'nope')
+    assert.equal(rejected.kind, 'error')
+    assert.ok(rejected.text?.includes('nope'), 'the rejected name is echoed')
+    assert.ok(rejected.text?.includes('workspace-write'), 'the alternatives are offered')
+    assert.deepEqual(presets.applied, [], 'an unknown preset must never reach set()')
+
+    // 5. An empty catalog is an error, not a misleading success.
+    const empty = makePresets([], 'custom')
+    const emptyCtx = {
+      get: (name: string) => name === 'permissionPresets' ? empty.service : makeCommands().service,
+      logger: { debug: () => {}, info: () => {}, warn: () => {} },
+      effect: (fn: () => unknown) => { fn(); return () => {} },
+    } as never
+    const emptyCommands = makeCommands()
+    ;(emptyCtx as { get: (n: string) => unknown }).get =
+      (name: string) => name === 'permissionPresets' ? empty.service : emptyCommands.service
+    registerPermCommand(emptyCtx)
+    const emptyResult = invoke(emptyCommands.registered[0].handler, '')
+    assert.equal(emptyResult.kind, 'error', 'an empty preset catalog fails closed')
+
+    // 6. A throwing set() surfaces as an error result rather than escaping.
+    const throwing = {
+      names: ['workspace-write'],
+      current: () => 'workspace-write',
+      set: () => { throw new Error('writer-held') },
+      resolve: () => ({ sandbox: 's', approval: 'a' }),
+    }
+    const throwingCommands = makeCommands()
+    const throwingCtx = {
+      get: (name: string) => name === 'permissionPresets' ? throwing : throwingCommands.service,
+      logger: { debug: () => {}, info: () => {}, warn: () => {} },
+      effect: (fn: () => unknown) => { fn(); return () => {} },
+    } as never
+    registerPermCommand(throwingCtx)
+    const threw = invoke(throwingCommands.registered[0].handler, 'workspace-write')
+    assert.equal(threw.kind, 'error')
+    assert.ok(threw.text?.includes('writer-held'), 'the underlying failure is reported')
+  }
+}
+step('/perm command (list, switch, fail-closed cases) OK')
 
 await rmBrowse(browseTmp, { recursive: true, force: true })
 

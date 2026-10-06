@@ -9,6 +9,7 @@ import { ChannelManager } from './channels/manager.ts'
 import { STATUS_ROUTE_PATH, BROWSE_ROUTE_PATH } from './status-proto.ts'
 import { createStatusHandler, createBrowseHandler, type RequestGate, type WebRouteService } from './status-route.ts'
 import { defaultBrowseDeps } from './browse-route.ts'
+import { registerPermCommand } from './permission-command.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -59,6 +60,11 @@ export function apply(ctx: Context, config: ConfigType): void {
       'dsh-im-gateway.settings-policy()',
     )
   })
+
+  // `/perm` — show or switch the calling session's permission preset. Registered
+  // globally, but its handler acts on the exact invoking agent, so the switch is
+  // per-session. Absent the `commands` bundle this is a no-op.
+  registerPermCommand(ctx)
 
   // Legacy single-channel path: keep the global webhook route alive exactly as
   // before, forwarding to the gateway with the legacy callback as the reply
