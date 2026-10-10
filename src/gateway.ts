@@ -316,8 +316,9 @@ export class ImGateway {
   /** IM-only bridge for DSH approval / user-question seams. */
   readonly interactions: InteractionBridge
   /**
-   * Per-chat session cursors backing `/new` and `/cwd`. In-memory: a restart
-   * returns every chat to its original session, which those commands say.
+   * Per-chat session cursors backing `/new` (both the plain rotation and the
+   * optional working-directory switch). In-memory: a restart returns every chat
+   * to its original session, which the command says.
    */
   private readonly cursors = new SessionCursors()
   /** Slash-command router: consumes IM commands before they become prompts. */
@@ -334,7 +335,7 @@ export class ImGateway {
       this.onSessionEvent(_session, event)
     }, { global: true })
     this.interactions = new InteractionBridge(ctx)
-    this.commands = new ImCommands(ctx, this.cursors, () => this.defaults.cwd ?? defaultWorkspaceDir())
+    this.commands = new ImCommands(ctx, this.cursors)
   }
 
   /**
@@ -375,9 +376,10 @@ export class ImGateway {
     // An explicitly configured working directory is folded in as well: a session
     // cannot be moved between workspaces, so a chat pointed at another directory
     // continues as a NEW conversation there instead of silently resuming into
-    // the old one. `/cwd` sets that directory per chat and `/new` bumps the
-    // generation — both change this key, which is how a chat is moved onto a
-    // different session without ever mutating a live one.
+    // the old one. `/new [工作目录]` changes both the directory and the
+    // generation — i.e. both parts of this key — which is how a chat is moved
+    // onto a different session (or just restarted) without ever mutating a
+    // live one.
     const chatKey = `${keyChannel ?? ''}:${message.chatId}`
     const cursor = this.cursors.get(chatKey)
     const effectiveCwd = cursor.cwd ?? runtime.sessionWorkspace ?? ''

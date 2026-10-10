@@ -31,7 +31,8 @@ Agents are composed **exactly like the DSH webhook / session-controller path**:
 - Every chat maps to a stable session id: `SessionId = im-<sha1(f"{channel}:{chat_id}")[0:16]>`, or `im-<sha1(f"{channel}:{chat_id}@{cwd}")[0:16]>` when an **explicitly configured working directory** applies (a channel's own `cwd`, or the settings card's 全局默认工作目录).
 - The **receiving channel** is part of the key, so the same external chat id arriving through two different channels (e.g. email vs cmcc) never shares a session (isolation mirrors dsh-im-main's `ConversationRoute`). An empty namespace keeps the historical chatId-only key for callers that predate multi-channel.
 - The **working directory** is part of the key because a DSH session's `cwd` is pinned when the session is created: `agents.resume` restores the persisted header (`ResumeAgentOptions` has no `cwd`), and `workspaceRegistry` refuses to attach a session whose header cwd differs from the workspace path. A conversation therefore lives in one workspace for its whole life, and pointing a channel at another directory **starts a new conversation there** — the old session stays in its old workspace (still openable in the Web UI). Silently resuming the old one is what used to make a changed working directory look ignored. The key is unchanged (and every existing IM session keeps its id) when no directory is configured: `cordis.yml`'s `cwd` stays a pure deployment fallback and does not scope the identity.
-- The same `channel + chat_id` (+ the same working directory) always reuses the same Agent (durable context); different chats are never shared.
+- The **generation** (the `im` / `im-g<N>` prefix) is what `/new` advances, so a chat can be restarted without touching any live session. A chat that a user moved with `/new D:\other\dir` is bound by its cursor for as long as the host process lives; on restart the cursor is gone and the configured directory governs again.
+- The same `channel + chat_id` (+ the same working directory and generation) always reuses the same Agent (durable context); different chats are never shared.
 
 ### Built-in gateway safeguards
 
@@ -49,6 +50,23 @@ Agents are composed **exactly like the DSH webhook / session-controller path**:
 DSH's tool-approval (`approval/request`) and user-question (`user-questions/request`) are agent-scoped waterfall events. On every agent this gateway creates/resumes a **bridge answerer** is installed that pushes the prompt down the *same* IM channel driving that session and maps the user's textual reply back to the outcome the seam expects — so a 5G消息 / email / … user is asked over IM instead of only seeing a web dialog.
 
 Ordering is load-bearing: in the `web` profile the `dsh-api-remotes` forwarder that feeds the browser answerer registers on the root context at startup, and Cordis waterfalls run listeners in **registration order** (scope filtering admits listeners, it does not reorder them). The bridge therefore registers with `prepend: true` so it heads the waterfall and the IM channel wins. Fallback: if the session has no reachable outbound sender (or the IM push fails) the bridge calls `next()` and **delegates to the web answerer** rather than fail-closing — an offline IM channel never wedges an approval a web user could answer. Pure web conversations are unaffected (only gateway-owned agents install the bridge).
+
+---
+
+## Chat commands
+
+An IM message that is a slash command is handled by the gateway's own router **before it can become a prompt**, so the command line and its output never enter the model's context (DSH's `commands` registry is driven by UI clients and is unreachable from a chat — the same names are registered there only so the Web composer lists them).
+
+| Command | What it does |
+| --- | --- |
+| `/status` | The routed session id, its generation and working directory, whether a live agent exists, and the session's permission preset |
+| `/new [工作目录]` | Start a **new session** for this chat, optionally in another working directory; the previous session is kept, never deleted |
+| `/perm [preset]` | Show or switch this session's permission preset (needs a live agent to switch) |
+| `/help` | The command list |
+
+`/new` is deliberately one command with two effects, because in DSH they are the same effect: a session's `cwd` is pinned when the session is created (`agents.resume` only restores the persisted header, and the workspace registry refuses to attach a session whose header cwd differs), so **switching directory always means starting a new session there**. `/new` rotates the generation and, given an absolute path, records the new directory — both parts of the session key, which is how a chat moves onto another session without ever mutating a live one (see [Session keying](#session-keying--isolation)). A bare `/new` keeps whatever directory the chat is already in. A relative path is **refused rather than guessed**, because its only natural reference point is the directory being changed. There is no `/cwd`: DSH cannot switch a workspace mid-session, so that command could never do what its name promised.
+
+An unrecognised `/name` falls through to the model (real text may begin with a slash — a path, a fraction), and the cursors are **in-memory**: a restart returns every chat to its original session, which both `/new` and `/status` state.
 
 ---
 
@@ -159,6 +177,7 @@ pnpm qq-probe <appId> <appSecret> [--ints c2c,public_guild] [--sandbox] [--secon
 | `src/inbound.ts` | Embedded `node:http` webhook server (routes by URL path; acks `202` only after `handle()` resolves) |
 | `src/gateway.ts` | Workspace-attached session composition, live-agent reuse, rpcId reply claiming, allowlist / dedup / serialization / source injection / delivery retry / fault notices |
 | `src/session.ts` | Deterministic session-key derivation: `im-<sha1(channel:chat_id[@cwd])>`, channel-isolated and scoped to an explicitly configured working directory |
+| `src/im-commands.ts` | IM slash-command router (`/status`, `/new [工作目录]`, `/perm`, `/help`) plus the per-chat session cursors it drives; the same names are registered with DSH's `commands` for the Web composer |
 | `src/index.ts` | Plugin entry (`name`/`inject`/`Config`/`apply` + lifecycle + the `GET /im-gateway/status` and `GET /im-gateway/browse` routes) |
 | `src/status-proto.ts` | Host↔client wire contract for live channel status and the directory browser (dependency-free; why a route, not a Remote namespace) |
 | `src/status-route.ts` | The status + browse route handlers (payload projection, shared browser-auth gate, method guard) |

@@ -1,5 +1,5 @@
 /**
- * IM-side slash commands: `/perm`, `/new`, `/cwd`, `/help`.
+ * IM-side slash commands: `/status`, `/perm`, `/new`, `/help`.
  *
  * WHY THIS EXISTS. DSH's own `commands` registry is driven by UI clients: the
  * Web composer parses a line and calls `commands.execute(agent, line, …)`. An IM
@@ -101,6 +101,23 @@ export class SessionCursors {
   }
 }
 
+/**
+ * Whether a user-supplied path is absolute.
+ *
+ * A RELATIVE path cannot be resolved here, and guessing would be worse than
+ * refusing: the obvious reference point — the session's own working directory —
+ * is exactly what is being changed, and it may be the configured default rather
+ * than anything this chat chose. A Windows drive path, a UNC share and a POSIX
+ * path are all absolute; anything else is refused with the reason.
+ * (The harness requires a working directory to be absolute anyway, so this
+ * mirrors the host's rule instead of inventing a second one.)
+ * @param path - the trimmed user input.
+ * @returns whether the path may be used as a working directory.
+ */
+function isAbsolutePath(path: string): boolean {
+  return /^[A-Za-z]:[\\/]/u.test(path) || path.startsWith('/') || path.startsWith('\\\\')
+}
+
 /** Split a command line into its name and verbatim remainder. */
 export interface ImParsedCommand {
   readonly name: string
@@ -164,8 +181,7 @@ function helpText(): string {
     '可用命令：',
     '  /status           查看本聊天的会话、工作目录与权限',
     '  /perm [preset]    查看或切换本会话的权限预设',
-    '  /new              开启新会话（当前会话保留，不删除）',
-    '  /cwd [path]       查看或切换工作目录（在新目录开新会话）',
+    '  /new [工作目录]    开启新会话（当前会话保留，不删除）；给了绝对路径就在该目录里开',
     '  /help             显示这份帮助',
     '',
     '命令不会进入模型上下文，模型看不到你输入的命令。',
@@ -185,7 +201,7 @@ export interface ImCommandContext {
   readonly sessionId: string
   /** The effective working directory for this chat ('' when none configured). */
   readonly effectiveCwd: string
-  /** Whether that directory came from `/cwd` rather than configuration. */
+  /** Whether that directory came from `/new` rather than configuration. */
   readonly cwdFromCommand: boolean
   /** The live agent for this session, when one exists. */
   readonly liveAgent: Agent | undefined
@@ -194,16 +210,15 @@ export interface ImCommandContext {
 /**
  * Bridge from an IM command line to the session cursor.
  *
- * `/perm` needs a live agent (it changes a session's permission); `/new` and
- * `/cwd` change the cursor that decides which session the NEXT message uses, so
- * they work even if no agent is live. `/status` needs neither.
+ * `/perm` needs a live agent (it changes a session's permission); `/new`
+ * changes the cursor that decides which session the NEXT message uses, so it
+ * works even if no agent is live. `/status` needs neither.
  */
 export class ImCommands {
-  /** Injected so tests can supply a fixed reply set without a live DSH. */
+  /** `ctx` is injected so tests can supply a fixed service set without a live DSH. */
   constructor(
     private readonly ctx: Context,
     private readonly cursors: SessionCursors,
-    private readonly defaultsCwd: () => string,
   ) {}
 
   /**
@@ -226,9 +241,7 @@ export class ImCommands {
       case 'perm':
         return this.runPerm(parsed.rawInput, context.liveAgent)
       case 'new':
-        return this.runNew(chatKey, context)
-      case 'cwd':
-        return this.runCwd(chatKey, parsed.rawInput)
+        return this.runNew(chatKey, parsed.rawInput, context)
       default:
         // An unknown `/name` is NOT swallowed: it may be a genuine message that
         // merely starts with a slash (a path, a fraction, a search string), and
@@ -248,9 +261,9 @@ export class ImCommands {
     const cursor = this.cursors.get(chatKey)
     const lines = [
       `会话 ID：${context.sessionId}`,
-      `会话代次：${cursor.generation}${cursor.generation === 0 ? '（初始会话）' : '（由 /new 或 /cwd 产生）'}`,
+      `会话代次：${cursor.generation}${cursor.generation === 0 ? '（初始会话）' : '（由 /new 产生）'}`,
       `工作目录：${context.effectiveCwd || '(未设置)'}`,
-      `目录来源：${context.cwdFromCommand ? '/cwd 设置' : (context.effectiveCwd === '' ? '无' : '配置默认值')}`,
+      `目录来源：${context.cwdFromCommand ? '/new 设置' : (context.effectiveCwd === '' ? '无' : '配置默认值')}`,
       `Agent 状态：${context.liveAgent === undefined ? '未启动（下一条消息会创建）' : '运行中'}`,
     ]
 
@@ -268,7 +281,7 @@ export class ImCommands {
       }
     }
 
-    lines.push('', '提示：重启 DSH 后会话代次与 /cwd 设置会重置。')
+    lines.push('', '提示：重启 DSH 后会话代次与 /new 设置的工作目录会重置。')
     return { kind: 'handled', ok: true, text: lines.join('\n') }
   }
 
@@ -336,52 +349,54 @@ export class ImCommands {
     return { kind: 'handled', ok: true, text: `权限预设已切换为 ${requested}${detail}。` }
   }
 
-  /** `/new` — rotate to a fresh session for this chat. */
-  private runNew(chatKey: string, context: ImCommandContext): ImCommandOutcome {
+  /**
+   * `/new [工作目录]` — rotate to a fresh session for this chat, optionally in
+   * another directory.
+   *
+   * Both halves are the SAME operation: `sessionIdForChat` hashes
+   * (channel, chatId, cwd) plus a generation prefix, so starting a new
+   * conversation and moving that conversation to another directory are one
+   * edit of one cursor. (This is why the retired `/cwd` command existed at
+   * all: switching directory cannot mutate a live session — DSH pins a
+   * session's cwd at creation — so it always meant "start a new one here".
+   * One command that says what it does replaces two that had to explain
+   * themselves to each other.)
+   *
+   * A path that is not absolute is REFUSED rather than guessed: the natural
+   * reference point would be the session's own directory, which is the very
+   * thing being changed.
+   */
+  private runNew(chatKey: string, rawInput: string, context: ImCommandContext): ImCommandOutcome {
     const current = this.cursors.get(chatKey)
-    const next: ChatSessionState = { generation: current.generation + 1, ...(current.cwd === undefined ? {} : { cwd: current.cwd }) }
-    this.cursors.set(chatKey, next)
-    const where = next.cwd === undefined ? '' : `\n工作目录仍为：${next.cwd}`
-    return {
-      kind: 'handled',
-      ok: true,
-      text: [
-        `已开启新会话（第 ${next.generation} 次）。下一条消息将在全新会话中进行。`,
-        `切换前会话：${context.sessionId}`,
-        '之前的会话记录仍保留，未被删除。',
-        '注意：服务重启后此计数会重置，本聊天将回到最初的会话。',
-      ].join('\n') + where,
-    }
-  }
-
-  /** `/cwd` — inspect or switch the working directory. */
-  private runCwd(chatKey: string, rawInput: string): ImCommandOutcome {
     const requested = rawInput.trim()
-    const current = this.cursors.get(chatKey)
-    const effective = current.cwd ?? this.defaultsCwd()
 
+    // No directory given: keep whatever this chat had (a `/cwd`-era cursor, the
+    // configured default, or nothing) and only rotate the generation — a plain
+    // `/new` must never quietly move a chat out of its workspace.
     if (requested === '') {
+      const next: ChatSessionState = {
+        generation: current.generation + 1,
+        ...(current.cwd === undefined ? {} : { cwd: current.cwd }),
+      }
+      this.cursors.set(chatKey, next)
+      const where = next.cwd === undefined ? '' : `\n工作目录仍为：${next.cwd}`
       return {
         kind: 'handled',
         ok: true,
         text: [
-          `当前工作目录：${effective || '(未设置)'}`,
-          current.cwd === undefined ? '（来自配置的默认值）' : '（由 /cwd 设置）',
-          '',
-          '切换：/cwd <绝对路径>',
-        ].join('\n'),
+          `已开启新会话（第 ${next.generation} 次）。下一条消息将在全新会话中进行。`,
+          `切换前会话：${context.sessionId}`,
+          '之前的会话记录仍保留，未被删除。',
+          '注意：服务重启后此计数会重置，本聊天将回到最初的会话。',
+        ].join('\n') + where,
       }
     }
 
-    // A relative path is ambiguous once the session's own cwd is the reference,
-    // and DSH pins a session's cwd at creation, so require an absolute one and
-    // say so rather than guessing.
-    const isAbsolute = /^[A-Za-z]:[\\/]/u.test(requested) || requested.startsWith('/') || requested.startsWith('\\\\')
-    if (!isAbsolute) {
+    if (!isAbsolutePath(requested)) {
       return {
         kind: 'handled',
         ok: false,
-        text: `请提供绝对路径，例如：/cwd D:\\项目\\foo\n收到：${requested}`,
+        text: `请提供绝对路径，例如：/new D:\\项目\\foo\n收到：${requested}`,
       }
     }
 
@@ -393,6 +408,7 @@ export class ImCommands {
       text: [
         `工作目录已设为：${requested}`,
         `已在新目录开启新会话（第 ${next.generation} 次）。下一条消息在新会话中进行。`,
+        `切换前会话：${context.sessionId}`,
         'DSH 会话的工作目录在创建时固定、无法迁移，因此这里是"在新目录重新开始"。',
         '注意：服务重启后此设置会重置，本聊天将回到最初的会话与目录。',
       ].join('\n'),
@@ -425,14 +441,9 @@ export class ImCommands {
       }),
       commands.register({
         name: 'new',
-        description: 'Start a new session for this chat (the previous one is kept).',
-        handler: () => ({ kind: 'success', text: 'IM 会话由聊天窗口的 /new 驱动；Web 端请直接新建会话。' }),
-      }),
-      commands.register({
-        name: 'cwd',
-        description: 'Show or switch the working directory for this chat.',
-        input: { hint: '[path]' },
-        handler: () => ({ kind: 'success', text: 'IM 工作目录由聊天窗口的 /cwd 驱动；Web 端请直接切换工作区。' }),
+        description: 'Start a new session for this chat, optionally in a given working directory.',
+        input: { hint: '[absolute path]' },
+        handler: () => ({ kind: 'success', text: 'IM 会话由聊天窗口的 /new [工作目录] 驱动；Web 端请直接新建会话（切换工作区请直接在 Web 端切换）。' }),
       }),
       commands.register({
         name: 'help',

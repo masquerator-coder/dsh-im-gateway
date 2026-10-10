@@ -77,6 +77,15 @@
  *      rather than as an empty one, and stop "up" at a real root. Exercised
  *      against real temp directories, because every one of those failures is
  *      silent in production.
+ *  18. IM slash commands — the router that runs BEFORE a message becomes a
+ *      prompt, so a command is consumed instead of being sent to the model.
+ *      Covers the pass-through contract (an unknown slash-word / a path still
+ *      reaches the model), `/perm` list/switch/reject, and the session-cursor
+ *      arithmetic behind `/new [工作目录]`: a bare `/new` rotates while keeping
+ *      the chat's current directory, an absolute path moves it (a session's cwd
+ *      is pinned at creation, so that is necessarily a new session), a relative
+ *      path is refused rather than guessed, and the retired `/cwd` is neither
+ *      routed nor registered.
  *
  * Real transports that need live services (email / feishu / wechat / qq / a
  * live CMCC gateway) are exercised by starting them in the plugin; this file
@@ -1712,13 +1721,13 @@ step('browse route (gate fails closed, method guard, roots view) OK')
 }
 step('client half paints only real theme tokens (no literal colours) OK')
 /**
- * IM slash commands — `/perm`, `/new`, `/cwd`, `/help`.
+ * IM slash commands — `/status`, `/perm`, `/new`, `/help`.
  *
  * These are reached through the gateway's own router, NOT through DSH's command
  * registry: an IM message never touches `commands.execute()`, so the router is
  * the only thing that makes a command work from a chat. The assertions below
  * cover the routing contract (not-a-command must pass through untouched) and the
- * session-cursor arithmetic that `/new` and `/cwd` rely on.
+ * session-cursor arithmetic that `/new` relies on.
  */
 {
   const makePresets = (names: readonly string[], current: string) => {
@@ -1752,6 +1761,7 @@ step('client half paints only real theme tokens (no literal colours) OK')
 
   // ---- grammar ----
   assert.deepEqual(parseImCommand('/new'), { name: 'new', rawInput: '' })
+  assert.deepEqual(parseImCommand('/new  D:\\x'), { name: 'new', rawInput: '  D:\\x' })
   assert.deepEqual(parseImCommand('/cwd  D:\\x'), { name: 'cwd', rawInput: '  D:\\x' })
   assert.equal(parseImCommand('/Upper'), undefined, 'the name grammar is lowercase-only')
   assert.equal(parseImCommand('hello'), undefined, 'plain text is not a command')
@@ -1766,7 +1776,7 @@ step('client half paints only real theme tokens (no literal colours) OK')
     const presets = makePresets(['workspace-write', 'danger-full-access'], 'workspace-write')
     const ctx = { get: (n: string) => n === 'permissionPresets' ? presets.service : undefined, logger: silent } as never
     const cursors = new SessionCursors()
-    const commands = new ImCommands(ctx, cursors, () => 'C:\\default')
+    const commands = new ImCommands(ctx, cursors)
     const fakeAgent = { session: { id: 's-1' } } as never
     // NOTE: an explicit `undefined` must mean "no live agent", so this cannot
     // use a default parameter (which would substitute the fake agent instead).
@@ -1796,7 +1806,7 @@ step('client half paints only real theme tokens (no literal colours) OK')
     const listed = runWithAgent('/perm') as { text: string }
     assert.ok(listed.text.includes('* workspace-write'), 'the current preset is marked')
     assert.equal(presets.applied.length, 0, 'listing must not switch anything')
-    const switched = runWithAgent('/perm danger-full-access')
+    const switched = runWithAgent('/perm danger-full-access') as { ok: boolean }
     assert.equal(switched.ok, true)
     assert.deepEqual(presets.applied, ['danger-full-access'], 'the switch reaches the service')
 
@@ -1817,7 +1827,7 @@ step('client half paints only real theme tokens (no literal colours) OK')
   {
     const ctx = { get: () => undefined, logger: silent } as never
     const cursors = new SessionCursors()
-    const commands = new ImCommands(ctx, cursors, () => 'C:\\default')
+    const commands = new ImCommands(ctx, cursors)
     const key = 'cmcc:chat-9'
     const noAgent = { sessionId: 'im-orig', effectiveCwd: '', cwdFromCommand: false, liveAgent: undefined }
 
@@ -1827,6 +1837,7 @@ step('client half paints only real theme tokens (no literal colours) OK')
     assert.equal(cursors.get(key).generation, 1, '/new advances the generation')
     assert.ok((first as { text: string }).text.includes('重启后'), '/new discloses the restart behaviour')
     assert.ok((first as { text: string }).text.includes('im-orig'), '/new names the session being left')
+    assert.equal(cursors.get(key).cwd, undefined, 'a bare /new must not invent a working directory')
 
     commands.run(key, '/new', noAgent)
     assert.equal(cursors.get(key).generation, 2, '/new is repeatable')
@@ -1835,38 +1846,52 @@ step('client half paints only real theme tokens (no literal colours) OK')
     assert.equal(cursors.get('cmcc:other').generation, 0, 'cursors are isolated per chat')
   }
 
-  // ---- /cwd ----
+  // ---- /new <绝对路径> — the new session starts in that directory ----
   {
     const ctx = { get: () => undefined, logger: silent } as never
     const cursors = new SessionCursors()
-    const commands = new ImCommands(ctx, cursors, () => 'C:\\default')
-    const key = 'cmcc:chat-cwd'
+    const commands = new ImCommands(ctx, cursors)
+    const key = 'cmcc:chat-newcwd'
     const noAgent = { sessionId: 'im-cwd', effectiveCwd: '', cwdFromCommand: false, liveAgent: undefined }
     const run = (t: string) => commands.run(key, t, noAgent) as { ok: boolean; text: string }
 
-    // No argument reports the effective directory and its origin.
-    const shown = run('/cwd')
-    assert.ok(shown.text.includes('C:\\default'), 'the default is reported')
-    assert.ok(shown.text.includes('默认值'), 'the origin of the value is stated')
-    assert.equal(cursors.get(key).generation, 0, 'inspecting must not rotate the session')
-
-    // A relative path is refused rather than guessed.
-    const relative = run('/cwd foo')
+    // A relative path is refused rather than guessed: the reference point would
+    // be the session's own directory — the very thing being changed.
+    const relative = run('/new foo')
     assert.equal(relative.ok, false, 'a relative path is refused')
     assert.ok(relative.text.includes('绝对路径'), 'the refusal explains what is wanted')
     assert.equal(cursors.get(key).cwd, undefined, 'a refused path changes nothing')
+    assert.equal(cursors.get(key).generation, 0, 'a refused path does not rotate either')
 
     // An absolute path sets the directory AND rotates the session.
-    const absolute = run('/cwd D:\\项目\\foo')
+    const absolute = run('/new D:\\项目\\foo')
     assert.equal(absolute.ok, true)
     assert.equal(cursors.get(key).cwd, 'D:\\项目\\foo', 'the directory is recorded')
-    assert.equal(cursors.get(key).generation, 1, '/cwd starts a new session by necessity')
+    assert.equal(cursors.get(key).generation, 1, 'a directory switch starts a new session by necessity')
     assert.ok(absolute.text.includes('无法迁移'), 'the reply explains why a new session is needed')
+    assert.ok(absolute.text.includes('im-cwd'), 'the reply names the session being left')
+
+    // Surrounding whitespace is the user's, not part of the path.
+    assert.equal(run('/new  D:\\项目\\bar  ').ok, true, 'a padded path is accepted')
+    assert.equal(cursors.get(key).cwd, 'D:\\项目\\bar', 'the path is trimmed')
+    assert.equal(cursors.get(key).generation, 2, 'each switch rotates')
 
     // A UNC path is accepted too (a Windows network share is absolute).
-    assert.equal(run('/cwd \\\\server\\share').ok, true, 'a UNC path is absolute')
+    assert.equal(run('/new \\\\server\\share').ok, true, 'a UNC path is absolute')
     // ...and a POSIX path, for a non-Windows host.
-    assert.equal(run('/cwd /srv/work').ok, true, 'a POSIX path is absolute')
+    assert.equal(run('/new /srv/work').ok, true, 'a POSIX path is absolute')
+
+    // Rotation count so far: /new D:\项目\foo, /new D:\项目\bar, /new \\server\share, /new /srv/work.
+    assert.equal(cursors.get(key).generation, 4, 'four accepted switches, four rotations')
+
+    // Back to a plain rotation: the directory chosen above is REMEMBERED and the
+    // generation advances — /new without a path must not silently fall back to
+    // the configured default workspace.
+    const bare = run('/new')
+    assert.equal(bare.ok, true)
+    assert.equal(cursors.get(key).cwd, '/srv/work', 'a bare /new keeps the directory the chat is in')
+    assert.equal(cursors.get(key).generation, 5, 'a bare /new still rotates')
+    assert.ok(bare.text.includes('/srv/work'), 'the reply says which directory the new session uses')
   }
 
   // ---- /status reports exactly what was routed ----
@@ -1874,7 +1899,7 @@ step('client half paints only real theme tokens (no literal colours) OK')
     const presets = makePresets(['workspace-write', 'danger-full-access'], 'workspace-write')
     const ctx = { get: (n: string) => n === 'permissionPresets' ? presets.service : undefined, logger: silent } as never
     const cursors = new SessionCursors()
-    const commands = new ImCommands(ctx, cursors, () => 'C:\\default')
+    const commands = new ImCommands(ctx, cursors)
     const key = 'cmcc:chat-status'
     const fakeAgent = { session: { id: 's-1' } } as never
 
@@ -1904,28 +1929,44 @@ step('client half paints only real theme tokens (no literal colours) OK')
     }) as { text: string }
     assert.ok(withAgent.text.includes('workspace-write'), 'the live permission preset is shown')
     assert.ok(withAgent.text.includes('D:\\proj'), 'the effective directory is shown')
-    assert.ok(withAgent.text.includes('/cwd 设置'), 'the directory origin is attributed to /cwd')
+    assert.ok(withAgent.text.includes('/new 设置'), 'the directory origin is attributed to /new')
     assert.ok(withAgent.text.includes('运行中'), 'a live agent is reported as running')
   }
 
   // ---- Web-side registration degrades without the commands service ----
   {
     const ctx = { get: () => undefined, logger: silent, effect: () => () => {} } as never
-    const commands = new ImCommands(ctx, new SessionCursors(), () => 'C:\\default')
+    const commands = new ImCommands(ctx, new SessionCursors())
     assert.equal(commands.registerWithHost(), undefined, 'no commands service registers nothing')
 
     const registry = makeCommands()
     const ctx2 = { get: () => registry.service, logger: silent, effect: (fn: () => unknown) => { fn(); return () => {} } } as never
-    const commands2 = new ImCommands(ctx2, new SessionCursors(), () => 'C:\\default')
+    const commands2 = new ImCommands(ctx2, new SessionCursors())
     commands2.registerWithHost()
     assert.deepEqual(
       registry.registered.map(r => r.name).sort(),
-      ['cwd', 'help', 'new', 'perm', 'status'],
+      ['help', 'new', 'perm', 'status'],
       'the Web composer lists the same command names',
+    )
+
+    // `/cwd` is retired: DSH cannot switch a workspace mid-session, so the
+    // command could only ever mean "start a new session over there" — which is
+    // now `/new <路径>`. Assert it is neither routed NOR registered, so the
+    // removal cannot silently half-happen.
+    assert.equal(
+      commands2.run('cmcc:chat-1', '/cwd D:\\x', {
+        sessionId: 'im-x', effectiveCwd: '', cwdFromCommand: false, liveAgent: undefined,
+      }).kind,
+      'pass',
+      'the retired /cwd is no longer consumed and falls through to the model',
+    )
+    assert.ok(
+      !registry.registered.some(r => r.name === 'cwd'),
+      'the retired /cwd is no longer registered with the Web composer',
     )
   }
 }
-step('IM slash commands (/status, /perm, /new, /cwd, routing + cursor arithmetic) OK')
+step('IM slash commands (/status, /perm, /new [path], routing + cursor arithmetic) OK')
 
 await rmBrowse(browseTmp, { recursive: true, force: true })
 
