@@ -55,7 +55,7 @@ Ordering is load-bearing: in the `web` profile the `dsh-api-remotes` forwarder t
 
 ## Chat commands
 
-An IM message that is a slash command is handled by the gateway's own router **before it can become a prompt**, so the command line and its output never enter the model's context (DSH's `commands` registry is driven by UI clients and is unreachable from a chat — the same names are registered there only so the Web composer lists them).
+An IM message that is a slash command is handled by the gateway's own router **before it can become a prompt**, so the command line and its output never enter the model's context (DSH's `commands` registry is driven by UI clients and is unreachable from a chat — the same names are registered there too, but **in each IM agent's own scope**, so the Web composer lists them for an IM session and not for an ordinary one).
 
 | Command | What it does |
 | --- | --- |
@@ -177,7 +177,7 @@ pnpm qq-probe <appId> <appSecret> [--ints c2c,public_guild] [--sandbox] [--secon
 | `src/inbound.ts` | Embedded `node:http` webhook server (routes by URL path; acks `202` only after `handle()` resolves) |
 | `src/gateway.ts` | Workspace-attached session composition, live-agent reuse, rpcId reply claiming, allowlist / dedup / serialization / source injection / delivery retry / fault notices |
 | `src/session.ts` | Deterministic session-key derivation: `im-<sha1(channel:chat_id[@cwd])>`, channel-isolated and scoped to an explicitly configured working directory |
-| `src/im-commands.ts` | IM slash-command router (`/status`, `/new [工作目录]`, `/perm`, `/help`) plus the per-chat session cursors it drives; the same names are registered with DSH's `commands` for the Web composer |
+| `src/im-commands.ts` | IM slash-command router (`/status`, `/new [工作目录]`, `/perm`, `/help`) plus the per-chat session cursors it drives; the same names are registered in each IM agent's **own command scope** (never globally) so only IM sessions list them in the Web composer |
 | `src/index.ts` | Plugin entry (`name`/`inject`/`Config`/`apply` + lifecycle + the `GET /im-gateway/status` and `GET /im-gateway/browse` routes) |
 | `src/status-proto.ts` | Host↔client wire contract for live channel status and the directory browser (dependency-free; why a route, not a Remote namespace) |
 | `src/status-route.ts` | The status + browse route handlers (payload projection, shared browser-auth gate, method guard) |

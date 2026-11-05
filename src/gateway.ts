@@ -498,6 +498,10 @@ export class ImGateway {
     if (live !== undefined) {
       this.ctx.logger.info(`[im-gateway] reusing the live agent for ${sessionId} (owned by another entry point)`)
       trace(`[gw] acquireAgent REUSE-LIVE session=${sessionId}`)
+      // `setup()` does not run for an agent another entry point composed, so the
+      // IM commands are installed on it here: this session is IM-keyed either
+      // way, and without this its Web composer would list none of them.
+      this.commands.registerForAgent(live.ctx)
       // Not owned here: another entry point created it and will dispose it.
       return { agent: live, dispose: async () => {} }
     }
@@ -581,6 +585,10 @@ export class ImGateway {
       // scope so a question surfaces on the driving IM channel instead of only
       // the web UI. `next()`-falls back when no sender is present.
       this.interactions.install(agentCtx, String(sessionId), (text) => this.sendInteractive(sessionId, text))
+      // The Web composer lists a session's commands from its AGENT's scope, so
+      // the IM commands are registered here — never on the plugin root, which is
+      // a global layer every session (including plain Web ones) would list.
+      this.commands.registerForAgent(agentCtx)
       trace(`[gw] setup(agentCtx) done session=${sessionId}`)
     }
 

@@ -61,10 +61,12 @@ export function apply(ctx: Context, config: ConfigType): void {
     )
   })
 
-  // Slash commands. The IM router (inside the gateway, ahead of the model) is
-// what makes them work from a chat; this registration is what makes the Web
-// composer list the same names. Absent the `commands` bundle this is a no-op.
-  gateway.commands.registerWithHost()
+  // Slash commands are NOT registered here. The IM router (inside the gateway,
+  // ahead of the model) is what makes them work from a chat; the Web-composer
+  // registrations are made per IM agent in the gateway's `setup()`, so an
+  // ordinary (non-IM) session never lists them. Registering them from this
+  // plugin context would be a GLOBAL registration, which is exactly the bug
+  // this replaced: every session saw `/new`, `/status` and `/help`.
 
   // Legacy single-channel path: keep the global webhook route alive exactly as
   // before, forwarding to the gateway with the legacy callback as the reply

@@ -85,7 +85,11 @@
  *      the chat's current directory, an absolute path moves it (a session's cwd
  *      is pinned at creation, so that is necessarily a new session), a relative
  *      path is refused rather than guessed, and the retired `/cwd` is neither
- *      routed nor registered.
+ *      routed nor registered. Also pins that the Web-composer half is registered
+ *      PER IM AGENT (never on the plugin root): the registry folds the global
+ *      layer into every agent, so a global registration is what used to show
+ *      `/new` `/status` `/help` in ordinary Web sessions. The scoping contract
+ *      itself is exercised against the real cordis + dsh-scope packages.
  *
  * Real transports that need live services (email / feishu / wechat / qq / a
  * live CMCC gateway) are exercised by starting them in the plugin; this file
@@ -96,6 +100,8 @@
 
 import { createServer, type Server, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from 'node:http'
 import assert from 'node:assert/strict'
+import type { Context as CordisContext } from '@deepseek-ai/cordis'
+import type { NamedEntries as ScopeNamedEntries, ScopedLayers as ScopeLayers } from '@deepseek-ai/dsh-scope'
 import type { InboundRoute } from '../src/transports/types.ts'
 import { ImCommands, SessionCursors, parseImCommand } from '../src/im-commands.ts'
 
@@ -1933,21 +1939,55 @@ step('client half paints only real theme tokens (no literal colours) OK')
     assert.ok(withAgent.text.includes('运行中'), 'a live agent is reported as running')
   }
 
-  // ---- Web-side registration degrades without the commands service ----
+  // ---- Web-side registration is PER IM AGENT, never global ----
+  //
+  // `commands.list(agent)` folds the global layer into EVERY agent's catalog, so
+  // a plugin-root registration put `/new`, `/status` and `/help` in ordinary Web
+  // sessions that never touched an IM channel. The definitions are therefore
+  // registered through the agent's own scoped context.
   {
-    const ctx = { get: () => undefined, logger: silent, effect: () => () => {} } as never
-    const commands = new ImCommands(ctx, new SessionCursors())
-    assert.equal(commands.registerWithHost(), undefined, 'no commands service registers nothing')
+    // Absent the `commands` bundle this must degrade to a no-op, not a throw.
+    const bare = { get: () => undefined, logger: silent } as never
+    const commands = new ImCommands(bare, new SessionCursors())
+    commands.registerForAgent(bare)
 
-    const registry = makeCommands()
-    const ctx2 = { get: () => registry.service, logger: silent, effect: (fn: () => unknown) => { fn(); return () => {} } } as never
-    const commands2 = new ImCommands(ctx2, new SessionCursors())
-    commands2.registerWithHost()
+    // Registration must go through the AGENT context: the root context's
+    // registry has to stay empty or every session lists the IM commands.
+    const rootRegistry = makeCommands()
+    const agentRegistry = makeCommands()
+    const rootCtx = {
+      get: (n: string) => (n === 'commands' ? rootRegistry.service : undefined),
+      logger: silent,
+    } as never
+    const agentCtx = {
+      get: (n: string) => (n === 'commands' ? agentRegistry.service : undefined),
+      logger: silent,
+    } as never
+    const commands2 = new ImCommands(rootCtx, new SessionCursors())
+    commands2.registerForAgent(agentCtx)
     assert.deepEqual(
-      registry.registered.map(r => r.name).sort(),
+      agentRegistry.registered.map(r => r.name).sort(),
       ['help', 'new', 'perm', 'status'],
-      'the Web composer lists the same command names',
+      'the IM command names are registered in the agent scope',
     )
+    assert.deepEqual(
+      rootRegistry.registered,
+      [],
+      'nothing is registered on the plugin root — ordinary sessions must not list them',
+    )
+
+    // Idempotent: the gateway installs during `setup()` and again when it adopts
+    // an agent another entry point already composed.
+    commands2.registerForAgent(agentCtx)
+    assert.equal(agentRegistry.registered.length, 4, 'a second install for the same agent is a no-op')
+
+    // A name already taken in that scope must not abort the agent's setup: the
+    // IM router still serves the chat, so the conflict is reported, not thrown.
+    const colliding = {
+      get: () => ({ register: () => { throw new Error('command "new" is already registered in this scope') } }),
+      logger: silent,
+    } as never
+    new ImCommands(rootCtx, new SessionCursors()).registerForAgent(colliding)
 
     // `/cwd` is retired: DSH cannot switch a workspace mid-session, so the
     // command could only ever mean "start a new session over there" — which is
@@ -1961,8 +2001,75 @@ step('client half paints only real theme tokens (no literal colours) OK')
       'the retired /cwd is no longer consumed and falls through to the model',
     )
     assert.ok(
-      !registry.registered.some(r => r.name === 'cwd'),
-      'the retired /cwd is no longer registered with the Web composer',
+      !agentRegistry.registered.some(r => r.name === 'cwd'),
+      'the retired /cwd is no longer registered for the Web composer',
+    )
+  }
+
+  // ---- the scoping CONTRACT this fix relies on (real cordis + dsh-scope) ----
+  //
+  // Whether `agentCtx.get('commands').register(…)` is per-agent or global is
+  // decided outside this plugin: cordis' service tracing makes the service see
+  // the ACCESSING context as `this.ctx`, and `dsh-scope` keeps one layer per
+  // scope. Prove that with the real packages, using the same
+  // `layers.effect(this.ctx, …)` shape as `@deepseek-ai/dsh-commands`.
+  {
+    const { Context, Service } = await import('@deepseek-ai/cordis')
+    const { NamedEntries, ScopedLayers, createScope } = await import('@deepseek-ai/dsh-scope')
+
+    interface Layer {
+      names: ScopeNamedEntries<string>
+      isEmpty(): boolean
+    }
+    class FakeRegistry extends Service {
+      readonly layers: ScopeLayers<Layer>
+      constructor(ctx: CordisContext) {
+        super(ctx, 'fakeCommands')
+        this.layers = new ScopedLayers<Layer>(() => {
+          const names = new NamedEntries<string>((name: string) => new Error(`duplicate /${name}`))
+          return { names, isEmpty: () => names.isEmpty() }
+        }, () => {})
+      }
+      register(name: string): void {
+        this.layers.effect(this.ctx, (layer) => layer.names.insert(name, name), { label: `fake:${name}` })
+      }
+      list(agent: object): string[] {
+        return [...this.layers.merge(agent, (layer) => layer.names).values()].sort()
+      }
+    }
+
+    const root = new Context()
+    const registry = new FakeRegistry(root)
+    const agentA = { id: 'agent-a' }
+    const agentB = { id: 'agent-b' }
+    const scopeA = createScope(root, agentA)
+    const scopeB = createScope(root, agentB)
+    ;(scopeA.ctx.get('fakeCommands') as FakeRegistry).register('new')
+    ;(scopeB.ctx.get('fakeCommands') as FakeRegistry).register('status')
+    assert.deepEqual(registry.list(agentA), ['new'], 'an agent-scoped command is listed for its own agent')
+    assert.deepEqual(registry.list(agentB), ['status'], 'and is invisible to every other agent')
+
+    // The shape this fix removed: a plugin-root registration is global.
+    root.get('fakeCommands').register('help')
+    assert.deepEqual(registry.list(agentA), ['help', 'new'], 'a root registration is global — the old bug')
+    assert.deepEqual(registry.list(agentB), ['help', 'status'], 'a root registration reaches ordinary agents too')
+  }
+
+  // ---- the gateway must actually WIRE the per-agent install ----
+  // `ImGateway` cannot be instantiated offline (it needs a live `agents`
+  // service), so the call site is asserted on the source: if it disappears the
+  // commands are simply never registered anywhere, and nothing else notices.
+  {
+    const gatewaySource = readFileSync(new URL('../src/gateway.ts', import.meta.url), 'utf8')
+    assert.match(
+      gatewaySource,
+      /this\.commands\.registerForAgent\(agentCtx\)/,
+      'setup() must register the commands in the agent scope',
+    )
+    const indexSource = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8')
+    assert.ok(
+      !/registerWithHost/.test(indexSource),
+      'the plugin entry must not register commands globally (every session would list them)',
     )
   }
 }

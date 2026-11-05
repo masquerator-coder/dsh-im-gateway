@@ -10,10 +10,22 @@
  *
  * This module is therefore two halves:
  *
- *  1. a router (`runImCommand`) the gateway calls BEFORE a message becomes a
- *     prompt, so a recognised command is consumed and never reaches the model;
- *  2. DSH command registrations for the same names, so the Web GUI lists them
- *     too. Both halves share one implementation per command.
+ *  1. a router (`run`) the gateway calls BEFORE a message becomes a prompt, so
+ *     a recognised command is consumed and never reaches the model;
+ *  2. DSH command registrations for the same names, made in the scope of each
+ *     IM agent the gateway composes — so the Web composer lists them for an IM
+ *     session and NOT for an ordinary (non-IM) one. Both halves share one
+ *     implementation per command.
+ *
+ * WHY PER-AGENT AND NOT GLOBAL. `commands` has no notion of a transport: a
+ * definition registered from a plain (plugin-root) context is global, and
+ * `commands.list(agent)` folds that global layer into EVERY agent's catalog.
+ * Registering globally here is what used to put `/new`, `/status` and `/help`
+ * in ordinary Web sessions, where they could only answer "IM 会话由聊天窗口的
+ * /new 驱动". A definition registered through an agent's scoped context lands
+ * in that agent's own layer instead (verified against cordis' service tracing
+ * + `dsh-scope` in `scripts/smoke.mts`), and rides the agent's fiber, so it is
+ * disposed with the agent.
  *
  * MODEL CONTEXT. Slash commands are deliberately outside the model's context.
  * The model-visible surface is exactly `system/message`, `developer/message`,
@@ -51,14 +63,17 @@ interface PermissionPresetLike {
   set(session: Session, name: string): void
 }
 
+/** One registration argument accepted by the `commands` runtime (consumed fields). */
+interface CommandDefinitionLike {
+  readonly name: string
+  readonly description: string
+  readonly input?: { readonly hint?: string }
+  readonly handler: (invocation: CommandInvocation) => CommandResult | Promise<CommandResult>
+}
+
 /** The subset of `commands` this module depends on. */
 interface CommandRuntimeLike {
-  register(definition: {
-    name: string
-    description: string
-    input?: { hint?: string }
-    handler: (invocation: CommandInvocation) => CommandResult | Promise<CommandResult>
-  }): () => void
+  register(definition: CommandDefinitionLike): () => void
 }
 
 /** Outcome of routing one IM message: either a reply, or "not a command". */
@@ -215,6 +230,9 @@ export interface ImCommandContext {
  * works even if no agent is live. `/status` needs neither.
  */
 export class ImCommands {
+  /** Agent contexts this instance already registered into (see `registerForAgent`). */
+  private readonly installed = new WeakSet<Context>()
+
   /** `ctx` is injected so tests can supply a fixed service set without a live DSH. */
   constructor(
     private readonly ctx: Context,
@@ -416,53 +434,79 @@ export class ImCommands {
   }
 
   /**
-   * Register the same commands with DSH's registry, so the Web GUI lists them.
+   * Register the same commands in ONE IM agent's scope.
+   *
+   * WHY SCOPED, NOT GLOBAL. `commands.list(agent)` folds the global layer into
+   * every agent's catalog, so a plugin-root registration is listed in EVERY
+   * session — including ordinary Web sessions that never touched an IM channel,
+   * where these names could only answer "IM 会话由聊天窗口的 /new 驱动".
+   * Registering through the agent's own scoped context (the one `setup()`
+   * receives) puts the definitions in that agent's layer instead: an ordinary
+   * session's agent never sees them, an IM agent does, and they are disposed
+   * with the agent because the registry attaches them to its fiber.
    *
    * The IM router is what makes them work from a chat; this half only makes
-   * them discoverable (and usable) in the Web composer.
-   * @returns the disposer, or undefined when the `commands` service is absent.
+   * them discoverable in the Web composer for the session they belong to.
+   *
+   * Idempotent per agent context: `setup()` runs once per created/resumed
+   * agent, but the gateway also installs on a live agent it adopts from another
+   * entry point, and a second registration in one scope would throw.
+   * @param agentCtx - the receiving agent's scoped context.
    */
-  registerWithHost(): (() => void) | undefined {
-    const commands = this.ctx.get('commands') as CommandRuntimeLike | undefined
+  registerForAgent(agentCtx: Context): void {
+    if (this.installed.has(agentCtx)) return
+    const commands = agentCtx.get('commands') as CommandRuntimeLike | undefined
     if (commands === undefined || typeof commands.register !== 'function') {
       this.ctx.logger.debug('[im-gateway] commands not registered: the commands service is unavailable')
-      return undefined
+      return
     }
-    const disposers = [
-      commands.register({
+    for (const definition of this.definitions()) {
+      try {
+        commands.register(definition)
+      } catch (error: unknown) {
+        // A name already taken in this agent's scope (an agent preset that
+        // ships its own `/new`, say) must not abort the agent's setup: the IM
+        // router still serves the chat. Name the dropped command rather than
+        // losing it silently.
+        const detail = error instanceof Error ? error.message : String(error)
+        this.ctx.logger.warn(`[im-gateway] /${definition.name} not listed for this agent: ${detail}`)
+      }
+    }
+    this.installed.add(agentCtx)
+  }
+
+  /** The Web-composer faces of the IM commands, one definition per name. */
+  private definitions(): readonly CommandDefinitionLike[] {
+    return [
+      {
         name: 'perm',
         description: "Show or switch this session's permission preset (sandbox + approval).",
         input: { hint: '[preset]' },
         handler: (invocation) => {
           const session = (invocation.agent as Agent & { session: Session }).session
-          const result = this.permForSession(session, invocation.rawInput)
-          return result
+          return this.permForSession(session, invocation.rawInput)
         },
-      }),
-      commands.register({
+      },
+      {
         name: 'new',
         description: 'Start a new session for this chat, optionally in a given working directory.',
         input: { hint: '[absolute path]' },
         handler: () => ({ kind: 'success', text: 'IM 会话由聊天窗口的 /new [工作目录] 驱动；Web 端请直接新建会话（切换工作区请直接在 Web 端切换）。' }),
-      }),
-      commands.register({
+      },
+      {
         name: 'help',
         description: 'List the IM gateway commands.',
         handler: () => ({ kind: 'success', text: helpText() }),
-      }),
-      commands.register({
+      },
+      {
         name: 'status',
         description: 'Show this chat\'s session id, working directory and permission.',
         handler: () => ({
           kind: 'success',
           text: 'IM 会话状态由聊天窗口的 /status 驱动（需要聊天上下文的会话信息）。',
         }),
-      }),
+      },
     ]
-    return this.ctx.effect(
-      () => () => { for (const dispose of disposers) dispose() },
-      'dsh-im-gateway.commands()',
-    )
   }
 
   /** `/perm` against an explicit session (the Web-composer path). */
